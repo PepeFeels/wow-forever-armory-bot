@@ -913,15 +913,24 @@ def create_bot() -> ArmoryBot:
 
 
 def _read_credential_file(path: Path) -> str:
-    """Read a bounded regular credential file with private POSIX permissions."""
+    """Read a bounded private token file or trusted systemd credential."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
-            raise ValueError("credential file must be a private regular file")
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("credential file must be a regular file")
+
+        mode = stat.S_IMODE(info.st_mode)
+        if not _credential_permissions_are_safe(
+            path,
+            owner_uid=info.st_uid,
+            mode=mode,
+            credentials_directory=os.getenv("CREDENTIALS_DIRECTORY"),
+        ):
+            raise ValueError("credential file must be private")
         with os.fdopen(descriptor, "r", encoding="utf-8") as credential_file:
             descriptor = -1
             value = credential_file.read(_MAX_TOKEN_FILE_BYTES + 1)
@@ -931,6 +940,24 @@ def _read_credential_file(path: Path) -> str:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _credential_permissions_are_safe(
+    path: Path,
+    *,
+    owner_uid: int,
+    mode: int,
+    credentials_directory: str | None,
+) -> bool:
+    """Allow group-read only for root-owned 0440 systemd credentials."""
+    if mode & 0o077 == 0:
+        return True
+    return (
+        credentials_directory is not None
+        and owner_uid == 0
+        and mode == 0o440
+        and path == Path(credentials_directory) / "discord-token"
+    )
 
 
 async def run_bot() -> None:
