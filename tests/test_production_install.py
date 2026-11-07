@@ -16,7 +16,9 @@ from unittest.mock import Mock, patch
 
 from deploy.production_install import (
     InstallError,
+    _assert_units_stopped_and_disabled,
     _check_repository,
+    _install_current_link,
     _install_release,
     _require_supported_runtime,
     _validate_logo_asset,
@@ -40,6 +42,85 @@ preflight = _load_preflight()
 
 
 class ProductionInstallTests(unittest.TestCase):
+    def test_upgrade_requires_units_confirmed_stopped_and_disabled(self) -> None:
+        stopped = SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
+        disabled = SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
+        with patch(
+            "deploy.production_install.subprocess.run",
+            side_effect=[stopped, stopped, stopped, disabled, disabled],
+        ):
+            _assert_units_stopped_and_disabled(upgrade_existing=True)
+
+        active = SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+        with patch("deploy.production_install.subprocess.run", return_value=active):
+            with self.assertRaisesRegex(InstallError, "stopped"):
+                _assert_units_stopped_and_disabled(upgrade_existing=True)
+
+        enabled = SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        with patch(
+            "deploy.production_install.subprocess.run",
+            side_effect=[stopped, stopped, stopped, enabled],
+        ):
+            with self.assertRaisesRegex(InstallError, "enabled"):
+                _assert_units_stopped_and_disabled(upgrade_existing=True)
+
+        unavailable = SimpleNamespace(returncode=1, stdout="", stderr="no bus")
+        with patch(
+            "deploy.production_install.subprocess.run", return_value=unavailable
+        ):
+            with self.assertRaisesRegex(InstallError, "stopped"):
+                _assert_units_stopped_and_disabled(upgrade_existing=True)
+
+    def test_upgrade_path_does_not_invoke_database_migration(self) -> None:
+        import inspect
+
+        from deploy.production_install import install
+
+        source = inspect.getsource(install)
+        self.assertNotIn("production_migration", source)
+        self.assertIn("if not upgrade_existing", source)
+
+    def test_upgrade_atomically_switches_managed_release_and_keeps_old_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            old_sha = "a" * 40
+            new_sha = "b" * 40
+            old_release = releases / old_sha
+            new_release = releases / new_sha
+            old_release.mkdir(parents=True)
+            new_release.mkdir()
+            (old_release / ".installation-complete").write_text(old_sha)
+            (new_release / ".installation-complete").write_text(new_sha)
+            (root / "current").symlink_to(old_release)
+            with (
+                patch("deploy.production_install.BASE", root),
+                patch("deploy.production_install._run") as run,
+            ):
+                _install_current_link(
+                    new_release, upgrade_existing=True, repo=Path(temporary)
+                )
+            self.assertEqual((root / "current").resolve(), new_release)
+            self.assertTrue(old_release.is_dir())
+            run.assert_called_once()
+
+    def test_upgrade_refuses_unapproved_release_switch_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            old_release = releases / ("a" * 40)
+            new_release = releases / ("b" * 40)
+            old_release.mkdir(parents=True)
+            new_release.mkdir()
+            (old_release / ".installation-complete").write_text("a" * 40)
+            (root / "current").symlink_to(old_release)
+            with patch("deploy.production_install.BASE", root):
+                with self.assertRaisesRegex(InstallError, "refusing to replace"):
+                    _install_current_link(new_release)
+            self.assertEqual((root / "current").resolve(), old_release)
+
     def test_installer_requires_exact_clean_release_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)

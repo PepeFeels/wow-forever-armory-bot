@@ -55,6 +55,44 @@ sudo systemctl enable --now wow-forever-armory-bot.service
 sudo systemctl enable --now wow-forever-armory-backup.timer
 ```
 
+### Code-only upgrade of an installed release
+
+For a reviewed code-only update, keep the service and backup timer stopped and
+disabled. The installer supports `--upgrade-existing`: it validates the
+existing config and credential in place, requires the current link to point to
+a complete managed release, requires the new commit to descend from that
+release, and atomically switches `current`. It does not migrate, open for
+writing, replace, or back up the database; it does not rewrite the config,
+credential, systemd units, launcher, state directory, or backup directory. The
+unit templates and launcher must be byte-identical to the installed versions;
+runtime configuration changes need a separately reviewed installation.
+
+Run only after a release-specific approval, from the clean approved checkout
+on `feature/v0.2.0-discord`:
+
+```bash
+# Configuration-changing: stages code and atomically switches the release link.
+sudo /usr/bin/python3.14 deploy/production_install.py \
+  --release-sha FULL_REVIEWED_RELEASE_SHA \
+  --upgrade-existing
+```
+
+The release remains stopped and disabled. Before any approved start, verify
+`current`, release marker, systemd units, database integrity, and backup
+availability. The start preflight independently refuses an absent, empty,
+corrupt, or restore-gated database. No migration command is part of this
+upgrade path.
+
+To roll the code pointer back while stopped, preserve the new release and all
+state/backups, then atomically repoint `current` to the previous release. For
+this credential-permission fix, the previously installed release is known to
+reject systemd's root-owned `0440` credential; pointer rollback therefore
+restores the previous code artifact but does not restore a working service.
+If the new release fails after start, stop it, preserve the current database,
+and keep the service disabled while preparing a corrected credential-compatible
+release. Never restore an older database snapshot to solve a code-startup
+failure.
+
 To deactivate in an approved rollback, stop and disable both units while
 retaining the database and backups:
 

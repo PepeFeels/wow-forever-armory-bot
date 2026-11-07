@@ -33,6 +33,10 @@ UNIT_FILES = (
     "wow-forever-armory-backup.service",
     "wow-forever-armory-backup.timer",
 )
+ENABLEABLE_UNITS = (
+    "wow-forever-armory-bot.service",
+    "wow-forever-armory-backup.timer",
+)
 CONFIG_KEYS = {
     "ARMORY_LOG_LEVEL",
     "ARMORY_LOG_FORMAT",
@@ -139,7 +143,7 @@ def validate_inputs(
 
 
 def _run(
-    command: list[str], *, capture: bool = False
+    command: list[str], *, capture: bool = False, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -147,9 +151,36 @@ def _run(
             check=True,
             text=True,
             capture_output=capture,
+            env=env,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise InstallError(f"installation command failed: {command[0]}") from exc
+
+
+def _assert_units_stopped_and_disabled(*, upgrade_existing: bool) -> None:
+    """Fail closed unless the bot and backup jobs are dormant."""
+    try:
+        for unit in UNIT_FILES:
+            result = subprocess.run(
+                ["systemctl", "is-active", unit],
+                text=True,
+                capture_output=True,
+            )
+            if result.stdout.strip() not in {"inactive", "failed", "unknown"}:
+                raise InstallError("could not verify that target units are stopped")
+        for unit in ENABLEABLE_UNITS:
+            result = subprocess.run(
+                ["systemctl", "is-enabled", unit],
+                text=True,
+                capture_output=True,
+            )
+            accepted = {"disabled"} if upgrade_existing else {"disabled", "not-found"}
+            if result.stdout.strip() not in accepted:
+                raise InstallError(
+                    "target service or backup timer is enabled or unknown"
+                )
+    except OSError as exc:
+        raise InstallError("could not verify systemd unit state") from exc
 
 
 def _require_supported_runtime(interpreter: Path) -> None:
@@ -415,16 +446,56 @@ def _install_release(
     _verify_release_readable(release, uid, gid)
 
 
-def _install_current_link(release: Path) -> None:
+def _install_current_link(
+    release: Path,
+    *,
+    upgrade_existing: bool = False,
+    repo: Path | None = None,
+) -> None:
     current = BASE / "current"
     if current.is_symlink():
-        if current.resolve() != release.resolve():
+        previous = current.resolve()
+        if previous == release.resolve():
+            return
+        if not upgrade_existing or repo is None:
             raise InstallError(
                 "current points to another release; refusing to replace it"
             )
-        return
-    if current.exists():
+        releases_root = (BASE / "releases").resolve()
+        try:
+            previous.relative_to(releases_root)
+        except ValueError as exc:
+            raise InstallError("current points outside the managed releases") from exc
+        previous_sha = previous.name
+        marker = previous / ".installation-complete"
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", previous_sha)
+            or previous.is_symlink()
+            or not marker.is_file()
+            or marker.is_symlink()
+            or marker.read_text(encoding="ascii") != previous_sha
+        ):
+            raise InstallError("current release is incomplete; refusing upgrade")
+        try:
+            _run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "merge-base",
+                    "--is-ancestor",
+                    previous_sha,
+                    release.name,
+                ]
+            )
+        except InstallError as exc:
+            raise InstallError(
+                "upgrade must descend from the installed release"
+            ) from exc
+    elif current.exists():
         raise InstallError("current exists and is not the approved release symlink")
+    elif upgrade_existing:
+        raise InstallError("upgrade requested but no current release is installed")
     temporary = BASE / ".current.installing"
     if temporary.exists() or temporary.is_symlink():
         raise InstallError(
@@ -432,7 +503,6 @@ def _install_current_link(release: Path) -> None:
         )
     temporary.symlink_to(release)
     os.replace(temporary, current)
-    os.chown(current, 0, 0, follow_symlinks=False)
 
 
 def _copy_unit(source: Path, destination: Path, mode: int = 0o644) -> None:
@@ -448,84 +518,152 @@ def install(
     config_source: Path,
     credential_source: Path,
     release_sha: str,
+    *,
+    upgrade_existing: bool = False,
 ) -> None:
     if os.geteuid() != 0:
         raise InstallError("run this installation script as an administrator")
     _check_repository(repo, release_sha)
+    if upgrade_existing and (
+        config_source != ETC / "config"
+        or credential_source != ETC / "discord-token"
+        or not (BASE / "current").is_symlink()
+    ):
+        raise InstallError(
+            "upgrade must use the installed config, credential, and current release"
+        )
     validate_inputs(config_source, credential_source)
     _require_supported_runtime(Path(sys.executable))
-    for unit in UNIT_FILES:
-        for verb in ("is-active", "is-enabled"):
-            result = subprocess.run(
-                ["systemctl", verb, unit],
-                text=True,
-                capture_output=True,
-            )
-            if result.returncode == 0:
-                raise InstallError(
-                    "a target service or timer is already active or enabled"
-                )
+    _assert_units_stopped_and_disabled(upgrade_existing=upgrade_existing)
 
-    uid, gid = _account()
+    if upgrade_existing:
+        try:
+            service_user = pwd.getpwnam(SERVICE_USER)
+            service_group = grp.getgrnam(SERVICE_USER)
+        except KeyError as exc:
+            raise InstallError("installed service account is unavailable") from exc
+        if (
+            service_user.pw_gid != service_group.gr_gid
+            or service_user.pw_dir != "/nonexistent"
+        ):
+            raise InstallError(
+                "existing service account does not match expected isolation"
+            )
+        uid, gid = service_user.pw_uid, service_group.gr_gid
+    else:
+        uid, gid = _account()
     configured_logo = _configured_logo_path(config_source)
     if configured_logo is not None:
         _validate_logo_asset(configured_logo, uid, gid)
-    for path, mode, owner, group in (
+    deploy = repo / "deploy"
+    systemd_directory = Path("/etc/systemd/system")
+    runtime_files = (
+        (deploy / "systemd/armory-launch", BASE / "bin/armory-launch"),
+        (
+            deploy / "systemd/armory-db-preflight.py",
+            BASE / "bin/armory-db-preflight",
+        ),
+        *((deploy / "systemd" / name, systemd_directory / name) for name in UNIT_FILES),
+    )
+    if upgrade_existing:
+        for source, destination in runtime_files:
+            if (
+                not destination.is_file()
+                or source.read_bytes() != destination.read_bytes()
+            ):
+                raise InstallError(
+                    "upgrade changes runtime configuration; use a separately "
+                    "reviewed install"
+                )
+        _run(
+            [str(BASE / "bin/armory-db-preflight")],
+            capture=True,
+            env={
+                **os.environ,
+                "ARMORY_DATABASE_PATH": str(STATE / "guild-armory.sqlite3"),
+            },
+        )
+    directories = (
         (BASE, 0o755, 0, 0),
         (BASE / "releases", 0o755, 0, 0),
         (BASE / "bin", 0o755, 0, 0),
         (ETC, 0o750, 0, gid),
         (STATE, 0o700, uid, gid),
         (STATE / "backups", 0o700, uid, gid),
+    )
+    for path, mode, owner, group in (
+        directories[:3] if upgrade_existing else directories
     ):
         _mkdir_owned(path, mode, owner, group)
 
     release = BASE / "releases" / release_sha
     _install_release(repo, release, uid, gid, release_sha)
-    _install_current_link(release)
+    _install_current_link(
+        release,
+        upgrade_existing=upgrade_existing,
+        repo=repo if upgrade_existing else None,
+    )
 
     config = ETC / "config"
-    config_temp = config.with_name(".config.installing")
-    shutil.copyfile(config_source, config_temp)
-    os.chown(config_temp, 0, gid)
-    os.chmod(config_temp, 0o640)
-    os.replace(config_temp, config)
-    _copy_secret(credential_source, ETC / "discord-token")
+    if not upgrade_existing:
+        config_temp = config.with_name(".config.installing")
+        shutil.copyfile(config_source, config_temp)
+        os.chown(config_temp, 0, gid)
+        os.chmod(config_temp, 0o640)
+        os.replace(config_temp, config)
+        _copy_secret(credential_source, ETC / "discord-token")
 
-    deploy = repo / "deploy"
-    _copy_unit(deploy / "systemd/armory-launch", BASE / "bin/armory-launch", 0o755)
-    _copy_unit(
-        deploy / "systemd/armory-db-preflight.py",
-        BASE / "bin/armory-db-preflight",
-        0o755,
-    )
-    systemd_directory = Path("/etc/systemd/system")
-    for name in UNIT_FILES:
-        _copy_unit(deploy / "systemd" / name, systemd_directory / name)
-    _run(
-        [
-            "systemd-analyze",
-            "verify",
-            *[str(systemd_directory / name) for name in UNIT_FILES],
-        ]
-    )
-    _run(["systemctl", "daemon-reload"])
+    if not upgrade_existing:
+        for source, destination in runtime_files:
+            _copy_unit(
+                source,
+                destination,
+                0o755
+                if source.name == "armory-launch"
+                or source.name == "armory-db-preflight.py"
+                else 0o644,
+            )
+        _run(
+            [
+                "systemd-analyze",
+                "verify",
+                *[str(systemd_directory / name) for name in UNIT_FILES],
+            ]
+        )
+        _run(["systemctl", "daemon-reload"])
     # Intentionally no enable, start, or restart commands in this installer.
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-sha", required=True)
-    parser.add_argument("--config-source", required=True, type=Path)
-    parser.add_argument("--credential-source", required=True, type=Path)
+    parser.add_argument("--config-source", type=Path)
+    parser.add_argument("--credential-source", type=Path)
+    parser.add_argument(
+        "--upgrade-existing",
+        action="store_true",
+        help=(
+            "install code only, preserving existing config, credential, units, "
+            "and state"
+        ),
+    )
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
+    if args.upgrade_existing:
+        config_source = args.config_source or ETC / "config"
+        credential_source = args.credential_source or ETC / "discord-token"
+    else:
+        if args.config_source is None or args.credential_source is None:
+            parser.error("initial installation requires config and credential sources")
+        config_source = args.config_source
+        credential_source = args.credential_source
     try:
         install(
             repo,
-            args.config_source,
-            args.credential_source,
+            config_source,
+            credential_source,
             args.release_sha,
+            upgrade_existing=args.upgrade_existing,
         )
     except InstallError as exc:
         print(f"Installation stopped safely: {exc}", file=sys.stderr)
