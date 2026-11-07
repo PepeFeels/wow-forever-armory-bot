@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 from io import BytesIO
 from pathlib import Path
 
@@ -25,11 +26,19 @@ from .guild_armory_store import (
 from .guild_armory_urls import validate_armory_url
 from .guild_armory_views import CharacterSelectView, GuildPanelView
 from .logging_config import configure_logging
+from .operations import (
+    LockUnavailable,
+    database_file_lock_path,
+    exclusive_file_lock,
+    restore_marker_path,
+    runtime_lock_path,
+)
 from .parser import ArmoryParseError
 
 _LOGGER = logging.getLogger(__name__)
 _SWORD = "⚔️"
 _LOCK_STRIPES = 32
+_MAX_TOKEN_FILE_BYTES = 4096
 
 
 class BotIdentityUnavailable(RuntimeError):
@@ -863,16 +872,60 @@ def create_bot() -> ArmoryBot:
     )
 
 
+def _read_credential_file(path: Path) -> str:
+    """Read a bounded regular credential file with private POSIX permissions."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise ValueError("credential file must be a private regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as credential_file:
+            descriptor = -1
+            value = credential_file.read(_MAX_TOKEN_FILE_BYTES + 1)
+        if len(value.encode("utf-8")) > _MAX_TOKEN_FILE_BYTES:
+            raise ValueError("credential file exceeds the permitted size")
+        return value.strip()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 async def run_bot() -> None:
     token = os.getenv("DISCORD_BOT_TOKEN")
+    token_file = os.getenv("DISCORD_BOT_TOKEN_FILE")
+    if not token and token_file:
+        try:
+            token = _read_credential_file(Path(token_file))
+        except OSError, UnicodeError, ValueError:
+            raise RuntimeError(
+                "configured Discord credential file is unavailable"
+            ) from None
     configure_logging(secrets=(token,) if token else ())
     _LOGGER.info("bot_startup_started")
     if not token:
         _LOGGER.error("bot_token_missing")
-        raise RuntimeError("DISCORD_BOT_TOKEN must be set")
-    async with create_bot() as bot:
-        _LOGGER.info("discord_connection_starting")
-        await bot.start(token)
+        raise RuntimeError("DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN_FILE must be set")
+    database_path = Path(os.getenv("ARMORY_DATABASE_PATH", "data/guild-armory.sqlite3"))
+    if restore_marker_path(database_path).exists():
+        _LOGGER.error("database_restore_requires_operator_review")
+        raise RuntimeError("database restore was interrupted; operator review required")
+    try:
+        with exclusive_file_lock(runtime_lock_path(database_path)):
+            with exclusive_file_lock(database_file_lock_path(database_path)):
+                if restore_marker_path(database_path).exists():
+                    _LOGGER.error("database_restore_requires_operator_review")
+                    raise RuntimeError(
+                        "database restore was interrupted; operator review required"
+                    )
+                async with create_bot() as bot:
+                    _LOGGER.info("discord_connection_starting")
+                    await bot.start(token)
+    except LockUnavailable as exc:
+        _LOGGER.error("another_bot_process_owns_database_lock")
+        raise RuntimeError("another bot process already owns this database") from exc
 
 
 if __name__ == "__main__":

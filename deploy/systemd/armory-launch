@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+: "${ARMORY_PYTHON:?ARMORY_PYTHON must point to the release Python interpreter}"
+
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+    token_file=${CREDENTIALS_DIRECTORY}/discord-token
+    if [ ! -r "$token_file" ]; then
+        printf '%s\n' 'Armory credential is unavailable.' >&2
+        exit 78
+    fi
+    token=
+    if ! IFS= read -r token < "$token_file"; then
+        if [ -z "$token" ]; then
+            printf '%s\n' 'Armory credential is empty.' >&2
+            exit 78
+        fi
+    fi
+    if [ -z "$token" ]; then
+        printf '%s\n' 'Armory credential is empty.' >&2
+        exit 78
+    fi
+    DISCORD_BOT_TOKEN=$token
+    export DISCORD_BOT_TOKEN
+fi
+
+exec "$ARMORY_PYTHON" -m wow_forever_armory.discord_bot

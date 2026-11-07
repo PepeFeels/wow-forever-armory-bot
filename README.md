@@ -76,8 +76,10 @@ Do not run this command for offline tests. It connects to Discord and syncs test
 - Armory submissions are checked against a single official HTTPS hostname and strict path shape. The existing Core URL validator enforces host boundaries; its HTTP client refuses redirects.
 - Every user action is scoped to the selected guild and Discord user. SQLite enforces unique character paths, three slots, and guild/user ownership. A small in-process semaphore bounds concurrent Armory requests.
 - SQLite and the rendered image files stay local; images are sent as Discord attachments and are not stored as files on disk.
-- The semaphore and member-operation locks are process-local. Run a single bot process against a database; horizontal multi-process coordination is not implemented.
+- The request semaphore and member-operation locks are process-local. Bot startup also holds an advisory filesystem lock to reject another local process using the same database path. Multi-host coordination is not implemented.
 - If Discord is unavailable after a registration commits, the stored snapshot lets startup recovery repair the row message. If a channel is permanently inaccessible or a database is lost, an administrator must restore permissions or the database backup.
+
+Operational deployment templates, SQLite backup/restore commands, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The systemd unit and timer files are preparation only and are not installed or enabled by this project.
 
 ## Tests and checks
 

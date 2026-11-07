@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily WoW Forever Armory SQLite backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=wow-forever-armory-backup.service
+
+[Install]
+WantedBy=timers.target
