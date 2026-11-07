@@ -5,23 +5,15 @@ set -eu
 
 if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
     token_file=${CREDENTIALS_DIRECTORY}/discord-token
-    if [ ! -r "$token_file" ]; then
+    if [ ! -f "$token_file" ] || [ ! -r "$token_file" ] || [ ! -s "$token_file" ]; then
         printf '%s\n' 'Armory credential is unavailable.' >&2
         exit 78
     fi
-    token=
-    if ! IFS= read -r token < "$token_file"; then
-        if [ -z "$token" ]; then
-            printf '%s\n' 'Armory credential is empty.' >&2
-            exit 78
-        fi
-    fi
-    if [ -z "$token" ]; then
-        printf '%s\n' 'Armory credential is empty.' >&2
-        exit 78
-    fi
-    DISCORD_BOT_TOKEN=$token
-    export DISCORD_BOT_TOKEN
+    # The application reads the systemd credential itself. Never copy its
+    # value into this shell or the child process environment.
+    unset DISCORD_BOT_TOKEN
+    DISCORD_BOT_TOKEN_FILE=$token_file
+    export DISCORD_BOT_TOKEN_FILE
 fi
 
 exec "$ARMORY_PYTHON" -m wow_forever_armory.discord_bot

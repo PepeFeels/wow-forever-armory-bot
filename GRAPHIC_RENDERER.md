@@ -47,12 +47,15 @@ source timestamps take precedence with `OUTDATED`.
 
 ## Assets and licensing
 
-- `assets/wow_forever_logo.png` is the logo supplied by the project owner for
-  this task. No separate license grant accompanied the file; confirm the right
-  to redistribute it in packaged releases before publication. The local copy
-  remains available for preview generation but is intentionally excluded from
-  this commit. If it is absent, the renderer leaves the reserved header area
-  blank rather than drawing a substitute mark.
+- The official logo is not part of the package or repository. An operator who
+  has permission to use it may provision it separately and set
+  `ARMORY_LOGO_PATH`; production accepts
+  `/etc/wow-forever-armory-bot/wow_forever_logo.png`. The image must be a
+  root-owned regular file, readable by the `wow-armory` group, and not
+  world-accessible. The renderer refuses symlinks and validates PNG format,
+  dimensions, and file size. Do not provision or redistribute the logo without
+  documented permission covering its use. If no valid path is configured, the
+  reserved header area stays blank; no substitute mark is drawn.
 - The four bundled DejaVu Sans/Serif regular and bold TTF files are distributed
   under the included `assets/fonts/LICENSE-DejaVu.txt` (Bitstream Vera/DejaVu
   license). They are bundled so output does not depend on host-installed fonts.
@@ -65,11 +68,8 @@ The stats section keeps its heading and explicit missing-data text, but its
 divider moves upward when there are no usable stats. The space is redistributed
 to the profession block without changing the 1–3 character canvas sizes.
 
-`pyproject.toml` includes package image assets and nested font/license files as
-package data. Since the supplied logo is excluded here, a wheel built from this
-commit will not contain it and will render a blank reserved logo area. Do not
-publish that wheel as the approved branded design until redistribution rights
-are confirmed and the asset is added through review.
+`pyproject.toml` includes the intro image and nested font/license files as
+package data. It never includes the separately provisioned official logo.
 
 ## Offline previews and checks
 

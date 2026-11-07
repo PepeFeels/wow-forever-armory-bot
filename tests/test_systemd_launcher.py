@@ -12,7 +12,7 @@ LAUNCHER = Path(__file__).parents[1] / "deploy/systemd/armory-launch"
 
 
 class SystemdLauncherTests(unittest.TestCase):
-    def test_forwards_systemd_credential_to_legacy_environment_interface(self) -> None:
+    def test_passes_credential_file_without_exporting_token_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temporary_path = Path(temp_dir)
             credential_dir = temporary_path / "credentials"
@@ -24,7 +24,11 @@ class SystemdLauncherTests(unittest.TestCase):
             fake_python = temporary_path / "python"
             fake_python.write_text(
                 "#!/bin/sh\n"
-                'test "$DISCORD_BOT_TOKEN" = "fixture-token" || exit 41\n'
+                'test "$DISCORD_BOT_TOKEN_FILE" = '
+                '"' + str(credential) + '" || exit 41\n'
+                'test -z "${DISCORD_BOT_TOKEN+x}" || exit 44\n'
+                'test "$(cat "$DISCORD_BOT_TOKEN_FILE")" = '
+                '"fixture-token" || exit 45\n'
                 'test "$1" = "-m" || exit 42\n'
                 'test "$2" = "wow_forever_armory.discord_bot" || exit 43\n'
                 'printf "%s\\n" "credential_forwarded=yes"\n',
@@ -33,7 +37,7 @@ class SystemdLauncherTests(unittest.TestCase):
             fake_python.chmod(0o700)
 
             environment = os.environ.copy()
-            environment.pop("DISCORD_BOT_TOKEN", None)
+            environment["DISCORD_BOT_TOKEN"] = "inherited-secret-fixture"
             environment["CREDENTIALS_DIRECTORY"] = str(credential_dir)
             environment["ARMORY_PYTHON"] = str(fake_python)
             result = subprocess.run(
@@ -47,6 +51,7 @@ class SystemdLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout.strip(), "credential_forwarded=yes")
             self.assertNotIn("fixture-token", result.stdout + result.stderr)
+            self.assertNotIn("inherited-secret-fixture", result.stdout + result.stderr)
 
     def test_missing_or_empty_credential_fails_without_running_python(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

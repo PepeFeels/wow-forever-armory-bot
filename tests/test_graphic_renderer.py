@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import time
 import tracemalloc
@@ -147,9 +148,7 @@ class GraphicRendererTests(unittest.TestCase):
 
     def test_golden_layout_is_stable_when_unlicensed_logo_is_absent(self) -> None:
         expected = json.loads(GOLDEN.read_text())["one"]
-        with patch(
-            "wow_forever_armory.graphic_renderer._LOGO_PATH", Path("missing-logo.png")
-        ):
+        with patch.dict(os.environ, {"ARMORY_LOGO_PATH": ""}):
             rendered = render_armory_overview(_fixture_requests()["one"])
         self.assertEqual(_snapshot_digest(rendered), expected)
 
@@ -330,7 +329,7 @@ class GraphicRendererTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             logo_path = Path(directory) / "test-logo.png"
             Image.new("RGBA", (24, 24), (10, 20, 30, 128)).save(logo_path)
-            with patch("wow_forever_armory.graphic_renderer._LOGO_PATH", logo_path):
+            with patch.dict(os.environ, {"ARMORY_LOGO_PATH": str(logo_path)}):
                 logo = _load_logo()
             self.assertEqual(logo.mode, "RGBA")
             self.assertIsNotNone(logo.getchannel("A").getbbox())
@@ -342,8 +341,8 @@ class GraphicRendererTests(unittest.TestCase):
     def test_missing_logo_fails_loader_but_renderer_uses_blank_header_space(
         self,
     ) -> None:
-        with patch(
-            "wow_forever_armory.graphic_renderer._LOGO_PATH", Path("missing-logo.png")
+        with (
+            patch.dict(os.environ, {"ARMORY_LOGO_PATH": "missing-logo.png"}),
         ):
             with self.assertRaises(GraphicAssetError):
                 _load_logo()
@@ -351,6 +350,19 @@ class GraphicRendererTests(unittest.TestCase):
                 ArmoryGraphicRequest("Member", (_character("Hero", "Druid"),))
             )
         self.assertTrue(rendered.startswith(b"\x89PNG"))
+
+    def test_separately_provisioned_logo_is_optional_and_rejects_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logo_path = root / "licensed-logo.png"
+            Image.new("RGBA", (24, 24), (10, 20, 30, 255)).save(logo_path)
+            with patch.dict(os.environ, {"ARMORY_LOGO_PATH": str(logo_path)}):
+                self.assertEqual(_load_logo().size, (24, 24))
+                alias = root / "alias.png"
+                alias.symlink_to(logo_path)
+                with patch.dict(os.environ, {"ARMORY_LOGO_PATH": str(alias)}):
+                    with self.assertRaises(GraphicAssetError):
+                        _load_logo()
 
     def test_member_state_adapter_uses_normalized_snapshots_only(self) -> None:
         core_character = Character(

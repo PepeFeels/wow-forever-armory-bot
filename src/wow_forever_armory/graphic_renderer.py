@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import re
+import stat as stat_module
 import unicodedata
 import warnings
 from dataclasses import dataclass
@@ -19,7 +21,6 @@ from .guild_armory_store import StoredCharacter
 from .models import Character, Profession
 
 _ASSET_DIR: Final = Path(__file__).with_name("assets")
-_LOGO_PATH: Final = _ASSET_DIR / "wow_forever_logo.png"
 _FONT_DIR: Final = _ASSET_DIR / "fonts"
 _OUTPUT_SIZES: Final = {1: (800, 900), 2: (1200, 900), 3: (1800, 900)}
 _STALE_AFTER: Final = timedelta(days=30)
@@ -265,18 +266,37 @@ def _background(size: tuple[int, int]) -> Image.Image:
 
 
 def _load_logo() -> Image.Image:
+    configured = os.getenv("ARMORY_LOGO_PATH")
+    if not configured:
+        raise GraphicAssetError("No separately provisioned local logo is configured")
+    path = Path(configured)
+    descriptor = -1
     try:
-        if _LOGO_PATH.stat().st_size > _MAX_LOGO_BYTES:
-            raise GraphicAssetError("The bundled logo exceeds the size limit")
-        with Image.open(_LOGO_PATH) as source:
-            if source.format != "PNG" or source.width > 4096 or source.height > 4096:
-                raise GraphicAssetError("The bundled logo is not a safe PNG")
-            if source.width * source.height > _MAX_SOURCE_PIXELS:
-                raise GraphicAssetError("The bundled logo exceeds the pixel limit")
-            source.load()
-            return source.convert("RGBA")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if not stat_module.S_ISREG(info.st_mode):
+            raise GraphicAssetError("The local logo is not a regular file")
+        if info.st_size > _MAX_LOGO_BYTES:
+            raise GraphicAssetError("The local logo exceeds the size limit")
+        with os.fdopen(descriptor, "rb") as logo_file:
+            descriptor = -1
+            with Image.open(logo_file) as source:
+                if (
+                    source.format != "PNG"
+                    or source.width > 4096
+                    or source.height > 4096
+                ):
+                    raise GraphicAssetError("The local logo is not a safe PNG")
+                if source.width * source.height > _MAX_SOURCE_PIXELS:
+                    raise GraphicAssetError("The local logo exceeds the pixel limit")
+                source.load()
+                return source.convert("RGBA")
     except (OSError, UnidentifiedImageError) as exc:
-        raise GraphicAssetError("The bundled WoW Forever logo is unavailable") from exc
+        raise GraphicAssetError("The local WoW Forever logo is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _load_portrait(png: bytes | None) -> Image.Image | None:

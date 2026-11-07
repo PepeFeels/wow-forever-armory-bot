@@ -37,16 +37,24 @@ def _create_guild_database(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.executescript(
             "CREATE TABLE guilds (guild_id INTEGER PRIMARY KEY, channel_id INTEGER, "
-            "panel_message_id INTEGER);"
+            "panel_message_id INTEGER, created_at TEXT, updated_at TEXT);"
             "CREATE TABLE members (guild_id INTEGER, user_id INTEGER, "
-            "row_message_id INTEGER, manage_message_id INTEGER);"
-            "CREATE TABLE characters (guild_id INTEGER, user_id INTEGER, path TEXT);"
-            "CREATE TABLE flows (guild_id INTEGER, user_id INTEGER);"
-            "INSERT INTO guilds VALUES (123, 456, 789);"
-            "INSERT INTO members VALUES (123, 456, 790, 791);"
-            "INSERT INTO characters VALUES (123, 456, 'fixture-path-0');"
-            "INSERT INTO characters VALUES (123, 456, 'fixture-path-1');"
-            "INSERT INTO characters VALUES (123, 456, 'fixture-path-2');"
+            "display_name TEXT, "
+            "row_message_id INTEGER, manage_message_id INTEGER, updated_at TEXT);"
+            "CREATE TABLE characters (guild_id INTEGER, user_id INTEGER, path TEXT, "
+            "slot INTEGER, character_json TEXT, created_at TEXT, updated_at TEXT);"
+            "CREATE TABLE flows (guild_id INTEGER, user_id INTEGER, "
+            "panel_message_id INTEGER, dm_message_id INTEGER, created_at TEXT);"
+            "INSERT INTO guilds VALUES (123, 456, 789, 'created-g', 'updated-g');"
+            "INSERT INTO members VALUES (123, 457, 'Member Fixture', "
+            "790, 791, 'updated-m');"
+            "INSERT INTO flows VALUES (123, 457, 789, 792, 'created-f');"
+            "INSERT INTO characters VALUES (123, 457, 'fixture-path-0', 0, "
+            "'{\"name\":\"Hero 0\",\"level\":60}', 'created-0', 'updated-0');"
+            "INSERT INTO characters VALUES (123, 457, 'fixture-path-1', 1, "
+            "'{\"name\":\"Hero 1\",\"level\":59}', 'created-1', 'updated-1');"
+            "INSERT INTO characters VALUES (123, 457, 'fixture-path-2', 2, "
+            "'{\"name\":\"Hero 2\",\"level\":58}', 'created-2', 'updated-2');"
         )
 
 
@@ -69,6 +77,22 @@ def _discord_references(path: Path) -> tuple[int, ...]:
             "SELECT row_message_id, manage_message_id FROM members"
         ).fetchone()
     return (*guild, *member)
+
+
+def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    with sqlite3.connect(path) as connection:
+        return {
+            table: tuple(
+                sorted(
+                    (
+                        tuple(row)
+                        for row in connection.execute(f"SELECT * FROM {table}")
+                    ),
+                    key=repr,
+                )
+            )
+            for table in ("guilds", "members", "characters", "flows")
+        }
 
 
 class ProductionMigrationTests(unittest.TestCase):
@@ -109,6 +133,8 @@ class ProductionMigrationTests(unittest.TestCase):
         self.assertEqual(
             _discord_references(self.target), _discord_references(self.source)
         )
+        self.assertEqual(_database_rows(self.source), _database_rows(backup))
+        self.assertEqual(_database_rows(self.source), _database_rows(self.target))
         self.assertEqual(
             hashlib.sha256(self.source.read_bytes()).hexdigest(), original_hash
         )
@@ -190,6 +216,7 @@ class ProductionMigrationTests(unittest.TestCase):
         self.assertFalse(self.backups.exists())
 
     def test_interrupted_import_keeps_startup_marker_and_blocks_preflight(self) -> None:
+        original_hash = hashlib.sha256(self.source.read_bytes()).hexdigest()
         with patch.object(
             migration.shutil,
             "copyfileobj",
@@ -202,6 +229,35 @@ class ProductionMigrationTests(unittest.TestCase):
         guard = _load_preflight()
         self.assertFalse(guard.database_is_ready(self.target))
         self.assertTrue(self.source.exists())
+        self.assertEqual(
+            hashlib.sha256(self.source.read_bytes()).hexdigest(), original_hash
+        )
+        backups = list(self.backups.glob("guild-armory-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        verify_database(backups[0])
+        self.assertEqual(_database_rows(self.source), _database_rows(backups[0]))
+
+    def test_failure_after_target_publish_keeps_marker_source_and_verified_backup(
+        self,
+    ) -> None:
+        verify = migration.verify_database
+
+        def fail_target(path):
+            if Path(path) == self.target:
+                raise RuntimeError("synthetic final target verification failure")
+            return verify(path)
+
+        with patch.object(migration, "verify_database", side_effect=fail_target):
+            with self.assertRaisesRegex(RuntimeError, "final target verification"):
+                self._migrate()
+
+        self.assertTrue(self.target.exists())
+        self.assertTrue(restore_marker_path(self.target).exists())
+        self.assertTrue(self.source.exists())
+        backups = list(self.backups.glob("guild-armory-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        verify_database(backups[0])
+        self.assertEqual(_database_rows(self.source), _database_rows(backups[0]))
 
 
 if __name__ == "__main__":

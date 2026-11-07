@@ -2,3 +2,5 @@
 ARMORY_LOG_LEVEL=INFO
 ARMORY_LOG_FORMAT=text
 ARMORY_BACKUP_RETENTION=14
+# Optional separately provisioned asset; omit unless redistribution rights are confirmed.
+# ARMORY_LOGO_PATH=/etc/wow-forever-armory-bot/wow_forever_logo.png

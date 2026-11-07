@@ -26,11 +26,14 @@ local development only; omit both from the production EnvironmentFile.
 
 Place the token in `/etc/wow-forever-armory-bot/discord-token`, also mode
 `0600` and root-owned. systemd passes it as a credential file. The stable
-launcher at `/opt/wow-forever-armory-bot/bin/armory-launch` reads that file and
-passes the token privately in the bot process environment. This supports both
-the current code and rollback to the earlier v0.2.0 code, which reads
-`DISCORD_BOT_TOKEN`. The launcher never prints the token. Never put the token
-in unit arguments or logs. Install the service and timer templates only after
+launcher at `/opt/wow-forever-armory-bot/bin/armory-launch` exports only the
+credential file path as `DISCORD_BOT_TOKEN_FILE`; the application reads the
+credential itself, so the value is not copied into the process environment.
+This requires a release supporting `DISCORD_BOT_TOKEN_FILE`; earlier code that
+does not support `DISCORD_BOT_TOKEN_FILE` is not a safe rollback target for
+this launcher. The approved v0.2.0 base already supports the credential-file
+interface.
+Never put the token in unit arguments or logs. Install the service and timer templates only after
 reviewing paths and account permissions. Run `systemd-analyze verify` on copies
 in a staging environment. Do not enable either unit until a separate
 production approval.
@@ -330,7 +333,7 @@ part of the approved deployment review.
 
 ## TASK 019 final installation gate
 
-`deploy/production_install.py` is an administrator-only, idempotent installer.
+`deploy/production_install.py` is an administrator-only, fail-closed installer.
 It is preparation code and must not be run until reviewed and committed. It
 requires the full approved release SHA and checks that it exactly matches the
 clean checkout's HEAD on `feature/v0.2.0-discord`. It also verifies the release
@@ -351,10 +354,30 @@ to use them. Global command changes may take time to propagate. The config sourc
 root-owned private regular file. The credential source must be root-owned mode
 `0600`; the installer copies it without displaying its contents. Do not store
 the token in the EnvironmentFile. The systemd credential is passed through the
-stable launcher for compatibility with earlier v0.2.0 code. The token is
-consequently present in the bot process environment; other users are isolated
-by the dedicated service account and `ProtectProc`, but code running as that
-same account can inspect its own process environment.
+stable launcher as `DISCORD_BOT_TOKEN_FILE`; the token value is not copied into
+the bot process environment. A rollback candidate must support this file-based
+credential interface; do not roll back to a launcher/application combination
+that expects only `DISCORD_BOT_TOKEN`.
+
+The release locks runtime and build dependencies in
+`deploy/requirements-runtime.lock` and `deploy/requirements-build.lock` with
+artifact hashes. They target CPython 3.14 on Linux x86_64. The installer checks
+the interpreter and platform before creating a release, then installs only
+hash-verified dependencies and builds the package without an unpinned isolated
+build environment. Do not widen the supported Python/platform target without
+generating and reviewing matching artifact hashes.
+
+The official logo is optional and separately provisioned. If its rights are
+confirmed, install it at
+`/etc/wow-forever-armory-bot/wow_forever_logo.png`, owned by `root:wow-armory`
+with mode `0640`, and set `ARMORY_LOGO_PATH` in the non-secret config. The
+installer checks the path, ownership, mode, and service-account readability.
+If the path is omitted, rendering leaves the logo region blank.
+
+The installer refuses an existing versioned release directory without a valid
+completion marker. It preserves that directory for operator review; inspect it
+and quarantine it manually under an approved maintenance procedure before any
+retry. It never recursively removes incomplete release content.
 
 The unit runs `armory-db-preflight` (installed from
 `deploy/systemd/armory-db-preflight.py`) with systemd's `+` privilege prefix

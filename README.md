@@ -8,7 +8,7 @@ Python bot foundation that displays public WoW Forever Armory profiles in a shar
 - `guild_armory_urls.py` accepts only HTTPS URLs on `worldofwarcraft.blizzard.com` with the supported locale/region/character path. It converts the URL to a Core path and asks the Core to validate it before any request.
 - `guild_armory_store.py` persists active guild panels, pending flows, members, row message IDs, character paths, normalized profile snapshots, and timestamps in SQLite. Short local database operations are serialized; write transactions do not span Discord or Armory requests.
 - `guild_armory_images.py` renders the illustrated Swedish panel and one wide PNG row per member locally with Pillow. The intro background is bundled; no remote images or fonts are downloaded.
-- `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses the supplied WoW Forever logo and bundled DejaVu fonts, and is called from the existing member-row synchronization path.
+- `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses bundled DejaVu fonts and an optional separately provisioned WoW Forever logo, and is called from the existing member-row synchronization path.
 - `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
 
 ## Development setup
@@ -24,6 +24,13 @@ set -a
 . ./.env
 set +a
 ```
+
+Production dependency versions are pinned in `deploy/requirements-runtime.lock`
+with SHA-256 hashes for CPython 3.14 on Linux x86_64. The build backend is
+separately locked in `deploy/requirements-build.lock`. The production installer
+uses `--require-hashes` and rejects unsupported Python/platform combinations.
+Regenerate and review both locks when updating dependencies; do not hand-edit
+versions without their artifact hashes.
 
 Source the local `.env` into the process environment as shown, or export the same variables another way. Set a real development bot token locally. For faster development command propagation, you may optionally set a controlled test guild ID. Keep `.env` private; it is ignored by Git.
 

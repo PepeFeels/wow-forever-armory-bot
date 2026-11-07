@@ -37,6 +37,7 @@ CONFIG_KEYS = {
     "ARMORY_LOG_LEVEL",
     "ARMORY_LOG_FORMAT",
     "ARMORY_BACKUP_RETENTION",
+    "ARMORY_LOGO_PATH",
 }
 
 
@@ -105,6 +106,11 @@ def validate_config(config: str | Path, *, expected_owner: int = 0) -> None:
         raise InstallError("configuration has an invalid log format")
     if not retention.isdecimal() or int(retention) < 1:
         raise InstallError("configuration has an invalid backup retention")
+    logo_path = settings.get("ARMORY_LOGO_PATH")
+    if "ARMORY_LOGO_PATH" in settings and logo_path != (
+        "/etc/wow-forever-armory-bot/wow_forever_logo.png"
+    ):
+        raise InstallError("configuration has an unsupported local logo path")
 
 
 def validate_inputs(
@@ -144,6 +150,28 @@ def _run(
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise InstallError(f"installation command failed: {command[0]}") from exc
+
+
+def _require_supported_runtime(interpreter: Path) -> None:
+    try:
+        version = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                (
+                    "import platform,sys; "
+                    "print(f'{sys.version_info.major}.{sys.version_info.minor}:"
+                    "{platform.machine()}:{sys.platform}')"
+                ),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise InstallError("could not verify the release Python runtime") from exc
+    if version != "3.14:x86_64:linux":
+        raise InstallError("release lock supports CPython 3.14 on Linux x86_64")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -250,6 +278,29 @@ def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
                 raise InstallError("service account cannot execute release file")
 
 
+def _validate_logo_asset(path: Path, service_uid: int, service_gid: int) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise InstallError("configured logo must be a regular non-symlink file")
+    info = path.stat()
+    if (
+        info.st_uid != 0
+        or info.st_gid != service_gid
+        or stat.S_IMODE(info.st_mode) != 0o640
+    ):
+        raise InstallError("configured logo ownership or permissions are unsafe")
+    if not _permits(info, service_uid, service_gid, 0o4):
+        raise InstallError("service account cannot read configured logo")
+
+
+def _configured_logo_path(config: Path) -> Path | None:
+    content = _read_regular_file(config, expected_owner=0, maximum_bytes=65536)
+    for line in content.decode("utf-8").splitlines():
+        key, separator, value = line.strip().partition("=")
+        if separator and key == "ARMORY_LOGO_PATH":
+            return Path(value)
+    return None
+
+
 def _copy_secret(source: Path, destination: Path) -> None:
     data = _read_regular_file(
         source, expected_owner=0, maximum_bytes=4096, exact_mode=0o600
@@ -272,6 +323,7 @@ def _copy_secret(source: Path, destination: Path) -> None:
 def _install_release(
     repo: Path, release: Path, uid: int, gid: int, release_sha: str
 ) -> None:
+    _require_supported_runtime(Path(sys.executable))
     marker = release / ".installation-complete"
     if release.is_symlink():
         raise InstallError("release directory must not be a symbolic link")
@@ -282,13 +334,10 @@ def _install_release(
             or marker.stat().st_uid != 0
             or marker.read_text() != release_sha
         ):
-            info = release.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
-                raise InstallError(
-                    "incomplete release path is not a root-owned directory"
-                )
-            shutil.rmtree(release)
-            release.mkdir(parents=True, mode=0o755)
+            raise InstallError(
+                "release path is incomplete or has a mismatched marker; "
+                "preserve it for operator review"
+            )
         else:
             _verify_release_readable(release, uid, gid)
             return
@@ -310,7 +359,42 @@ def _install_release(
     interpreter = Path(sys.executable)
     _run([str(interpreter), "-m", "venv", str(release / ".venv")])
     python = release / ".venv" / "bin" / "python"
-    _run([str(python), "-m", "pip", "install", "--no-input", str(release)])
+    _run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--require-hashes",
+            "-r",
+            str(release / "deploy/requirements-build.lock"),
+        ]
+    )
+    _run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--require-hashes",
+            "-r",
+            str(release / "deploy/requirements-runtime.lock"),
+        ]
+    )
+    _run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--no-build-isolation",
+            "--no-deps",
+            str(release),
+        ]
+    )
     _run([str(python), "-m", "pip", "check"])
     _run([str(python), "-m", "compileall", "-q", str(release / "src")])
     for directory, subdirectories, files in os.walk(release, followlinks=False):
@@ -369,6 +453,7 @@ def install(
         raise InstallError("run this installation script as an administrator")
     _check_repository(repo, release_sha)
     validate_inputs(config_source, credential_source)
+    _require_supported_runtime(Path(sys.executable))
     for unit in UNIT_FILES:
         for verb in ("is-active", "is-enabled"):
             result = subprocess.run(
@@ -382,6 +467,9 @@ def install(
                 )
 
     uid, gid = _account()
+    configured_logo = _configured_logo_path(config_source)
+    if configured_logo is not None:
+        _validate_logo_asset(configured_logo, uid, gid)
     for path, mode, owner, group in (
         (BASE, 0o755, 0, 0),
         (BASE / "releases", 0o755, 0, 0),

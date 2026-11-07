@@ -5,15 +5,24 @@ from __future__ import annotations
 import importlib.util
 import os
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from deploy.production_install import InstallError, _check_repository, validate_inputs
+from deploy.production_install import (
+    InstallError,
+    _check_repository,
+    _install_release,
+    _require_supported_runtime,
+    _validate_logo_asset,
+    validate_config,
+    validate_inputs,
+)
 
 
 def _load_preflight():
@@ -84,6 +93,82 @@ class ProductionInstallTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("DISCORD_TEST_GUILD_ID=", example)
         self.assertFalse(hasattr(preflight, "guild_configuration_is_valid"))
+
+    def test_optional_logo_path_is_allowlisted_for_external_provisioning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config"
+            config.write_text(
+                "ARMORY_LOGO_PATH=/etc/wow-forever-armory-bot/wow_forever_logo.png\n",
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            validate_config(config, expected_owner=os.getuid())
+            config.write_text("ARMORY_LOGO_PATH=/tmp/unreviewed.png\n")
+            config.chmod(0o600)
+            with self.assertRaisesRegex(InstallError, "unsupported local logo"):
+                validate_config(config, expected_owner=os.getuid())
+
+    def test_logo_asset_requires_root_service_group_and_exact_private_mode(
+        self,
+    ) -> None:
+        asset = Mock()
+        asset.is_symlink.return_value = False
+        asset.is_file.return_value = True
+        asset.stat.return_value = SimpleNamespace(
+            st_uid=0, st_gid=321, st_mode=stat.S_IFREG | 0o640
+        )
+        _validate_logo_asset(asset, service_uid=654, service_gid=321)
+        asset.stat.return_value = SimpleNamespace(
+            st_uid=0, st_gid=0, st_mode=stat.S_IFREG | 0o644
+        )
+        with self.assertRaisesRegex(InstallError, "ownership or permissions"):
+            _validate_logo_asset(asset, service_uid=654, service_gid=321)
+
+    def test_incomplete_release_is_preserved_for_operator_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            release = root / "release"
+            release.mkdir()
+            sentinel = release / "operator-review.txt"
+            sentinel.write_text("preserve this file", encoding="utf-8")
+            with self.assertRaisesRegex(
+                InstallError, "preserve it for operator review"
+            ):
+                _install_release(repo, release, os.getuid(), os.getgid(), "a" * 40)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve this file")
+
+    def test_dependency_locks_pin_every_dependency_and_hash(self) -> None:
+        root = Path(__file__).parents[1] / "deploy"
+        for name in ("requirements-build.lock", "requirements-runtime.lock"):
+            entries = [
+                line.strip()
+                for line in (root / name).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            self.assertTrue(entries)
+            logical = " ".join(entries).replace("\\", "").split()
+            self.assertEqual(len(logical) % 2, 0)
+            for index in range(0, len(logical), 2):
+                self.assertRegex(logical[index], r"^[A-Za-z0-9_.-]+==[^=]+$")
+                self.assertRegex(logical[index + 1], r"^--hash=sha256:[0-9a-f]{64}$")
+
+    def test_release_python_guard_is_explicitly_limited_to_locked_target(self) -> None:
+        source = (Path(__file__).parents[1] / "deploy/production_install.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('version != "3.14:x86_64:linux"', source)
+        project = (Path(__file__).parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('requires-python = ">=3.14,<3.15"', project)
+        with patch(
+            "deploy.production_install.subprocess.run",
+            return_value=SimpleNamespace(stdout="3.13:x86_64:linux"),
+        ):
+            with self.assertRaisesRegex(InstallError, "supports CPython 3.14"):
+                _require_supported_runtime(Path("python"))
 
     def test_config_guild_must_match_independently_supplied_value(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
