@@ -1,6 +1,7 @@
 """Guild Armory command and event tests with no Discord gateway access."""
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,6 +127,99 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         guild = self.bot.tree.copy_global_to.call_args.kwargs["guild"]
         self.assertEqual(guild.id, 999)
         self.bot.tree.sync.assert_awaited_once_with(guild=guild)
+
+    async def test_setup_globally_syncs_when_no_development_guild_is_configured(
+        self,
+    ) -> None:
+        self.bot.test_guild_id = None
+        self.bot.add_cog = AsyncMock()
+        self.bot.tree.copy_global_to = MagicMock()
+        self.bot.tree.sync = AsyncMock(return_value=[object(), object()])
+        await self.bot.setup_hook()
+        self.bot.tree.copy_global_to.assert_not_called()
+        self.bot.tree.sync.assert_awaited_once_with()
+
+    async def test_create_bot_does_not_require_test_guild_configuration(self) -> None:
+        from wow_forever_armory.discord_bot import create_bot
+
+        with patch.dict(os.environ, {}, clear=True):
+            bot = create_bot()
+        try:
+            self.assertIsNone(bot.test_guild_id)
+        finally:
+            await bot.close()
+
+    async def test_create_bot_rejects_invalid_optional_test_guild(self) -> None:
+        from wow_forever_armory.discord_bot import create_bot
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARMORY_ENVIRONMENT": "development",
+                "DISCORD_TEST_GUILD_ID": "not-a-guild",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "positive integer"):
+                create_bot()
+
+    async def test_development_mode_honors_test_guild_override(self) -> None:
+        from wow_forever_armory.discord_bot import create_bot
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARMORY_ENVIRONMENT": "development",
+                "DISCORD_TEST_GUILD_ID": "123456789012345678",
+            },
+        ):
+            bot = create_bot()
+        try:
+            self.assertEqual(bot.test_guild_id, 123456789012345678)
+        finally:
+            await bot.close()
+
+    async def test_production_ignores_legacy_test_guild_environment_variable(
+        self,
+    ) -> None:
+        from wow_forever_armory.discord_bot import create_bot
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARMORY_ENVIRONMENT": "production",
+                "DISCORD_TEST_GUILD_ID": "123456789012345678",
+            },
+        ):
+            bot = create_bot()
+        try:
+            self.assertIsNone(bot.test_guild_id)
+        finally:
+            await bot.close()
+
+    async def test_same_member_has_independent_access_in_two_guilds(self) -> None:
+        await self.store.activate_guild(222, 223, 224)
+        self.assertEqual((await self.store.get_guild(111)).channel_id, 222)
+        self.assertEqual((await self.store.get_guild(222)).channel_id, 223)
+        self.assertEqual((await self.store.get_guild_by_panel(333)).guild_id, 111)
+        self.assertEqual((await self.store.get_guild_by_panel(224)).guild_id, 222)
+        first_guild = await self.store.finish_flow(
+            111, 456, "First", f"{PREFIX}/first", Character(name="First")
+        )
+        second_guild = await self.store.finish_flow(
+            222, 456, "Second", f"{PREFIX}/second", Character(name="Second")
+        )
+        self.assertEqual(first_guild.guild_id, 111)
+        self.assertEqual(second_guild.guild_id, 222)
+        self.assertEqual(
+            (await self.store.member(111, 456)).characters[0].path,
+            f"{PREFIX}/first",
+        )
+        self.assertEqual(
+            (await self.store.member(222, 456)).characters[0].path,
+            f"{PREFIX}/second",
+        )
+        with self.assertRaises(ValueError):
+            await self.store.remove_character(222, 456, f"{PREFIX}/first")
 
     async def test_startup_recovery_reuses_panel_and_member_row(self) -> None:
         await self.store.finish_flow(

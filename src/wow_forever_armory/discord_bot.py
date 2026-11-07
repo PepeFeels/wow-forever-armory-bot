@@ -142,7 +142,7 @@ class ArmoryBot(commands.Bot):
         self,
         armory_client: ArmoryClient,
         store: GuildArmoryStore,
-        test_guild_id: int,
+        test_guild_id: int | None = None,
     ) -> None:
         super().__init__(
             command_prefix=commands.when_mentioned,
@@ -172,10 +172,14 @@ class ArmoryBot(commands.Bot):
         configs = await self.store.guilds()
         for config in configs:
             self.add_view(GuildPanelView(self, config.guild_id))
-        test_guild = discord.Object(id=self.test_guild_id)
-        self.tree.copy_global_to(guild=test_guild)
-        await self.tree.sync(guild=test_guild)
-        _LOGGER.info("slash_commands_synced", extra={"guild_count": 1})
+        if self.test_guild_id is not None:
+            test_guild = discord.Object(id=self.test_guild_id)
+            self.tree.copy_global_to(guild=test_guild)
+            await self.tree.sync(guild=test_guild)
+            _LOGGER.info("slash_commands_synced_to_test_guild")
+        else:
+            synced = await self.tree.sync()
+            _LOGGER.info("global_slash_commands_synced", extra={"count": len(synced)})
 
     def activation_lock(self, guild_id: int) -> asyncio.Lock:
         return self._activation_locks[guild_id % _LOCK_STRIPES]
@@ -859,12 +863,24 @@ class ArmoryBot(commands.Bot):
 
 def create_bot() -> ArmoryBot:
     """Build an offline bot instance from public configuration and env secrets."""
-    try:
-        test_guild_id = int(os.getenv("DISCORD_TEST_GUILD_ID", ""))
-    except ValueError as exc:
-        raise RuntimeError("DISCORD_TEST_GUILD_ID must be configured") from exc
-    if test_guild_id <= 0:
-        raise RuntimeError("DISCORD_TEST_GUILD_ID must be a positive integer")
+    runtime_environment = os.getenv("ARMORY_ENVIRONMENT", "production").lower()
+    if runtime_environment not in {"production", "development"}:
+        raise RuntimeError("ARMORY_ENVIRONMENT must be production or development")
+    raw_test_guild_id = (
+        os.getenv("DISCORD_TEST_GUILD_ID")
+        if runtime_environment == "development"
+        else None
+    )
+    test_guild_id: int | None = None
+    if raw_test_guild_id:
+        try:
+            test_guild_id = int(raw_test_guild_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                "DISCORD_TEST_GUILD_ID must be a positive integer when set"
+            ) from exc
+        if test_guild_id <= 0:
+            raise RuntimeError("DISCORD_TEST_GUILD_ID must be a positive integer")
     timeout = float(os.getenv("ARMORY_TIMEOUT", "10"))
     database_path = Path(os.getenv("ARMORY_DATABASE_PATH", "data/guild-armory.sqlite3"))
     return ArmoryBot(

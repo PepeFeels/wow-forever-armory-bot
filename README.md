@@ -24,16 +24,18 @@ set -a
 set +a
 ```
 
-Source the local `.env` into the process environment as shown, or export the same variables another way. Set a real development bot token and your controlled test guild ID locally. Keep `.env` private; it is ignored by Git.
+Source the local `.env` into the process environment as shown, or export the same variables another way. Set a real development bot token locally. For faster development command propagation, you may optionally set a controlled test guild ID. Keep `.env` private; it is ignored by Git.
 
 ```dotenv
 DISCORD_BOT_TOKEN=your-private-test-token
+ARMORY_ENVIRONMENT=development
+# Optional development-only fast command sync; used only in development mode.
 DISCORD_TEST_GUILD_ID=123456789012345678
 ARMORY_TIMEOUT=10
 ARMORY_DATABASE_PATH=data/guild-armory.sqlite3
 ```
 
-`DISCORD_TEST_GUILD_ID` is required. Startup syncs commands to that guild only; the bot never performs a global command sync. `ARMORY_DATABASE_PATH` defaults to `data/guild-armory.sqlite3`, which is ignored by Git.
+`ARMORY_ENVIRONMENT` defaults to `production`. `DISCORD_TEST_GUILD_ID` is optional and is honored only when `ARMORY_ENVIRONMENT=development`; then commands are copied and synced to that guild for fast iteration. In production, guild-specific sync is disabled even if a legacy `DISCORD_TEST_GUILD_ID` remains in the process environment. Production globally syncs application commands, so the bot works in every guild where it is installed and authorized. Global command changes can take time to propagate through Discord. Adding another guild requires only inviting the existing application with the documented OAuth scopes and permissions, not changing Python code, the systemd unit, or server environment files. `ARMORY_DATABASE_PATH` defaults to `data/guild-armory.sqlite3`, which is ignored by Git.
 
 ## Logging and diagnostics
 
@@ -58,6 +60,10 @@ Members react with ⚔️ to receive private instructions and a button that open
 
 Each member can keep up to three unique characters per guild. Their data appears in one wide image message in the panel's channel. Later additions, replacements, and removals edit that same message. **Mina karaktärer** and `/armory manage` provide private list, remove, and replace controls. Component IDs carry the originating guild, and the bot verifies membership before changing data, so DM actions are not guessed across a member's guilds.
 
+### Add another Discord server
+
+Invite the same Discord application to the server using OAuth2 scopes `bot` and `applications.commands`; grant only the channel and message permissions listed below. No guild ID needs to be added to Python code, the production environment file, or systemd. In production, leave `DISCORD_TEST_GUILD_ID` unset so global slash commands are available in every installed guild after Discord's propagation delay. A server administrator then runs `/armory activate` in the desired channel. Panel IDs, member registrations, authorization checks, and row-message references are keyed by guild ID, so the same Discord user has separate state in each server. The initial production guild ID is used for deployment verification only, not as an allowlist.
+
 All character URLs are submitted in a private modal; the bot does not read ordinary message content and does not enable the privileged Message Content or Members intents. The bot needs standard guild/reaction gateway intents and channel permissions to view the channel/history, send messages, attach files, embed links, add reactions, and edit its own messages. No privileged Discord Developer Portal intent is required.
 
 When the bot reconnects, it restores persistent component handlers and reconciles saved panel/member rows. Character snapshots and IDs are stored locally in SQLite so rows can be recreated without repeating Armory requests. Back up and restrict access to the database; it contains Discord IDs, character paths, and public profile snapshots. It contains no Discord token.
@@ -68,7 +74,7 @@ Run only when you are ready to connect to the configured development application
 .venv/bin/python -m wow_forever_armory.discord_bot
 ```
 
-Do not run this command for offline tests. It connects to Discord and syncs test-guild commands.
+Do not run this command for offline tests. It connects to Discord and syncs either the optional development guild or global commands.
 
 ## Security and operational limits
 

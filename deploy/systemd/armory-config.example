@@ -1,0 +1,4 @@
+# DISCORD_TEST_GUILD_ID is a development-only override. Omit in production.
+ARMORY_LOG_LEVEL=INFO
+ARMORY_LOG_FORMAT=text
+ARMORY_BACKUP_RETENTION=14

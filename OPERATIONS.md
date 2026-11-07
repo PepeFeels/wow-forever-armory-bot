@@ -16,11 +16,13 @@ Create `/etc/wow-forever-armory-bot/config` with mode `0600` and owner
 `root:root`; it contains only non-secret configuration, for example:
 
 ```dotenv
-DISCORD_TEST_GUILD_ID=123456789012345678
 ARMORY_LOG_LEVEL=INFO
 ARMORY_LOG_FORMAT=text
 ARMORY_BACKUP_RETENTION=14
 ```
+
+`ARMORY_ENVIRONMENT=development` and optional `DISCORD_TEST_GUILD_ID` are for
+local development only; omit both from the production EnvironmentFile.
 
 Place the token in `/etc/wow-forever-armory-bot/discord-token`, also mode
 `0600` and root-owned. systemd passes it as a credential file. The stable
@@ -325,3 +327,118 @@ substituted the future release interpreter path because that path is not
 installed in this development environment. Full verification against the
 target Ubuntu host, actual account ownership, and credential delivery remains
 part of the approved deployment review.
+
+## TASK 019 final installation gate
+
+`deploy/production_install.py` is an administrator-only, idempotent installer.
+It is preparation code and must not be run until reviewed and committed. It
+requires the full approved release SHA and checks that it exactly matches the
+clean checkout's HEAD on `feature/v0.2.0-discord`. It also verifies the release
+is based on checkpoint `9f5548d3763b42d38fff0613ef2cfd6c3b560d07`. It builds
+the versioned release from that exact SHA, creates the locked `wow-armory` account and
+private directories, copies the supplied config and private credential,
+installs the unit and timer, verifies their syntax, and reloads systemd. It
+does **not** enable or start anything. It refuses to overwrite a different
+`current` release or proceed if a target unit is already active or enabled.
+
+The project owner confirmed PROD Guild ID `1549012880215638086` for initial
+deployment verification. The runtime, installer, and systemd preflight are not
+pinned to that guild. Production configuration must omit
+`DISCORD_TEST_GUILD_ID`; production mode globally syncs application commands
+even if a legacy test-guild variable remains in the process environment,
+allowing every authorized guild where the application is installed
+to use them. Global command changes may take time to propagate. The config source must be a
+root-owned private regular file. The credential source must be root-owned mode
+`0600`; the installer copies it without displaying its contents. Do not store
+the token in the EnvironmentFile. The systemd credential is passed through the
+stable launcher for compatibility with earlier v0.2.0 code. The token is
+consequently present in the bot process environment; other users are isolated
+by the dedicated service account and `ProtectProc`, but code running as that
+same account can inspect its own process environment.
+
+The unit runs `armory-db-preflight` (installed from
+`deploy/systemd/armory-db-preflight.py`) with systemd's `+` privilege prefix
+before the launcher. This short, root-owned helper needs host process visibility to
+detect the old manual bot; it prints no environment values. It refuses to
+continue if another Armory module process exists or process inspection fails.
+It opens the configured database read-only and refuses a missing, zero-byte, invalid, uninitialized, or
+restore-gated database. It requires the Guild Armory tables and at least one
+registered guild. This prevents first start from creating an empty database
+in place of migrated data.
+
+Example invocation (configuration-changing; not run):
+
+```bash
+sudo /usr/bin/python3 \
+  /home/codex-dev/projects/wow-forever-armory-bot/deploy/production_install.py \
+  --release-sha <approved-full-commit-sha> \
+  --config-source /run/armory-install/config \
+  --credential-source /run/armory-install/discord-token
+```
+
+Stage the non-secret config from `deploy/systemd/armory-config.example`. It
+contains no guild pin. Read the token through a hidden prompt; never
+put it in a command argument, shell history, or log:
+
+```bash
+sudo install -d -o root -g root -m 0700 /run/armory-install
+sudo install -o root -g root -m 0600 deploy/systemd/armory-config.example /run/armory-install/config
+sudo /bin/bash -c 'umask 077; read -r -s -p "Discord token: " token; printf "\n" >&2; printf "%s\n" "$token" > /run/armory-install/discord-token; unset token'
+```
+
+After verifying installation, remove the temporary credential source from
+`/run/armory-install`. The installed root-owned credential remains at
+`/etc/wow-forever-armory-bot/discord-token` for systemd `LoadCredential`.
+
+The script installs systemd files and runs `daemon-reload`, but intentionally
+does not enable or start the service or timer. Verify installed paths and
+ownership afterward. The source checkout must be clean and its HEAD must equal
+`--release-sha`; use the full SHA from the reviewed and pushed checkpoint.
+These scripts require a separately approved installation before they can be
+run.
+
+### Legacy process inspection and database import
+
+Before the maintenance window, record the legacy process identity, working
+directory and database path while it is running. The read-only command below
+prints the selected database path and whether a credential variable exists.
+It reports whether the running process has a test-guild override and whether
+it matches an optional expected value; it never prints environment contents or
+token values. The expected-guild comparison is observational only and is not
+an installation or startup gate:
+
+```bash
+/home/codex-dev/projects/wow-forever-armory-bot/.venv/bin/python \
+  /home/codex-dev/projects/wow-forever-armory-bot/deploy/production_migration.py \
+  --inspect-legacy --expected-guild-id 1549012880215638086
+```
+
+After a separately approved graceful stop, run the migration script as root
+with both the recorded source path and the same path explicitly confirmed. It
+refuses to proceed if an Armory module process is running, the paths differ,
+the source is invalid, or the StateDirectory database already exists. It holds
+the updated bot's runtime lock and leaves the startup restore marker throughout
+the import. It creates a final online SQLite backup in a dedicated migration
+backup directory, checks integrity and aggregate guild/member/character
+counts, then atomically publishes the verified copy. The original database
+and pre-existing backups remain in place. A failed or interrupted import
+leaves the marker so startup remains blocked pending operator review.
+
+Example migration command (writes StateDirectory and backup files; not run):
+
+```bash
+sudo /opt/wow-forever-armory-bot/current/.venv/bin/python \
+  /home/codex-dev/projects/wow-forever-armory-bot/deploy/production_migration.py \
+  --source-database /home/codex-dev/projects/wow-forever-armory-bot/data/guild-armory.sqlite3 \
+  --expected-source-database /home/codex-dev/projects/wow-forever-armory-bot/data/guild-armory.sqlite3
+```
+
+The expected source path must come from pre-stop inspection, not a guess. Keep
+the service disabled and stopped until migration output, database ownership,
+permissions and preflight have been checked. Do not remove a restore marker or
+replace the StateDirectory database automatically after a failed import.
+
+For rollback, stop the new unit, preserve its current database and backup,
+switch the release pointer back, and use the current DB if its schema is
+compatible. Do not restore the pre-migration snapshot over registrations made
+after cutover unless that data loss is explicitly accepted.

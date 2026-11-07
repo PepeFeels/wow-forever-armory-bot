@@ -18,6 +18,7 @@ LoadCredential=discord-token:/etc/wow-forever-armory-bot/discord-token
 StateDirectory=wow-forever-armory-bot
 StateDirectoryMode=0700
 UMask=0077
+ExecStartPre=+/opt/wow-forever-armory-bot/bin/armory-db-preflight
 ExecStart=/opt/wow-forever-armory-bot/bin/armory-launch
 Restart=on-failure
 RestartSec=10s
