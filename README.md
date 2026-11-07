@@ -1,30 +1,97 @@
 # WoW Forever Armory Bot
 
-Python foundation for a standalone, multi-guild Discord bot that reads **public** WoW Forever Armory character pages. This repository currently contains only the Armory data layer. It does not run a bot or store guild configuration.
+Python bot foundation that displays public WoW Forever Armory profiles in a shared Discord guild channel. Version 0.2.0 adds an admin-activated, persistent Guild Armory over the existing Armory Core.
 
 ## Architecture
 
-- `parser.py` locates the `character-profile-mount-initial-state` script with Python's HTML parser. The script begins with `var characterProfileInitialState =`, followed by a JSON object and semicolon. The parser decodes only that JSON and rejects trailing executable content. It does not execute JavaScript.
-- `models.py` holds optional normalized character, specialization, and profession values. Every profession tier is retained.
-- `client.py` fetches a caller supplied relative profile path over HTTPS with an explicit timeout, bounded retries for transient HTTP errors, `Retry-After` handling, and structured log fields. It never uses credentials.
+- `client.py`, `parser.py`, and `models.py` remain the Armory Core. The Core fetches only validated relative paths over HTTPS, refuses redirects, applies timeouts, and parses public profile data.
+- `guild_armory_urls.py` accepts only HTTPS URLs on `worldofwarcraft.blizzard.com` with the supported locale/region/character path. It converts the URL to a Core path and asks the Core to validate it before any request.
+- `guild_armory_store.py` persists active guild panels, pending flows, members, row message IDs, character paths, normalized profile snapshots, and timestamps in SQLite. Short local database operations are serialized; write transactions do not span Discord or Armory requests.
+- `guild_armory_images.py` renders the illustrated Swedish panel and one wide PNG row per member locally with Pillow. The intro background is bundled; no remote images or fonts are downloaded.
+- `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
 
-The decoded object has `character`, `summary`, and `supportedArmoryTabs` keys. The character's `class.name` and `race.name` supply display names. The active entry in `character.specs` supplies specialization ID, name, and spent points. `character.professions.primaries` and `.secondaries` contain professions with `tiers`; each tier supplies `skillPoints` and `maxSkillPoints`. `character.lastUpdatedTimestamp` supplies `iso8601` and millisecond `epoch` values. The parser reads a valid ISO timestamp as aware UTC, falls back to the epoch in milliseconds when needed, and leaves invalid or absent values as `None`.
+## Development setup
 
-For a profession with one tier, `skill` and `max_skill` are convenient aliases for that tier. For multiple tiers, those aliases are `None`; read each entry in `tiers` to avoid losing or combining distinct ranks.
-
-## Local setup
-
-Use Python 3.14 or newer. Runtime use and tests require only the standard library. From this repository:
+Use Python 3.14 or newer:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
+cp .env.example .env
+set -a
+. ./.env
+set +a
 ```
 
-An editable install makes the package importable by pytest and other tools without setting `PYTHONPATH`.
+Source the local `.env` into the process environment as shown, or export the same variables another way. Set a real development bot token and your controlled test guild ID locally. Keep `.env` private; it is ignored by Git.
 
-## Example
+```dotenv
+DISCORD_BOT_TOKEN=your-private-test-token
+DISCORD_TEST_GUILD_ID=123456789012345678
+ARMORY_TIMEOUT=10
+ARMORY_DATABASE_PATH=data/guild-armory.sqlite3
+```
+
+`DISCORD_TEST_GUILD_ID` is required. Startup syncs commands to that guild only; the bot never performs a global command sync. `ARMORY_DATABASE_PATH` defaults to `data/guild-armory.sqlite3`, which is ignored by Git.
+
+## Logging and diagnostics
+
+When the bot is started with `.venv/bin/python -m wow_forever_armory.discord_bot`, it configures standard-library logging to `stderr`. The default level is `INFO`; set `ARMORY_LOG_LEVEL` to `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. An invalid level safely falls back to `INFO` with a warning. `ARMORY_LOG_FORMAT=text` is the default readable UTC ISO 8601 format; set it to `json` for JSON records with timestamps, levels, logger names, events, and selected safe numeric metadata. Invalid formats fall back to text.
+
+Example local settings:
+
+```dotenv
+ARMORY_LOG_LEVEL=INFO
+ARMORY_LOG_FORMAT=text
+```
+
+The bot and discord.py logs flow through separate Armory-owned handlers to the terminal's standard error. Root propagation is disabled for those logger namespaces to prevent a second copy through root handlers. A future systemd unit can let journald capture stderr; after such a unit is separately approved and created, logs can be read with `journalctl -u <unit-name> -f`. This project does not create a unit or log file. Application events do not include tokens, authorization values, submitted URLs, character paths, DM contents, or database records. The Armory-owned formatter also masks recognized tokens, authorization headers, URLs, and character paths in exceptions.
+
+If external handlers are attached directly to `wow_forever_armory` or `discord`, they remain unchanged and receive their own copy of each record. An external console handler can therefore print a duplicate line, and its formatter may expose exception text that the Armory-owned handler masks. The Armory formatter does not sanitize records for those external handlers. Review or remove such external handlers separately if duplicate output or their handling of exception details is unsuitable; the bot does not modify them.
+
+## Guild flow
+
+An administrator with **Manage Server** (or Administrator) runs `/armory activate` in the channel that will contain both the instruction panel and all member image rows. Activation is guild-only and idempotent. Repeating it reuses the saved panel; if the panel message was deleted, the bot recreates it in the same channel.
+
+Members react with ⚔️ to receive private instructions and a button that opens a URL modal in DM. The panel also has **Registrera privat**, which opens the same private modal as a discreet alternative when DMs are closed. The modal accepts only a full HTTPS character URL on `worldofwarcraft.blizzard.com` with a supported locale, region, and Armory character path. The Core blocks redirects and validates the final relative path.
+
+Each member can keep up to three unique characters per guild. Their data appears in one wide image message in the panel's channel. Later additions, replacements, and removals edit that same message. **Mina karaktärer** and `/armory manage` provide private list, remove, and replace controls. Component IDs carry the originating guild, and the bot verifies membership before changing data, so DM actions are not guessed across a member's guilds.
+
+All character URLs are submitted in a private modal; the bot does not read ordinary message content and does not enable the privileged Message Content or Members intents. The bot needs standard guild/reaction gateway intents and channel permissions to view the channel/history, send messages, attach files, embed links, add reactions, and edit its own messages. No privileged Discord Developer Portal intent is required.
+
+When the bot reconnects, it restores persistent component handlers and reconciles saved panel/member rows. Character snapshots and IDs are stored locally in SQLite so rows can be recreated without repeating Armory requests. Back up and restrict access to the database; it contains Discord IDs, character paths, and public profile snapshots. It contains no Discord token.
+
+Run only when you are ready to connect to the configured development application and test guild:
+
+```bash
+.venv/bin/python -m wow_forever_armory.discord_bot
+```
+
+Do not run this command for offline tests. It connects to Discord and syncs test-guild commands.
+
+## Security and operational limits
+
+- Keep the bot token in a secret manager or private local environment. Never commit a real token or put it in command arguments.
+- Armory submissions are checked against a single official HTTPS hostname and strict path shape. The existing Core URL validator enforces host boundaries; its HTTP client refuses redirects.
+- Every user action is scoped to the selected guild and Discord user. SQLite enforces unique character paths, three slots, and guild/user ownership. A small in-process semaphore bounds concurrent Armory requests.
+- SQLite and the rendered image files stay local; images are sent as Discord attachments and are not stored as files on disk.
+- The semaphore and member-operation locks are process-local. Run a single bot process against a database; horizontal multi-process coordination is not implemented.
+- If Discord is unavailable after a registration commits, the stored snapshot lets startup recovery repair the row message. If a channel is permanently inaccessible or a database is lost, an administrator must restore permissions or the database backup.
+
+## Tests and checks
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/mypy src/wow_forever_armory
+.venv/bin/python -m compileall -q src tests
+```
+
+All automated tests use temporary SQLite files, synthetic profiles, and mocked Discord/Core calls. They make no network requests or gateway connections.
+
+## Armory Core example
 
 ```python
 import asyncio
@@ -32,7 +99,6 @@ from wow_forever_armory import ArmoryClient
 
 async def main() -> None:
     client = ArmoryClient(timeout=10, max_retries=2)
-    # Supply a public character path relative to the configured base URL.
     character = await client.fetch_character(
         "en-us/forever/eu/armory/character/pepe-feels"
     )
@@ -41,37 +107,4 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The client does not discover characters or infer a profile URL from a name. The example path is a public test character; its values will change over time.
-
-To perform an **explicit**, one-request live smoke test, run:
-
-```bash
-.venv/bin/python -m wow_forever_armory.smoke \
-  en-us/forever/eu/armory/character/pepe-feels
-```
-
-The smoke command is never invoked by the offline tests or CI. It prints a concise normalized summary and does not save the HTML page. It disables retries, so an HTTP failure or rate limit stops the command after one request.
-
-## Tests and checks
-
-```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q src tests
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
-.venv/bin/mypy src/wow_forever_armory
-```
-
-The Ruff, mypy, and pytest commands require those development tools in the local virtual environment. All tests use synthetic HTML and mocked HTTP responses; they make no network requests.
-
-## Current limitations
-
-- The field paths are based on the verified public character snapshot supplied for this task. Offline fixtures are minimal and do not cover every Armory field or future schema changes.
-- `fetch_character` accepts a known relative URL path; search and URL discovery are not implemented.
-- The standard library HTTP request runs in a worker thread. Cancellation of the coroutine cannot stop an in-flight socket call immediately, although the socket has a timeout.
-- There is no persistent cache or cross-process rate limiter. Callers should keep polling infrequent and honor Armory restrictions.
-- No Discord commands, guild configuration, or persistence are included yet.
-
-## Next step
-
-Add Discord commands and per-guild character configuration on top of this data layer, with a small opt-in live check after Armory schema changes.
+The Core accepts known relative paths and does not search for characters. A one-request live Core smoke test remains available through `python -m wow_forever_armory.smoke`, but is not run by this task or the offline suite.

@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wow-forever-armory-bot"
-version = "0.1.0"
-description = "Public WoW Forever Armory data layer"
+version = "0.2.0"
+description = "WoW Forever Armory Core and Discord integration"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
 authors = [{name = "WoW Forever Armory contributors"}]
-dependencies = []
+dependencies = ["discord.py>=2.4,<3", "Pillow>=10,<14"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+wow_forever_armory = ["assets/*.png"]
 
 [tool.ruff]
 target-version = "py314"
