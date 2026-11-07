@@ -22,6 +22,10 @@ import sys
 import tarfile
 from pathlib import Path
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from deploy.production_db_snapshot import verify_database_snapshot
+
 BASE_CHECKPOINT_SHA = "9f5548d3763b42d38fff0613ef2cfd6c3b560d07"
 BRANCH = "feature/v0.2.0-discord"
 SERVICE_USER = "wow-armory"
@@ -181,6 +185,43 @@ def _assert_units_stopped_and_disabled(*, upgrade_existing: bool) -> None:
                 )
     except OSError as exc:
         raise InstallError("could not verify systemd unit state") from exc
+
+
+def _assert_no_armory_process(proc_root: Path = Path("/proc")) -> None:
+    """Keep the old preflight's process guard without opening its database."""
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError as exc:
+        raise InstallError("could not verify Armory process state") from exc
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            arguments = [
+                item.decode(errors="replace")
+                for item in (entry / "cmdline").read_bytes().split(b"\0")
+                if item
+            ]
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InstallError("could not verify Armory process state") from exc
+        if (
+            len(arguments) >= 3
+            and arguments[1:3] == ["-m", "wow_forever_armory.discord_bot"]
+        ) or any(Path(argument).name == "discord_bot.py" for argument in arguments):
+            raise InstallError("an Armory bot process is still running")
+
+
+def _verify_upgrade_database(database: Path, *, uid: int, gid: int) -> None:
+    _assert_no_armory_process()
+    try:
+        verify_database_snapshot(database, expected_owner=uid, expected_group=gid)
+    except Exception as exc:
+        # Surface no source paths, SQL details, or data values in installer output.
+        raise InstallError(
+            "isolated production database snapshot verification failed"
+        ) from exc
 
 
 def _require_supported_runtime(interpreter: Path) -> None:
@@ -575,14 +616,7 @@ def install(
                     "upgrade changes runtime configuration; use a separately "
                     "reviewed install"
                 )
-        _run(
-            [str(BASE / "bin/armory-db-preflight")],
-            capture=True,
-            env={
-                **os.environ,
-                "ARMORY_DATABASE_PATH": str(STATE / "guild-armory.sqlite3"),
-            },
-        )
+        _verify_upgrade_database(STATE / "guild-armory.sqlite3", uid=uid, gid=gid)
     directories = (
         (BASE, 0o755, 0, 0),
         (BASE / "releases", 0o755, 0, 0),

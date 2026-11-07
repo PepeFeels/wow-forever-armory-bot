@@ -22,6 +22,7 @@ from deploy.production_install import (
     _install_release,
     _require_supported_runtime,
     _validate_logo_asset,
+    _verify_upgrade_database,
     validate_config,
     validate_inputs,
 )
@@ -79,6 +80,90 @@ class ProductionInstallTests(unittest.TestCase):
         source = inspect.getsource(install)
         self.assertNotIn("production_migration", source)
         self.assertIn("if not upgrade_existing", source)
+
+    def test_upgrade_uses_snapshot_and_cannot_invoke_installed_db_preflight(
+        self,
+    ) -> None:
+        import ast
+        import inspect
+
+        from deploy.production_install import install
+
+        tree = ast.parse(inspect.getsource(install))
+        run_calls = [
+            ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run"
+        ]
+        self.assertIn("_verify_upgrade_database(", inspect.getsource(install))
+        source_calls = {
+            name: min(
+                node.lineno
+                for node in ast.walk(ast.parse(inspect.getsource(install)))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == name
+            )
+            for name in (
+                "_verify_upgrade_database",
+                "_install_release",
+                "_install_current_link",
+            )
+        }
+        self.assertLess(
+            source_calls["_verify_upgrade_database"],
+            source_calls["_install_release"],
+        )
+        self.assertLess(
+            source_calls["_verify_upgrade_database"],
+            source_calls["_install_current_link"],
+        )
+        self.assertFalse(
+            any("armory-db-preflight" in call for call in run_calls), run_calls
+        )
+
+    def test_upgrade_snapshot_failure_fails_closed(self) -> None:
+        with (
+            patch("deploy.production_install._assert_no_armory_process") as process,
+            patch(
+                "deploy.production_install.verify_database_snapshot",
+                side_effect=OSError("synthetic snapshot failure"),
+            ) as verify,
+        ):
+            with self.assertRaisesRegex(InstallError, "snapshot verification failed"):
+                _verify_upgrade_database(
+                    Path("/temporary/database.sqlite3"), uid=10, gid=10
+                )
+        process.assert_called_once_with()
+        verify.assert_called_once_with(
+            Path("/temporary/database.sqlite3"), expected_owner=10, expected_group=10
+        )
+
+    def test_upgrade_process_guard_detects_bot_and_fails_closed_on_proc_error(
+        self,
+    ) -> None:
+        from deploy.production_install import _assert_no_armory_process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            bot = proc / "456"
+            bot.mkdir()
+            (bot / "cmdline").write_bytes(
+                b"python\0-m\0wow_forever_armory.discord_bot\0"
+            )
+            (bot / "environ").write_bytes(b"DISCORD_BOT_TOKEN=synthetic")
+            with self.assertRaisesRegex(InstallError, "still running"):
+                _assert_no_armory_process(proc)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            process = proc / "123"
+            process.mkdir()
+            with patch.object(Path, "read_bytes", side_effect=PermissionError):
+                with self.assertRaisesRegex(InstallError, "verify Armory process"):
+                    _assert_no_armory_process(proc)
 
     def test_upgrade_atomically_switches_managed_release_and_keeps_old_release(
         self,
