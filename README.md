@@ -8,6 +8,7 @@ Python bot foundation that displays public WoW Forever Armory profiles in a shar
 - `guild_armory_urls.py` accepts only HTTPS URLs on `worldofwarcraft.blizzard.com` with the supported locale/region/character path. It converts the URL to a Core path and asks the Core to validate it before any request.
 - `guild_armory_store.py` persists active guild panels, pending flows, members, row message IDs, character paths, normalized profile snapshots, and timestamps in SQLite. Short local database operations are serialized; write transactions do not span Discord or Armory requests.
 - `guild_armory_images.py` renders the illustrated Swedish panel and one wide PNG row per member locally with Pillow. The intro background is bundled; no remote images or fonts are downloaded.
+- `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses the supplied WoW Forever logo and bundled DejaVu fonts, and is called from the existing member-row synchronization path.
 - `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
 
 ## Development setup
@@ -86,6 +87,8 @@ Do not run this command for offline tests. It connects to Discord and syncs eith
 - If Discord is unavailable after a registration commits, the stored snapshot lets startup recovery repair the row message. If a channel is permanently inaccessible or a database is lost, an administrator must restore permissions or the database backup.
 
 Operational deployment templates, SQLite backup/restore commands, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The systemd unit and timer files are preparation only and are not installed or enabled by this project.
+
+The character overview renderer's supported fields, unavailable-data placeholders, bundled asset licenses, preview generation, and development review process are documented in [GRAPHIC_RENDERER.md](GRAPHIC_RENDERER.md). The renderer does not expand the Armory scraper or retrieve portraits/statistics/PvP data from other sources.
 
 ## Tests and checks
 

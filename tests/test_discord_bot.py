@@ -24,6 +24,11 @@ PREFIX = "en-us/forever/eu/armory/character"
 PANEL_URL = "https://worldofwarcraft.blizzard.com/en-us/forever/eu/armory/character/"
 
 
+async def _inline_thread_call(function, *args, **kwargs):
+    """Keep Discord adapter tests offline from the default executor lifecycle."""
+    return function(*args, **kwargs)
+
+
 class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -32,9 +37,15 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         await self.store.activate_guild(111, 222, 333)
         self.core = ArmoryClient(max_retries=0)
         self.bot = ArmoryBot(self.core, self.store, 999)
+        self.render_runner = AsyncMock(side_effect=_inline_thread_call)
+        self._render_runner_patch = patch(
+            "wow_forever_armory.discord_bot.to_thread", new=self.render_runner
+        )
+        self._render_runner_patch.start()
 
     async def asyncTearDown(self) -> None:
         await self.bot.close()
+        self._render_runner_patch.stop()
         self.temp_dir.cleanup()
 
     @staticmethod
@@ -243,7 +254,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock()
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await self.bot.on_ready()
             await self.bot.on_disconnect()
@@ -300,7 +312,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock(return_value=sent)
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await asyncio.gather(
                 self.bot.sync_member_row(state), self.bot.sync_member_row(state)
@@ -308,6 +321,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_awaited_once()
         sent.edit.assert_awaited_once()
         self.assertEqual((await self.store.member(111, 456)).row_message_id, 900)
+        self.assertEqual(self.render_runner.await_count, 2)
 
     async def test_missing_saved_id_reuses_own_image_and_removes_exact_duplicates(
         self,
@@ -341,7 +355,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock()
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await self.bot.sync_member_row(state)
         reused.edit.assert_awaited_once()
@@ -403,7 +418,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock(return_value=created)
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await self.bot.sync_member_row(state)
         foreign_message.edit.assert_not_awaited()
@@ -439,7 +455,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
                 "wow_forever_armory.discord_bot.render_intro_panel", return_value=b"PNG"
             ),
             patch(
-                "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+                "wow_forever_armory.discord_bot.render_stored_member_overview",
+                return_value=b"PNG",
             ),
         ):
             await self.bot.upsert_panel(111, channel, await self.store.get_guild(111))
@@ -471,7 +488,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.bot._connection.user = None
 
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             with self.assertRaisesRegex(
                 BotIdentityUnavailable, "member row sync deferred"
@@ -625,6 +643,9 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.characters[0].character.name, "Éowyn")
         self.assertIsNone(await self.store.member(111, 456))
         self.bot._verify_member.assert_awaited_once_with(222, 456)
+        self.bot.sync_member_row.assert_awaited_once_with(
+            state, fresh_paths=frozenset({state.characters[0].path})
+        )
         self.assertIn(
             "sparats", interaction.edit_original_response.await_args.kwargs["content"]
         )
@@ -704,13 +725,50 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock()
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await self.bot.sync_member_row(state)
         message.edit.assert_awaited_once()
         self.assertEqual(len(message.edit.await_args.kwargs["attachments"]), 1)
         channel.send.assert_not_awaited()
         self.assertEqual((await self.store.member(111, 456)).row_message_id, 888)
+
+    async def test_row_renderer_receives_discord_identity_and_fresh_character_path(
+        self,
+    ) -> None:
+        path = f"{PREFIX}/hero"
+        await self.store.finish_flow(
+            111, 456, "StoredDisplayName", path, Character(name="Hero", level=60)
+        )
+        await self.store.set_row_message(111, 456, 888)
+        state = await self.store.member(111, 456)
+        message = MagicMock(spec=discord.Message)
+        message.id = 888
+        self.mark_owned(message, "guild-armory-111-456.png")
+        message.edit = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=message)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        discord_member = SimpleNamespace(display_name="Current Discord Name")
+        guild = MagicMock()
+        guild.get_member.return_value = discord_member
+        self.bot.get_guild = MagicMock(return_value=guild)
+
+        with patch(
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
+        ):
+            await self.bot.sync_member_row(state, fresh_paths=frozenset({path}))
+
+        self.assertEqual(
+            self.render_runner.await_args.kwargs["display_name"],
+            "Current Discord Name",
+        )
+        self.assertEqual(
+            self.render_runner.await_args.kwargs["fresh_paths"], frozenset({path})
+        )
+        message.edit.assert_awaited_once()
 
     async def test_missing_row_message_is_recreated_once(self) -> None:
         await self.store.finish_flow(
@@ -741,7 +799,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock(return_value=sent)
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         with patch(
-            "wow_forever_armory.discord_bot.render_member_row", return_value=b"PNG"
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
         ):
             await self.bot.sync_member_row(state)
         channel.send.assert_awaited_once()

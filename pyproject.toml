@@ -16,7 +16,7 @@ dependencies = ["discord.py>=2.4,<3", "Pillow>=10,<14"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-wow_forever_armory = ["assets/*.png"]
+wow_forever_armory = ["assets/*.png", "assets/fonts/*.ttf", "assets/fonts/*.txt"]
 
 [tool.ruff]
 target-version = "py314"

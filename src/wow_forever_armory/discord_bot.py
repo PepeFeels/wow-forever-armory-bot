@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import stat
+from asyncio import to_thread
 from io import BytesIO
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from .client import ArmoryClient, ArmoryClientError, ArmoryHTTPError, ArmoryTimeoutError
-from .guild_armory_images import render_intro_panel, render_member_row
+from .graphic_renderer import render_stored_member_overview
+from .guild_armory_images import render_intro_panel
 from .guild_armory_store import (
     CharacterLimitReached,
     CharacterNotFound,
@@ -152,6 +154,7 @@ class ArmoryBot(commands.Bot):
         self.store = store
         self.test_guild_id = test_guild_id
         self.armory_semaphore = asyncio.Semaphore(3)
+        self.graphic_semaphore = asyncio.Semaphore(2)
         self._member_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
         self._row_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
         self._activation_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
@@ -453,7 +456,9 @@ class ArmoryBot(commands.Bot):
                             )
                         row_updated = True
                         try:
-                            await self.sync_member_row(state)
+                            await self.sync_member_row(
+                                state, fresh_paths=frozenset({path})
+                            )
                         except BotIdentityUnavailable:
                             row_updated = False
                             _LOGGER.warning(
@@ -520,10 +525,15 @@ class ArmoryBot(commands.Bot):
             _LOGGER.exception("Unexpected Guild Armory registration failure")
         await self.edit_ephemeral(interaction, result)
 
-    async def sync_member_row(self, state: MemberState) -> None:
+    async def sync_member_row(
+        self,
+        state: MemberState,
+        *,
+        fresh_paths: frozenset[str] = frozenset(),
+    ) -> None:
         async with self.row_lock(state.guild_id, state.user_id):
             self._require_bot_identity()
-            await self._sync_member_row(state)
+            await self._sync_member_row(state, fresh_paths=fresh_paths)
 
     def _require_bot_identity(self) -> discord.ClientUser:
         user = self.user
@@ -533,7 +543,12 @@ class ArmoryBot(commands.Bot):
             )
         return user
 
-    async def _sync_member_row(self, state: MemberState) -> None:
+    async def _sync_member_row(
+        self,
+        state: MemberState,
+        *,
+        fresh_paths: frozenset[str] = frozenset(),
+    ) -> None:
         latest_state = await self.store.member(state.guild_id, state.user_id)
         if latest_state is not None:
             state = latest_state
@@ -566,7 +581,16 @@ class ArmoryBot(commands.Bot):
             await self.store.set_row_message(state.guild_id, state.user_id, None)
             _LOGGER.info("member_image_removed")
             return
-        png = render_member_row(state.display_name, state.characters)
+        guild = self.get_guild(state.guild_id)
+        member = guild.get_member(state.user_id) if guild is not None else None
+        display_name = member.display_name if member is not None else state.display_name
+        async with self.graphic_semaphore:
+            png = await to_thread(
+                render_stored_member_overview,
+                state,
+                display_name=display_name,
+                fresh_paths=fresh_paths,
+            )
         filename = f"guild-armory-{state.guild_id}-{state.user_id}.png"
         message: discord.Message | None = None
         fetch_message = getattr(channel, "fetch_message", None)
