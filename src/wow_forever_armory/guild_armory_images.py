@@ -33,9 +33,11 @@ _CARD = (23, 37, 59)
 _INTRO_COPY: Final = (
     "GUILD ARMORY",
     "Register your characters",
-    "1. React to this panel with the sword to start registration.",
-    "2. Open the form in your DM and paste your full Armory URL.",
-    "3. Add up to three characters. Use Add & Edit to manage them.",
+    "1. Click the Add & Edit button below to open character management.",
+    "2. Select Add Character to open the registration form.",
+    "3. Paste your full WoW Armory URL and submit the form.",
+    "4. Add up to three characters. Use Add & Edit to add, replace, or remove "
+    "characters.",
     "Only HTTPS URLs from worldofwarcraft.blizzard.com are accepted.",
 )
 

@@ -10,7 +10,7 @@ v1.1.2 release candidate for the WoW Forever Armory Bot. It displays public WoW 
 - Startup and recovery events distinguish Discord Gateway connection, READY, setup, and recovery outcomes. Recovery counters separate synchronized, created, removed, skipped, and deferred member rows. Failure logs omit exception messages and tracebacks.
 - `guild_armory_images.py` renders the English instruction panel and one wide PNG row per member locally with Pillow. The intro background and nine HD class icons are bundled; no remote images or fonts are downloaded.
 - `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses bundled DejaVu fonts and an optional separately provisioned WoW Forever logo, and is called from the existing member-row synchronization path.
-- `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
+- `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, persistence, Core requests, and row-message recovery.
 
 ## Development setup
 
@@ -65,7 +65,7 @@ If external handlers are attached directly to `wow_forever_armory` or `discord`,
 
 An administrator with **Manage Server** (or Administrator) runs `/armory activate` in the channel that will contain both the instruction panel and all member image rows. Activation is guild-only and idempotent. Repeating it reuses the saved panel; if the panel message was deleted, the bot recreates it in the same channel.
 
-Members react with ⚔️ to receive private instructions. The panel's **Add & Edit** button opens character management, where members can add characters and edit or remove existing ones. The modal accepts only a full HTTPS character URL on `worldofwarcraft.blizzard.com` with a supported locale, region, and Armory character path. The Core blocks redirects and validates the final relative path.
+The panel's **Add & Edit** button opens private character management. Members can add a character directly from the Add Character button, then use the character selector to replace or remove existing characters. The modal accepts only a full HTTPS character URL on `worldofwarcraft.blizzard.com` with a supported locale, region, and Armory character path. The Core blocks redirects and validates the final relative path.
 
 Each member can keep up to three unique characters per guild. Their data appears in one wide image message in the panel's channel, with the registering member mentioned when that message is first created. Automatic image updates do not ping them again. Later additions, replacements, and removals edit that same message. **Add & Edit** and `/armory manage` provide private list, add, replace, and remove controls. Component IDs carry the originating guild, and the bot verifies membership before changing data, so DM actions are not guessed across a member's guilds.
 
@@ -73,7 +73,7 @@ Each member can keep up to three unique characters per guild. Their data appears
 
 Invite the same Discord application to the server using OAuth2 scopes `bot` and `applications.commands`; grant only the channel and message permissions listed below. No guild ID needs to be added to Python code, the production environment file, or systemd. In production, leave `DISCORD_TEST_GUILD_ID` unset so global slash commands are available in every installed guild after Discord's propagation delay. A server administrator then runs `/armory activate` in the desired channel. Panel IDs, member registrations, authorization checks, and row-message references are keyed by guild ID, so the same Discord user has separate state in each server. The initial production guild ID is used for deployment verification only, not as an allowlist.
 
-All character URLs are submitted in a private modal; the bot does not read ordinary message content and does not enable the privileged Message Content or Members intents. The bot needs standard guild/reaction gateway intents and channel permissions to view the channel/history, send messages, attach files, embed links, add reactions, and edit its own messages. No privileged Discord Developer Portal intent is required.
+All character URLs are submitted in a private modal; the bot does not read ordinary message content and does not enable the privileged Message Content or Members intents. The bot uses the standard guild intent and needs channel permissions to view the channel/history, send messages, attach files, embed links, and edit its own messages. No privileged Discord Developer Portal intent is required.
 
 When the bot reconnects, it restores persistent component handlers and reconciles saved panel/member rows. Character snapshots and IDs are stored locally in SQLite so rows can be recreated without repeating Armory requests. Back up and restrict access to the database; it contains Discord IDs, character paths, and public profile snapshots. It contains no Discord token.
 
