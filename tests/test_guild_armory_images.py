@@ -4,10 +4,11 @@ import unittest
 from datetime import UTC, datetime
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from wow_forever_armory.guild_armory_images import (
     _INTRO_COPY,
+    _font,
     render_intro_panel,
     render_member_row,
 )
@@ -19,9 +20,26 @@ class GuildArmoryImageTests(unittest.TestCase):
     def test_intro_copy_is_english_and_explains_registration_controls(self) -> None:
         self.assertTrue(all(text.isascii() for text in _INTRO_COPY))
         copy = " ".join(_INTRO_COPY)
-        self.assertIn("sword", copy)
-        self.assertIn("Add & Edit", copy)
+        self.assertEqual(
+            _INTRO_COPY,
+            (
+                "GUILD ARMORY",
+                "Register your characters",
+                "1. Click the Add & Edit button below to open character management.",
+                "2. Select Add Character to open the registration form.",
+                "3. Paste your full WoW Armory URL and submit the form.",
+                "4. Add up to three characters. Use Add & Edit to add, replace, or "
+                "remove characters.",
+                "Only HTTPS URLs from worldofwarcraft.blizzard.com are accepted.",
+            ),
+        )
+        self.assertNotIn("sword", copy.lower())
         self.assertNotIn("Register Privately", copy)
+        draw = ImageDraw.Draw(Image.new("RGB", (1600, 560)))
+        for index, line in enumerate(_INTRO_COPY[2:]):
+            bounds = draw.textbbox((145, 236 + index * 48), line, font=_font(23))
+            self.assertLessEqual(bounds[2], 1500)
+            self.assertLessEqual(bounds[3], 485)
 
     def test_intro_panel_is_a_readable_sized_png(self) -> None:
         result = render_intro_panel()

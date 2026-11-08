@@ -47,7 +47,7 @@ class _ManageButton(discord.ui.Button[discord.ui.View]):
     def __init__(self, guild_id: int) -> None:
         super().__init__(
             label="Add & Edit",
-            style=discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.primary,
             custom_id=f"guild-armory:manage:{guild_id}",
         )
 
@@ -138,13 +138,17 @@ class _AddCharacterButton(discord.ui.Button[discord.ui.View]):
 
 class CharacterSelectView(discord.ui.View):
     def __init__(
-        self, bot: ArmoryBot, guild_id: int, owner_id: int, state: MemberState
+        self,
+        bot: ArmoryBot,
+        guild_id: int,
+        owner_id: int,
+        state: MemberState | None,
     ) -> None:
         super().__init__(timeout=180)
         self.bot = bot
         self.guild_id = guild_id
         self.owner_id = owner_id
-        if state.characters:
+        if state is not None and state.characters:
             self.add_item(_CharacterSelect(state))
         self.add_item(_AddCharacterButton(guild_id))
 

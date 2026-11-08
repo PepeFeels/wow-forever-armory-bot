@@ -40,7 +40,6 @@ from .operations import (
 from .parser import ArmoryParseError
 
 _LOGGER = logging.getLogger("wow_forever_armory.discord_bot")
-_SWORD = "⚔️"
 _LOCK_STRIPES = 32
 _MAX_TOKEN_FILE_BYTES = 4096
 
@@ -206,7 +205,6 @@ class ArmoryBot(commands.Bot):
     def _intents() -> discord.Intents:
         intents = discord.Intents.none()
         intents.guilds = True
-        intents.guild_reactions = True
         return intents
 
     async def setup_hook(self) -> None:
@@ -323,10 +321,6 @@ class ArmoryBot(commands.Bot):
             if channel_id is None:
                 raise RuntimeError("Armory channel does not have an ID")
             await self.store.activate_guild(guild_id, channel_id, panel.id)
-        try:
-            await panel.add_reaction(_SWORD)
-        except discord.DiscordException:
-            _LOGGER.warning("Guild Armory panel reaction could not be added")
         return panel
 
     async def _find_attachment_message(
@@ -354,55 +348,6 @@ class ArmoryBot(commands.Bot):
             await interaction.edit_original_response(content=text)
         except discord.DiscordException, TimeoutError:
             _LOGGER.warning("Guild Armory interaction response could not be edited")
-
-    async def on_raw_reaction_add(
-        self, payload: discord.RawReactionActionEvent
-    ) -> None:
-        if payload.guild_id is None or payload.user_id == (
-            self.user.id if self.user else None
-        ):
-            return
-        if payload.emoji.name not in {"⚔", "⚔️"}:
-            return
-        try:
-            config = await self.store.get_guild_by_panel(payload.message_id)
-            if config is None or config.guild_id != payload.guild_id:
-                return
-            result = await self.store.begin_flow(
-                config.guild_id, payload.user_id, config.panel_message_id
-            )
-            if result != "started":
-                return
-            user = self.get_user(payload.user_id) or await self.fetch_user(
-                payload.user_id
-            )
-            dm = await user.create_dm()
-            embed = discord.Embed(
-                title="Register with Guild Armory",
-                description=(
-                    f"Server: **{self.guild_label(config.guild_id)}**. "
-                    "Open the form with the Add & Edit button and paste your full "
-                    "WoW Armory character URL. You can register up to three "
-                    "characters. Use the WoW Forever Armory (EU) link below to "
-                    "find your character."
-                ),
-                color=discord.Color.blurple(),
-            )
-            message = await dm.send(
-                embed=embed,
-                view=GuildPanelView(self, config.guild_id),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            await self.store.set_flow_message(
-                config.guild_id, payload.user_id, message.id
-            )
-        except discord.Forbidden, discord.NotFound:
-            # Add & Edit remains available on the panel when DMs are closed.
-            return
-        except discord.HTTPException, TimeoutError:
-            _LOGGER.warning("Guild Armory reaction flow could not start")
-        except Exception:
-            _LOGGER.exception("Unexpected Guild Armory reaction flow failure")
 
     async def _verify_member(
         self, guild_id: int, user_id: int
@@ -782,17 +727,19 @@ class ArmoryBot(commands.Bot):
             return
         try:
             verified = await self._verify_member(guild_id, interaction.user.id)
+            if verified is None:
+                await interaction.edit_original_response(
+                    content="You are not a member of this server.",
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
             state = await self.store.member(guild_id, interaction.user.id)
-            if verified is None or state is None:
-                text = (
-                    "No registered characters were found for you in this server."
+            if state is None or not state.characters:
+                text = "Your list is empty. Add a character using the form."
+                view: discord.ui.View = CharacterSelectView(
+                    self, guild_id, interaction.user.id, state
                 )
-                view: discord.ui.View = GuildPanelView(self, guild_id)
-            elif not state.characters:
-                text = (
-                    "Your list is empty. Add a character using the form."
-                )
-                view = GuildPanelView(self, guild_id)
             else:
                 text = f"You have {len(state.characters)} of 3 characters."
                 view = CharacterSelectView(self, guild_id, interaction.user.id, state)
@@ -1056,30 +1003,7 @@ class ArmoryBot(commands.Bot):
                                 reason="panel_upsert",
                             )
                     if panel is not None:
-                        try:
-                            await panel.add_reaction(_SWORD)
-                        except (
-                            discord.DiscordException,
-                            OSError,
-                            TimeoutError,
-                        ) as exc:
-                            recovered = False
-                            deferred = True
-                            _log_recovery_exception(
-                                "guild_armory_reaction_restore_deferred",
-                                exc,
-                                reason="reaction_restore",
-                                level=logging.WARNING,
-                            )
-                        except Exception as exc:
-                            recovered = False
-                            _log_recovery_exception(
-                                "guild_armory_reaction_restore_failed",
-                                exc,
-                                reason="reaction_restore",
-                            )
-                        else:
-                            panels_recovered = 1
+                        panels_recovered = 1
                 except discord.NotFound:
                     try:
                         await self.upsert_panel(config.guild_id, channel, config)

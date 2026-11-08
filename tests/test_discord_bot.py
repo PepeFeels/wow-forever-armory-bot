@@ -19,8 +19,12 @@ from wow_forever_armory.discord_bot import (
     GuildRecoveryResult,
     MemberRowSyncOutcome,
 )
-from wow_forever_armory.guild_armory_store import GuildArmoryStore
-from wow_forever_armory.guild_armory_views import CharacterSelectView, GuildPanelView
+from wow_forever_armory.guild_armory_store import GuildArmoryStore, MemberState
+from wow_forever_armory.guild_armory_views import (
+    CharacterSelectView,
+    CharacterUrlModal,
+    GuildPanelView,
+)
 from wow_forever_armory.models import Character
 
 PREFIX = "en-us/forever/eu/armory/character"
@@ -65,15 +69,6 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         interaction.channel.mention = "#armory"
         return interaction
 
-    @staticmethod
-    def payload(*, guild_id: int = 111, user_id: int = 456) -> SimpleNamespace:
-        return SimpleNamespace(
-            guild_id=guild_id,
-            user_id=user_id,
-            message_id=333,
-            emoji=SimpleNamespace(name="⚔️"),
-        )
-
     def mark_owned(self, message: MagicMock, filename: str) -> None:
         self.bot._connection.user = SimpleNamespace(id=1)
         message.author = SimpleNamespace(id=1)
@@ -94,7 +89,6 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         panel = MagicMock(spec=discord.Message)
         panel.id = 333
         self.mark_owned(panel, "guild-armory-panel-111.png")
-        panel.add_reaction = AsyncMock()
         panel.edit = AsyncMock()
         channel.fetch_message.return_value = panel
         with patch(
@@ -106,18 +100,20 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, panel)
         channel.send.assert_not_awaited()
         panel.edit.assert_awaited_once()
-        panel.add_reaction.assert_awaited_once_with("⚔️")
+        panel.add_reaction.assert_not_awaited()
         self.assertEqual((await self.store.get_guild(111)).panel_message_id, 333)
 
     async def test_panel_view_has_add_edit_and_official_link(
         self,
     ) -> None:
         view = GuildPanelView(self.bot, 111)
+        self.assertIsNone(view.timeout)
         buttons = [
             child for child in view.children if isinstance(child, discord.ui.Button)
         ]
         self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0].label, "Add & Edit")
+        self.assertEqual(buttons[0].style, discord.ButtonStyle.primary)
         self.assertEqual(buttons[0].custom_id, "guild-armory:manage:111")
         self.assertEqual(
             buttons[1].url,
@@ -144,7 +140,10 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             Character(name="Hero", surname="Woodsong", level=60),
         )
         state = await self.store.member(111, 456)
-        view = CharacterSelectView(self.bot, 111, 456, state)
+        self.bot._verify_member = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        interaction = self.interaction()
+        await self.bot.open_management(interaction, 111)
+        view = interaction.edit_original_response.await_args.kwargs["view"]
         self.assertTrue(
             any(
                 isinstance(item, discord.ui.Button) and item.label == "Add Character"
@@ -158,13 +157,67 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             item for item in view.children if isinstance(item, discord.ui.Select)
         )
         self.assertEqual(selector.options[0].label, "Hero Woodsong")
+        selector._values = [state.characters[0].path]
+        await selector.callback(interaction)
+        action_view = interaction.response.edit_message.await_args.kwargs["view"]
+        self.assertEqual(
+            {item.label for item in action_view.children}, {"Replace", "Remove"}
+        )
 
-    async def test_bot_uses_only_non_privileged_guild_and_reaction_intents(
-        self,
-    ) -> None:
+    async def test_verified_member_without_record_gets_add_button_and_modal(self):
+        self.bot._verify_member = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        interaction = self.interaction()
+
+        await self.bot.open_management(interaction, 111)
+
+        view = interaction.edit_original_response.await_args.kwargs["view"]
+        self.assertIsInstance(view, CharacterSelectView)
+        self.assertFalse(
+            any(isinstance(item, discord.ui.Select) for item in view.children)
+        )
+        add_button = next(
+            item
+            for item in view.children
+            if isinstance(item, discord.ui.Button) and item.label == "Add Character"
+        )
+        await add_button.callback(interaction)
+        modal = interaction.response.send_modal.await_args.args[0]
+        self.assertIsInstance(modal, CharacterUrlModal)
+        self.assertEqual(modal.guild_id, 111)
+
+    async def test_verified_member_with_empty_record_gets_add_button(self):
+        self.bot._verify_member = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        self.store.member = AsyncMock(
+            return_value=MemberState(111, 456, "Member", None, None, ())
+        )
+        interaction = self.interaction()
+
+        await self.bot.open_management(interaction, 111)
+
+        view = interaction.edit_original_response.await_args.kwargs["view"]
+        self.assertIsInstance(view, CharacterSelectView)
+        self.assertEqual(len(view.children), 1)
+        self.assertEqual(view.children[0].label, "Add Character")
+
+    async def test_repeated_add_edit_does_not_return_empty_member_to_panel(self):
+        self.bot._verify_member = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        for _ in range(2):
+            interaction = self.interaction()
+            await self.bot.open_management(interaction, 111)
+            view = interaction.edit_original_response.await_args.kwargs["view"]
+            self.assertIsInstance(view, CharacterSelectView)
+            self.assertTrue(
+                any(
+                    isinstance(item, discord.ui.Button)
+                    and item.label == "Add Character"
+                    for item in view.children
+                )
+            )
+
+    async def test_bot_uses_only_required_non_privileged_guild_intents(self) -> None:
         intents = self.bot.intents
         self.assertTrue(intents.guilds)
-        self.assertTrue(intents.guild_reactions)
+        self.assertFalse(intents.guild_reactions)
         self.assertFalse(intents.message_content)
         self.assertFalse(intents.members)
 
@@ -372,7 +425,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.on_ready()
             await self.bot.on_disconnect()
             await self.bot.on_ready()
-        self.assertEqual(panel.add_reaction.await_count, 2)
+        panel.add_reaction.assert_not_awaited()
         self.assertEqual(row.edit.await_count, 2)
         channel.send.assert_not_awaited()
         self.assertTrue(self.bot._recovered)
@@ -672,7 +725,6 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             self.bot.upsert_panel = AsyncMock(side_effect=error)
         else:
             first_channel.fetch_message = AsyncMock(return_value=first_panel)
-            first_panel.add_reaction = AsyncMock(side_effect=error)
 
         second_channel = MagicMock(spec=discord.TextChannel)
         second_channel.send = AsyncMock()
@@ -694,14 +746,9 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.sync_member_row.await_count, 3)
         self.assertEqual(self.bot.get_armory_channel.await_count, 2)
         self.assertFalse(self.bot._recovered)
-        expected_event = (
-            "guild_armory_reaction_restore_deferred"
-            if operation == "reaction"
-            else "guild_armory_panel_recovery_deferred"
-        )
         self.assertTrue(
             any(
-                call.args[1] == expected_event
+                call.args[1] == "guild_armory_panel_recovery_deferred"
                 and call.kwargs["extra"]["reason"] == reason
                 for call in logger.log.call_args_list
             ),
@@ -769,19 +816,6 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             "upsert_without_fetch",
             TimeoutError("private panel timeout"),
             "panel_upsert",
-        )
-
-    async def test_sword_reaction_timeout_is_deferred_and_other_work_continues(self):
-        await self._assert_panel_operation_failure_is_deferred(
-            "reaction", TimeoutError("private reaction timeout"), "reaction_restore"
-        )
-
-    async def test_sword_reaction_api_failure_is_deferred_separately(self):
-        error = discord.HTTPException(
-            SimpleNamespace(status=503, reason="Unavailable"), "private response"
-        )
-        await self._assert_panel_operation_failure_is_deferred(
-            "reaction", error, "reaction_restore"
         )
 
     async def test_channel_lookup_discord_timeout_and_unexpected_errors_classify(self):
@@ -1173,60 +1207,8 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         foreign_panel.edit.assert_not_awaited()
         foreign_panel.add_reaction.assert_not_awaited()
         foreign_panel.delete.assert_not_awaited()
-        created.add_reaction.assert_awaited_once_with("⚔️")
+        created.add_reaction.assert_not_awaited()
         channel.send.assert_awaited_once()
-
-    async def test_reaction_starts_one_private_flow_and_duplicate_is_idempotent(
-        self,
-    ) -> None:
-        dm = AsyncMock()
-        dm.send.return_value = MagicMock(id=777)
-        user = MagicMock()
-        user.create_dm = AsyncMock(return_value=dm)
-        self.bot.fetch_user = AsyncMock(return_value=user)
-        payload = self.payload()
-        await self.bot.on_raw_reaction_add(payload)
-        await self.bot.on_raw_reaction_add(payload)
-        dm.send.assert_awaited_once()
-        self.assertEqual(await self.store.flow_message(111, 456), 777)
-        embed = dm.send.await_args.kwargs["embed"]
-        view = dm.send.await_args.kwargs["view"]
-        self.assertIn("Add & Edit", embed.description)
-        self.assertIn("Armory (EU)", embed.description)
-        self.assertIsInstance(view, GuildPanelView)
-
-    async def test_closed_dm_keeps_panel_modal_as_private_fallback(self) -> None:
-        user = MagicMock()
-        user.create_dm = AsyncMock(
-            side_effect=discord.Forbidden(
-                MagicMock(status=403, reason="Forbidden"), "closed"
-            )
-        )
-        self.bot.fetch_user = AsyncMock(return_value=user)
-        await self.bot.on_raw_reaction_add(self.payload())
-        self.assertEqual(await self.store.begin_flow(111, 456, 333), "already_pending")
-        view = GuildPanelView(self.bot, 111)
-        self.assertEqual(view.children[0].label, "Add & Edit")
-
-    async def test_wrong_reaction_and_wrong_panel_do_nothing(self) -> None:
-        self.bot.fetch_user = AsyncMock()
-        await self.bot.on_raw_reaction_add(
-            SimpleNamespace(
-                guild_id=111,
-                user_id=456,
-                message_id=333,
-                emoji=SimpleNamespace(name="👍"),
-            )
-        )
-        await self.bot.on_raw_reaction_add(
-            SimpleNamespace(
-                guild_id=111,
-                user_id=456,
-                message_id=444,
-                emoji=SimpleNamespace(name="⚔️"),
-            )
-        )
-        self.bot.fetch_user.assert_not_awaited()
 
     async def test_submission_persists_profile_and_scopes_to_selected_guild(
         self,
