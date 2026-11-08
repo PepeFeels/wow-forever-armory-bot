@@ -26,8 +26,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deploy.production_db_snapshot import verify_database_snapshot
 
-BASE_CHECKPOINT_SHA = "e6b8c0ce4e1444d87ff87f29df2802a49bc1ad3f"
-BRANCH = "release/v1.1.1"
+BASE_CHECKPOINT_SHA = "de1ffb89a366ae1e4ba73db2a30804698d218e40"
+BRANCH = "release/v1.1.2"
 SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")

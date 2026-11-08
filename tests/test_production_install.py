@@ -214,7 +214,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=release/v1.1.1",
+                    "--initial-branch=release/v1.1.2",
                     str(repo),
                 ],
                 check=True,

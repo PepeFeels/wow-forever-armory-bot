@@ -6,6 +6,9 @@ import importlib
 import io
 import json
 import logging
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -233,6 +236,35 @@ class LoggingConfigTests(unittest.TestCase):
         ):
             self.assertIn(event, output)
         self.assertEqual(output.count("bot_info_probe"), 1)
+
+    def test_module_execution_emits_startup_info_through_canonical_logger(self):
+        project_root = Path(__file__).parents[1]
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(project_root / "src"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "ARMORY_LOG_LEVEL": "INFO",
+            "ARMORY_LOG_FORMAT": "text",
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "wow_forever_armory.discord_bot"],
+            cwd=project_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "INFO wow_forever_armory.discord_bot bot_startup_started",
+            result.stderr,
+        )
+        self.assertIn(
+            "ERROR wow_forever_armory.discord_bot bot_token_missing", result.stderr
+        )
+        self.assertNotIn("DISCORD_BOT_TOKEN=", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_single_json_event_emits_exactly_one_json_object(self) -> None:
         stderr = io.StringIO()

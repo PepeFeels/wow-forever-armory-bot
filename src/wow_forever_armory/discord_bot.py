@@ -39,7 +39,7 @@ from .operations import (
 )
 from .parser import ArmoryParseError
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("wow_forever_armory.discord_bot")
 _SWORD = "⚔️"
 _LOCK_STRIPES = 32
 _MAX_TOKEN_FILE_BYTES = 4096

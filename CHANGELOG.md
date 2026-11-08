@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.2 — release candidate
+
+Prepared on `fix/v1.1.2-stable-logger` for independent review. This hotfix
+uses a stable `wow_forever_armory.discord_bot` logger name so INFO lifecycle
+events are routed through the configured application handler when launched as
+`python -m wow_forever_armory.discord_bot`. Existing logging levels, handlers,
+formatting, redaction, setup, READY, and recovery behavior are preserved.
+Production was not accessed or changed; the previous PROD incident attribution
+still requires verification against the code actually installed there.
+
+- Package metadata identifies this candidate as version 1.1.2.
+- No database schema or production configuration changes are included.
+- The installer requires a clean exact-SHA checkout on `release/v1.1.2` whose
+  history descends from the approved v1.1.1 checkpoint
+  `de1ffb89a366ae1e4ba73db2a30804698d218e40`.
+
 ## v1.1.1 — release candidate
 
 Prepared on `release/v1.1.1` for independent release review. This corrective
