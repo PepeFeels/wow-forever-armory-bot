@@ -76,19 +76,20 @@ or backup directory. The unit templates and launcher must be byte-identical to
 the installed versions; runtime configuration changes need a separately
 reviewed installation.
 
-Current production runs v1.1.2 at
-`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. The v1.1.3 hotfix candidate is
-based on that approved production commit. Run only after release-specific
-approval, from the clean approved checkout on `release/v1.1.3`:
+Current production remains v1.1.2 at
+`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. v1.1.3 was published at
+`c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce`, but its production deployment
+was safely blocked because snapshot verification still rejected zero guilds.
+The v1.1.4 candidate is based on that v1.1.3 commit. Run only after
+release-specific approval, from the clean approved checkout on
+`release/v1.1.4`:
 
 Before installation, record the installed shared preflight's SHA-256 and
-preserve a root-owned copy for rollback. The installer atomically replaces
-`/opt/wow-forever-armory-bot/bin/armory-db-preflight` before switching
+preserve a root-owned copy for recovery planning. The installer atomically
+replaces `/opt/wow-forever-armory-bot/bin/armory-db-preflight` before switching
 `current`; if installation later fails, the old application release can remain
-active with the new (more permissive for zero guild rows) preflight. Keep the
-backup until the release is accepted, and restore the previous preflight as
-well as the release pointer during a rollback. Do not alter other services or
-bots.
+active with the new zero-guild-compatible preflight. Keep the original backup
+and its recorded hash. Do not alter other services or bots.
 
 ```bash
 sudo sha256sum /opt/wow-forever-armory-bot/bin/armory-db-preflight
@@ -100,6 +101,28 @@ sudo sha256sum \
   /var/lib/wow-forever-armory-bot/backups/armory-db-preflight.v1.1.2
 ```
 
+Application rollback and preflight rollback are separate operations. When
+rolling the application pointer back to v1.1.2, retain the zero-guild-compatible
+preflight. The v1.1.2 preflight rejects an empty guild table, so **never restore
+the saved v1.1.2 preflight while the production database has zero guilds**.
+The compatible preflight shipped from published base commit
+`c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce` has SHA-256
+`c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803`. Verify
+the installed script against that exact digest before starting either the
+current or rolled-back application:
+
+```bash
+printf '%s  %s\n' \
+  'c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803' \
+  '/opt/wow-forever-armory-bot/bin/armory-db-preflight' \
+  | sudo sha256sum --check -
+```
+
+If this verification fails or a compatible preflight cannot be retained, keep
+the service stopped. Restore the saved v1.1.2 preflight only after the database
+has been independently verified to contain at least one real guild row and the
+operator has separately approved that preflight rollback.
+
 ```bash
 # Configuration-changing: stages code and atomically switches the release link.
 sudo /usr/bin/python3.14 deploy/production_install.py \
@@ -109,18 +132,22 @@ sudo /usr/bin/python3.14 deploy/production_install.py \
 
 The release remains stopped and disabled. Before any approved start, verify
 `current`, release marker, systemd units, database integrity, and backup
-availability. The start preflight independently refuses an absent, zero-byte,
-uninitialized, corrupt, or restore-gated database. A correctly initialized
-database with zero guild rows is accepted. No migration command is part of this
-upgrade path.
+availability. Both the startup preflight and isolated installer snapshot
+verification accept a correctly initialized database with zero guild rows,
+members, and characters. They continue to reject an absent, zero-byte,
+uninitialized, corrupt, or restore-gated database, and the snapshot verifier
+retains its source ownership, permissions, WAL/SHM consistency, signature, and
+isolation checks. No migration command is part of this upgrade path.
 
 For a code rollback, keep both units stopped and disabled, preserve the new
 release and all state/backups, and verify that the previous release supports
 the installed systemd credential-file interface and current database schema.
-Only then may an approved operator atomically repoint `current` and separately
-authorize service activation. A pointer rollback alone does not guarantee a
-working service. If compatibility is uncertain or fails, leave the service
-stopped and disabled while preparing a corrected compatible release.
+Application pointer rollback does not roll back the shared preflight. Before
+activation, verify that the compatible preflight still matches the SHA-256
+above. Only then may an approved operator atomically repoint `current` and
+separately authorize service activation. A pointer rollback alone does not
+guarantee a working service. If compatibility is uncertain or fails, leave the
+service stopped and disabled while preparing a corrected compatible release.
 Never restore an older database snapshot merely to solve a code-startup failure.
 
 To deactivate in an approved rollback, stop and disable both units while
@@ -330,10 +357,13 @@ task did not perform it.
    panel/member behavior, and service health.
 7. If health checks fail, stop and disable both units and preserve the current
    database, backups, and release artifacts. Verify credential-file and schema
-   compatibility before any pointer rollback. If the previous release is
-   compatible, an approved operator may atomically restore its pointer and
-   separately authorize activation. Otherwise keep the service stopped and
-   prepare a corrected release. Database restoration is a separate, explicitly
+   compatibility before any application pointer rollback. Application rollback
+   and preflight rollback are separate operations: while the database has zero
+   guilds, retain the compatible preflight and verify its exact SHA-256 above;
+   never restore the saved v1.1.2 preflight. If a compatible preflight cannot be
+   retained and verified, keep the service stopped. An approved operator may
+   atomically restore the compatible previous application pointer and separately
+   authorize activation. Database restoration is a separate, explicitly
    approved recovery operation, never an automatic response to startup failure.
 
 The v1.0.0 code has no schema migration framework. Keep upgrades
@@ -403,13 +433,13 @@ installed in this development environment. Full verification against the
 target Ubuntu host, actual account ownership, and credential delivery remains
 part of the approved deployment review.
 
-## v1.1.3 release installation gate
+## v1.1.4 release installation gate
 
 `deploy/production_install.py` is an administrator-only, fail-closed installer.
 It requires the full approved release SHA and checks that it exactly matches
-the clean checkout's HEAD on `release/v1.1.3`. It also verifies the release
-descends from the approved v1.1.2 production checkpoint
-`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. It builds
+the clean checkout's HEAD on `release/v1.1.4`. It also verifies the release
+descends from the published v1.1.3 checkpoint
+`c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce`. It builds
 the versioned release from that exact SHA. For an existing installation,
 `--upgrade-existing` validates the installed config and credential without
 rewriting them, requires installed runtime files to match the checkout, verifies
@@ -538,4 +568,7 @@ replace the StateDirectory database automatically after a failed import.
 For rollback, stop the new unit, preserve its current database and backup,
 switch the release pointer back, and use the current DB if its schema is
 compatible. Do not restore the pre-migration snapshot over registrations made
-after cutover unless that data loss is explicitly accepted.
+after cutover unless that data loss is explicitly accepted. For a v1.1.4
+zero-guild code rollback, follow the code/preflight rollback instructions above;
+the legacy migration rollback procedure does not authorize restoring an older
+startup preflight.

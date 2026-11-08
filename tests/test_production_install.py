@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from deploy import production_db_snapshot, production_install
 from deploy.production_install import (
     InstallError,
     _assert_units_stopped_and_disabled,
@@ -157,6 +158,110 @@ class ProductionInstallTests(unittest.TestCase):
             Path("/temporary/database.sqlite3"), expected_owner=10, expected_group=10
         )
 
+    def test_complete_upgrade_flow_accepts_empty_initialized_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = Path(__file__).parents[1]
+            base = root / "opt/wow-forever-armory-bot"
+            etc = root / "etc/wow-forever-armory-bot"
+            state = root / "var/lib/wow-forever-armory-bot"
+            bin_dir = base / "bin"
+            releases = base / "releases"
+            etc.mkdir(parents=True)
+            state.mkdir(parents=True)
+            bin_dir.mkdir(parents=True)
+            releases.mkdir()
+
+            old_release = releases / ("a" * 40)
+            old_release.mkdir()
+            (old_release / ".installation-complete").write_text("a" * 40)
+            (base / "current").symlink_to(old_release)
+
+            config = etc / "config"
+            credential = etc / "discord-token"
+            config.write_text("ARMORY_LOG_LEVEL=INFO\n", encoding="utf-8")
+            credential.write_text("synthetic-test-credential\n", encoding="utf-8")
+
+            launcher_source = repo / "deploy/systemd/armory-launch"
+            preflight_source = repo / "deploy/systemd/armory-db-preflight.py"
+            installed_launcher = bin_dir / "armory-launch"
+            installed_launcher.write_bytes(launcher_source.read_bytes())
+            installed_preflight = bin_dir / "armory-db-preflight"
+            installed_preflight.write_bytes(b"previous preflight")
+            installed_preflight.chmod(0o755)
+
+            database = state / "guild-armory.sqlite3"
+            _create_preflight_database(database, guild_count=0)
+            snapshot_root = root / "private-snapshots"
+            snapshot_root.mkdir(mode=0o700)
+            service_account = SimpleNamespace(
+                pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir="/nonexistent"
+            )
+            service_group = SimpleNamespace(gr_gid=os.getgid())
+            release_sha = "b" * 40
+
+            with (
+                patch.object(production_install, "BASE", base),
+                patch.object(production_install, "ETC", etc),
+                patch.object(production_install, "STATE", state),
+                patch.object(production_install, "UNIT_FILES", ()),
+                patch.object(
+                    production_install,
+                    "os",
+                    SimpleNamespace(geteuid=lambda: 0),
+                ),
+                patch.object(production_install, "_check_repository"),
+                patch.object(production_install, "validate_inputs"),
+                patch.object(production_install, "_require_supported_runtime"),
+                patch.object(
+                    production_install, "_assert_units_stopped_and_disabled"
+                ),
+                patch.object(
+                    production_install.pwd,
+                    "getpwnam",
+                    return_value=service_account,
+                ),
+                patch.object(
+                    production_install.grp,
+                    "getgrnam",
+                    return_value=service_group,
+                ),
+                patch.object(
+                    production_install, "_configured_logo_path", return_value=None
+                ),
+                patch.object(
+                    production_install, "_read_regular_file", return_value=b"old"
+                ),
+                patch.object(production_install, "_mkdir_owned"),
+                patch.object(production_install, "_assert_no_armory_process"),
+                patch.object(production_install, "_install_release"),
+                patch.object(production_install, "_copy_unit") as copy_unit,
+                patch.object(
+                    production_install, "_install_current_link"
+                ) as switch_link,
+                patch.object(
+                    production_install,
+                    "_verify_upgrade_database",
+                    wraps=production_install._verify_upgrade_database,
+                ) as verify_database,
+                patch.object(production_db_snapshot, "SNAPSHOT_ROOT", snapshot_root),
+            ):
+                production_install.install(
+                    repo,
+                    config,
+                    credential,
+                    release_sha,
+                    upgrade_existing=True,
+                )
+
+            verify_database.assert_called_once_with(
+                state / "guild-armory.sqlite3", uid=os.getuid(), gid=os.getgid()
+            )
+            copy_unit.assert_called_once_with(
+                preflight_source, installed_preflight, 0o755
+            )
+            switch_link.assert_called_once()
+
     def test_upgrade_process_guard_detects_bot_and_fails_closed_on_proc_error(
         self,
     ) -> None:
@@ -230,7 +335,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=release/v1.1.3",
+                    "--initial-branch=release/v1.1.4",
                     str(repo),
                 ],
                 check=True,

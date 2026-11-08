@@ -13,7 +13,13 @@ from unittest.mock import patch
 from deploy import production_db_snapshot as snapshot
 
 
-def create_database(path: Path, *, character_count: int = 3) -> None:
+def create_database(
+    path: Path,
+    *,
+    guild_count: int = 1,
+    member_count: int = 1,
+    character_count: int = 3,
+) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
@@ -21,9 +27,15 @@ def create_database(path: Path, *, character_count: int = 3) -> None:
             "CREATE TABLE members (id INTEGER);"
             "CREATE TABLE characters (id INTEGER);"
             "CREATE TABLE flows (id INTEGER);"
-            "INSERT INTO guilds VALUES (1);"
-            "INSERT INTO members VALUES (1);"
             "INSERT INTO flows VALUES (1);"
+        )
+        connection.executemany(
+            "INSERT INTO guilds VALUES (?)",
+            ((number,) for number in range(guild_count)),
+        )
+        connection.executemany(
+            "INSERT INTO members VALUES (?)",
+            ((number,) for number in range(member_count)),
         )
         connection.executemany(
             "INSERT INTO characters VALUES (?)",
@@ -55,6 +67,18 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
             expected_owner=os.getuid(),
             expected_group=os.getgid(),
         )
+
+    def test_empty_guild_member_and_character_state_is_accepted(self) -> None:
+        database = self.root / "empty-guild-armory.sqlite3"
+        create_database(database, guild_count=0, member_count=0, character_count=0)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            self.assertEqual(self.verify(database), (0, 0, 0))
+
+    def test_one_or_more_guilds_are_accepted_with_aggregate_counts(self) -> None:
+        database = self.root / "multiple-guild-armory.sqlite3"
+        create_database(database, guild_count=2, member_count=3, character_count=5)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            self.assertEqual(self.verify(database), (2, 3, 5))
 
     def test_integrity_and_counts_run_only_on_private_snapshot(self) -> None:
         database = self.root / "armory.sqlite3"
@@ -201,6 +225,54 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
                 self.verify(link)
             database.chmod(0o644)
             with self.assertRaises(snapshot.SnapshotVerificationError):
+                self.verify(database)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_incorrect_database_owner_is_rejected(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError, "metadata is unsafe"
+            ):
+                snapshot.verify_database_snapshot(
+                    database,
+                    expected_owner=os.getuid() + 1,
+                    expected_group=os.getgid(),
+                )
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_missing_required_tables_and_corrupt_sqlite_are_rejected(self) -> None:
+        missing_tables = self.root / "missing-tables.sqlite3"
+        with sqlite3.connect(missing_tables) as connection:
+            connection.execute("CREATE TABLE guilds (id INTEGER)")
+        missing_tables.chmod(0o600)
+
+        corrupt = self.root / "corrupt.sqlite3"
+        corrupt.write_bytes(b"not a SQLite database")
+        corrupt.chmod(0o600)
+
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.subTest(database="missing tables"):
+                with self.assertRaisesRegex(
+                    snapshot.SnapshotVerificationError, "snapshot schema is incomplete"
+                ):
+                    self.verify(missing_tables)
+            with self.subTest(database="corrupt"):
+                with self.assertRaises(snapshot.SnapshotVerificationError):
+                    self.verify(corrupt)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_inconsistent_shm_sidecar_is_rejected(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        shm = Path(f"{database}-shm")
+        shm.write_bytes(b"bad")
+        shm.chmod(0o600)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError, "SHM size is inconsistent"
+            ):
                 self.verify(database)
         self.assertEqual(list(self.snapshot_root.iterdir()), [])
 

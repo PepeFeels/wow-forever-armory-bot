@@ -232,8 +232,6 @@ def _verify_snapshot(snapshot: Path) -> tuple[int, int, int]:
             connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             for table in ("guilds", "members", "characters")
         )
-        if counts[0] < 1:
-            raise SnapshotVerificationError("snapshot contains no guild records")
         return counts
     finally:
         connection.close()

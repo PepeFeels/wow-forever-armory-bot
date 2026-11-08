@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.4 — release candidate
+
+Prepared on `hotfix/v1.1.4-empty-snapshot-verification` to allow the isolated
+production database snapshot verifier and installer upgrade gate to accept a
+valid initialized database with zero guild, member, and character rows. Schema,
+integrity, ownership, permissions, sidecar consistency, source-signature, and
+snapshot-isolation checks remain enforced. No database migration or dummy row
+is introduced.
+
+- Package metadata identifies this candidate as version 1.1.4.
+- Installer release branch is `release/v1.1.4`.
+- Installer ancestry checkpoint is v1.1.3 commit
+  `c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce`.
+- v1.1.3 was published but its production deployment was blocked by the
+  remaining snapshot guild-count restriction; production was not changed.
+
 ## v1.1.3 — release candidate
 
 Prepared on `hotfix/v1.1.3-empty-guild-preflight` to correct startup preflight
