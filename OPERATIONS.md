@@ -77,7 +77,8 @@ the installed versions; runtime configuration changes need a separately
 reviewed installation.
 
 Run only after a release-specific approval, from the clean approved checkout
-on `release/v1.0.0`:
+on `feature/v1.1.0`. Production remains on v1.0.0 until a separate production
+approval authorizes an upgrade:
 
 ```bash
 # Configuration-changing: stages code and atomically switches the release link.
@@ -386,8 +387,9 @@ part of the approved deployment review.
 `deploy/production_install.py` is an administrator-only, fail-closed installer.
 It is preparation code and must not be run until reviewed and committed. It
 requires the full approved release SHA and checks that it exactly matches the
-clean checkout's HEAD on `release/v1.0.0`. It also verifies the release
-is based on checkpoint `9f5548d3763b42d38fff0613ef2cfd6c3b560d07`. It builds
+clean checkout's HEAD on `feature/v1.1.0`. It also verifies the release
+descends from v1.0.0 base commit
+`4ac05712259e26560d1818746f5cee90e6793f78`. It builds
 the versioned release from that exact SHA, creates the locked `wow-armory` account and
 private directories, copies the supplied config and private credential,
 installs the unit and timer, verifies their syntax, and reloads systemd. It

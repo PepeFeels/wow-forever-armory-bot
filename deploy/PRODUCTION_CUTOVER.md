@@ -1,5 +1,9 @@
 # Manual production cutover review procedure
 
+This document records the legacy v0.2.0 initial database migration procedure.
+For a v1.1.0 code-only release upgrade, follow `OPERATIONS.md`; production
+remains on v1.0.0 until that upgrade is separately approved.
+
 This is a reviewed operator checklist, not an executable cutover script. It is
 intentionally manual because the legacy process does not honor the new runtime
 lock. Do not run it without a separately approved maintenance window. The
@@ -158,7 +162,7 @@ rollback copy, and quarantined WAL/SHM sidecars.
 
 ## Release integration gate
 
-The production installer only accepts a clean exact-SHA checkout on
-`feature/v0.2.0-discord`. This graphics remediation branch must first be
-reviewed and integrated onto that branch by an approved Git operation. Do not
-merge, push, deploy, or change the production checkout as part of this review.
+The production installer accepts a clean exact-SHA checkout on
+`feature/v1.1.0` based on the v1.0.0 release commit. The active production
+release remains v1.0.0 until a separately approved production upgrade. This
+legacy cutover procedure does not authorize changes to the production checkout.

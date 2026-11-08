@@ -178,6 +178,7 @@ def normalize_character(state: dict[str, Any]) -> Character:
     )
     return Character(
         name=_label(profile.get("name")),
+        surname=_label(profile.get("surname") or profile.get("lastName")),
         level=_number(profile.get("level")),
         race=_label(profile.get("race")),
         character_class=_label(profile.get("class")),

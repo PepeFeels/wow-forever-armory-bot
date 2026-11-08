@@ -8,7 +8,7 @@ import discord
 
 from .guild_armory_store import MemberState
 
-_OFFICIAL_ARMORY_URL = "https://worldofwarcraft.blizzard.com/en-gb/forever/eu/armory"
+_OFFICIAL_ARMORY_URL = "https://worldofwarcraft.blizzard.com/en-us/forever/eu/armory/"
 
 if TYPE_CHECKING:
     from .discord_bot import ArmoryBot
@@ -22,12 +22,12 @@ class CharacterUrlModal(discord.ui.Modal):
         *,
         replace_path: str | None = None,
     ) -> None:
-        super().__init__(title="Registrera WoW-karaktär")
+        super().__init__(title="Register WoW Character")
         self.bot = bot
         self.guild_id = guild_id
         self.replace_path = replace_path
         self.profile_url: discord.ui.TextInput[discord.ui.Modal] = discord.ui.TextInput(
-            label="Full Armory-länk",
+            label="Full Armory URL",
             placeholder="https://worldofwarcraft.blizzard.com/en-us/forever/eu/...",
             max_length=1024,
             required=True,
@@ -43,27 +43,10 @@ class CharacterUrlModal(discord.ui.Modal):
         )
 
 
-class _RegisterButton(discord.ui.Button[discord.ui.View]):
-    def __init__(self, guild_id: int) -> None:
-        super().__init__(
-            label="Registrera privat",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"guild-armory:register:{guild_id}",
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = cast(GuildPanelView | None, self.view)
-        if view is None:
-            return
-        await interaction.response.send_modal(
-            CharacterUrlModal(view.bot, view.guild_id)
-        )
-
-
 class _ManageButton(discord.ui.Button[discord.ui.View]):
     def __init__(self, guild_id: int) -> None:
         super().__init__(
-            label="Mina karaktärer",
+            label="Add & Edit",
             style=discord.ButtonStyle.secondary,
             custom_id=f"guild-armory:manage:{guild_id}",
         )
@@ -81,7 +64,6 @@ class GuildPanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
         self.guild_id = guild_id
-        self.add_item(_RegisterButton(guild_id))
         self.add_item(_ManageButton(guild_id))
         self.add_item(
             discord.ui.Button(
@@ -96,9 +78,14 @@ class _CharacterSelect(discord.ui.Select[discord.ui.View]):
     def __init__(self, state: MemberState) -> None:
         options = [
             discord.SelectOption(
-                label=(entry.character.name or "Okänd karaktär")[:100],
+                label=(
+                    " ".join(
+                        filter(None, (entry.character.name, entry.character.surname))
+                    )
+                    or "Unknown Character"
+                )[:100],
                 description=(
-                    f"{(entry.character.character_class or 'Okänd klass')[:50]} · "
+                    f"{(entry.character.character_class or 'Unknown Class')[:50]} · "
                     f"{entry.path[-40:]}"
                 ),
                 value=entry.path,
@@ -106,7 +93,7 @@ class _CharacterSelect(discord.ui.Select[discord.ui.View]):
             for entry in state.characters
         ]
         super().__init__(
-            placeholder="Välj en karaktär att hantera",
+            placeholder="Choose a character to manage",
             min_values=1,
             max_values=1,
             options=options,
@@ -116,11 +103,11 @@ class _CharacterSelect(discord.ui.Select[discord.ui.View]):
         view = cast(CharacterSelectView, self.view)
         if interaction.user.id != view.owner_id:
             await interaction.response.send_message(
-                "Den här menyn tillhör en annan medlem.", ephemeral=True
+                "This menu belongs to another member.", ephemeral=True
             )
             return
         await interaction.response.edit_message(
-            content="Välj vad du vill göra med karaktären:",
+            content="Choose an action for this character:",
             view=CharacterActionView(
                 view.bot, view.guild_id, view.owner_id, self.values[0]
             ),
@@ -130,7 +117,7 @@ class _CharacterSelect(discord.ui.Select[discord.ui.View]):
 class _AddCharacterButton(discord.ui.Button[discord.ui.View]):
     def __init__(self, guild_id: int) -> None:
         super().__init__(
-            label="Lägg till karaktär",
+            label="Add Character",
             style=discord.ButtonStyle.primary,
             custom_id=f"guild-armory:add:{guild_id}",
         )
@@ -141,7 +128,7 @@ class _AddCharacterButton(discord.ui.Button[discord.ui.View]):
             return
         if interaction.user.id != view.owner_id:
             await interaction.response.send_message(
-                "Den här menyn tillhör en annan medlem.", ephemeral=True
+                "This menu belongs to another member.", ephemeral=True
             )
             return
         await interaction.response.send_modal(
@@ -164,7 +151,7 @@ class CharacterSelectView(discord.ui.View):
 
 class _RemoveButton(discord.ui.Button[discord.ui.View]):
     def __init__(self) -> None:
-        super().__init__(label="Ta bort", style=discord.ButtonStyle.danger)
+        super().__init__(label="Remove", style=discord.ButtonStyle.danger)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view = cast(CharacterActionView | None, self.view)
@@ -172,7 +159,7 @@ class _RemoveButton(discord.ui.Button[discord.ui.View]):
             return
         if interaction.user.id != view.owner_id:
             await interaction.response.send_message(
-                "Den här menyn tillhör en annan medlem.", ephemeral=True
+                "This menu belongs to another member.", ephemeral=True
             )
             return
         await view.bot.remove_character(interaction, view.guild_id, view.path)
@@ -180,7 +167,7 @@ class _RemoveButton(discord.ui.Button[discord.ui.View]):
 
 class _ReplaceButton(discord.ui.Button[discord.ui.View]):
     def __init__(self) -> None:
-        super().__init__(label="Ersätt", style=discord.ButtonStyle.primary)
+        super().__init__(label="Replace", style=discord.ButtonStyle.primary)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view = cast(CharacterActionView | None, self.view)
@@ -188,7 +175,7 @@ class _ReplaceButton(discord.ui.Button[discord.ui.View]):
             return
         if interaction.user.id != view.owner_id:
             await interaction.response.send_message(
-                "Den här menyn tillhör en annan medlem.", ephemeral=True
+                "This menu belongs to another member.", ephemeral=True
             )
             return
         await interaction.response.send_modal(

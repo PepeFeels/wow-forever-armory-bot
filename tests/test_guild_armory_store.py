@@ -31,6 +31,7 @@ class GuildArmoryStoreTests(unittest.IsolatedAsyncioTestCase):
     def character(name: str) -> Character:
         return Character(
             name=name,
+            surname="Woodsong",
             level=60,
             character_class="Druid",
             professions=(Profession("Herbalism", skill=300, max_skill=300),),
@@ -56,6 +57,7 @@ class GuildArmoryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.character("Éowyn"),
         )
         self.assertEqual(state.display_name, "Éowyn")
+        self.assertEqual(state.characters[0].character.surname, "Woodsong")
         self.assertEqual(state.characters[0].character.professions[0].skill, 300)
         self.assertEqual(
             state.characters[0].path, "en-us/forever/eu/armory/character/eowyn"

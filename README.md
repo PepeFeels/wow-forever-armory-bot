@@ -1,13 +1,13 @@
 # WoW Forever Armory Bot
 
-v1.0.0 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and member-row recovery. Publication and production upgrade await final host verification.
+v1.1.0 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and member-row recovery. Production remains on v1.0.0; publication and production upgrade require separate approval and host verification.
 
 ## Architecture
 
 - `client.py`, `parser.py`, and `models.py` remain the Armory Core. The Core fetches only validated relative paths over HTTPS, refuses redirects, applies timeouts, and parses public profile data.
 - `guild_armory_urls.py` accepts only HTTPS URLs on `worldofwarcraft.blizzard.com` with the supported locale/region/character path. It converts the URL to a Core path and asks the Core to validate it before any request.
 - `guild_armory_store.py` persists active guild panels, pending flows, members, row message IDs, character paths, normalized profile snapshots, and timestamps in SQLite. Short local database operations are serialized; write transactions do not span Discord or Armory requests.
-- `guild_armory_images.py` renders the illustrated Swedish panel and one wide PNG row per member locally with Pillow. The intro background is bundled; no remote images or fonts are downloaded.
+- `guild_armory_images.py` renders the English instruction panel and one wide PNG row per member locally with Pillow. The intro background and nine HD class icons are bundled; no remote images or fonts are downloaded.
 - `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses bundled DejaVu fonts and an optional separately provisioned WoW Forever logo, and is called from the existing member-row synchronization path.
 - `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
 
@@ -64,9 +64,9 @@ If external handlers are attached directly to `wow_forever_armory` or `discord`,
 
 An administrator with **Manage Server** (or Administrator) runs `/armory activate` in the channel that will contain both the instruction panel and all member image rows. Activation is guild-only and idempotent. Repeating it reuses the saved panel; if the panel message was deleted, the bot recreates it in the same channel.
 
-Members react with ⚔️ to receive private instructions and a button that opens a URL modal in DM. The panel also has **Registrera privat**, which opens the same private modal as a discreet alternative when DMs are closed. The modal accepts only a full HTTPS character URL on `worldofwarcraft.blizzard.com` with a supported locale, region, and Armory character path. The Core blocks redirects and validates the final relative path.
+Members react with ⚔️ to receive private instructions. The panel's **Add & Edit** button opens character management, where members can add characters and edit or remove existing ones. The modal accepts only a full HTTPS character URL on `worldofwarcraft.blizzard.com` with a supported locale, region, and Armory character path. The Core blocks redirects and validates the final relative path.
 
-Each member can keep up to three unique characters per guild. Their data appears in one wide image message in the panel's channel. Later additions, replacements, and removals edit that same message. **Mina karaktärer** and `/armory manage` provide private list, remove, and replace controls. Component IDs carry the originating guild, and the bot verifies membership before changing data, so DM actions are not guessed across a member's guilds.
+Each member can keep up to three unique characters per guild. Their data appears in one wide image message in the panel's channel, with the registering member mentioned when that message is first created. Automatic image updates do not ping them again. Later additions, replacements, and removals edit that same message. **Add & Edit** and `/armory manage` provide private list, add, replace, and remove controls. Component IDs carry the originating guild, and the bot verifies membership before changing data, so DM actions are not guessed across a member's guilds.
 
 ### Add another Discord server
 
@@ -95,7 +95,7 @@ Do not run this command for offline tests. It connects to Discord and syncs eith
 
 Production installation, SQLite backup/restore, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The repository includes reviewed systemd templates and an installer; running it changes host state and requires an approved maintenance procedure. This documentation update does not install or activate anything.
 
-Version history, the v1.0.0 release-candidate notes, and operational troubleshooting are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+Version history, the v1.1.0 release-candidate notes, the historical v1.0.0 release notes, and operational troubleshooting are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.1.0.md](RELEASE_NOTES_v1.1.0.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 The character overview renderer's supported fields, unavailable-data placeholders, bundled asset licenses, preview generation, and development review process are documented in [GRAPHIC_RENDERER.md](GRAPHIC_RENDERER.md). The renderer does not expand the Armory scraper or retrieve portraits/statistics/PvP data from other sources.
 

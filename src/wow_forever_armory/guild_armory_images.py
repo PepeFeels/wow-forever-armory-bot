@@ -30,6 +30,14 @@ _INK = (237, 234, 222)
 _MUTED = (175, 186, 204)
 _PANEL = (12, 22, 40)
 _CARD = (23, 37, 59)
+_INTRO_COPY: Final = (
+    "GUILD ARMORY",
+    "Register your characters",
+    "1. React to this panel with the sword to start registration.",
+    "2. Open the form in your DM and paste your full Armory URL.",
+    "3. Add up to three characters. Use Add & Edit to manage them.",
+    "Only HTTPS URLs from worldofwarcraft.blizzard.com are accepted.",
+)
 
 
 def _font(
@@ -57,7 +65,7 @@ def _png(image: Image.Image) -> bytes:
 
 
 def render_intro_panel() -> bytes:
-    """Compose the generated decorative background with crisp Swedish copy."""
+    """Compose the generated decorative background with crisp English copy."""
     with Image.open(_ASSET) as source:
         converted = source.convert("RGB")
         target_ratio = _INTRO_SIZE[0] / _INTRO_SIZE[1]
@@ -82,14 +90,9 @@ def render_intro_panel() -> bytes:
     )
     image = Image.alpha_composite(image.convert("RGBA"), overlay)
     draw = ImageDraw.Draw(image)
-    draw.text((145, 108), "GILLETS ARMORY", font=_font(42, True), fill=_GOLD)
-    draw.text((145, 170), "Registrera dina karaktärer", font=_font(34, True), fill=_INK)
-    instructions = (
-        "1. Reagera med svärdssymbolen eller välj Registrera privat.",
-        "2. Öppna formuläret i DM och klistra in hela din Armory-länk.",
-        "3. Lägg till upp till tre karaktärer. Hantera dem via Mina karaktärer.",
-        "Endast HTTPS-länkar från worldofwarcraft.blizzard.com godkänns.",
-    )
+    draw.text((145, 108), _INTRO_COPY[0], font=_font(42, True), fill=_GOLD)
+    draw.text((145, 170), _INTRO_COPY[1], font=_font(34, True), fill=_INK)
+    instructions = _INTRO_COPY[2:]
     y = 236
     for line in instructions:
         draw.text((145, y), line, font=_font(23), fill=_INK if y < 330 else _MUTED)
@@ -138,7 +141,7 @@ def _professions(entry: StoredCharacter) -> str:
             else:
                 label = profession.name
             labels.append(label)
-    return (", ".join(labels)[:2000]) if labels else "Yrken saknas"
+    return (", ".join(labels)[:2000]) if labels else "No professions available"
 
 
 def render_member_row(
@@ -158,7 +161,7 @@ def render_member_row(
         font=_font(34, True),
         fill=_GOLD,
     )
-    draw.text((52, 82), "GILLETS KARAKTÄRER", font=_font(18, True), fill=_MUTED)
+    draw.text((52, 82), "GUILD CHARACTERS", font=_font(18, True), fill=_MUTED)
 
     gap = 20
     card_width = (1700 - gap * (len(characters) - 1)) // len(characters)
@@ -175,14 +178,15 @@ def render_member_row(
             width=2,
         )
         character = entry.character
-        name = _fit(
-            draw, character.name or "Okänd karaktär", _font(28, True), card_width - 44
-        )
+        character_name = " ".join(
+            filter(None, (character.name, character.surname))
+        ) or "Unknown Character"
+        name = _fit(draw, character_name, _font(28, True), card_width - 44)
         draw.text((left + 22, top + 20), name, font=_font(28, True), fill=_GOLD)
         details = (
-            f"Nivå {character.level if character.level is not None else '—'} · "
-            f"{character.race or 'Okänd ras'} · "
-            f"{character.character_class or 'Okänd klass'}"
+            f"Level {character.level if character.level is not None else '—'} · "
+            f"{character.race or 'Unknown race'} · "
+            f"{character.character_class or 'Unknown class'}"
         )
         draw.text(
             (left + 22, top + 78),
@@ -190,7 +194,7 @@ def render_member_row(
             font=_font(18),
             fill=_INK,
         )
-        spec = character.active_specialization or "Specialisering saknas"
+        spec = character.active_specialization or "No specialization available"
         draw.text(
             (left + 22, top + 124),
             _fit(draw, spec, _font(18), card_width - 44),

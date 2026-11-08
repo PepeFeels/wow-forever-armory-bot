@@ -70,14 +70,14 @@ class GuildArmoryCommands(commands.Cog):
             or not (permissions.manage_guild or permissions.administrator)
         ):
             await interaction.response.send_message(
-                "Tjänsten kan bara aktiveras av en serveradministratör.",
+                "Only a server administrator can activate this service.",
                 ephemeral=True,
             )
             return
         channel = interaction.channel
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message(
-                "Välj en kanal där boten får skicka meddelanden.", ephemeral=True
+                "Choose a channel where the bot can send messages.", ephemeral=True
             )
             return
         try:
@@ -95,15 +95,15 @@ class GuildArmoryCommands(commands.Cog):
                     if active_channel is None:
                         await self.bot.edit_ephemeral(
                             interaction,
-                            "Den aktiva kanalen hittas inte. Kontakta en "
-                            "administratör innan du aktiverar på nytt.",
+                            "The active channel could not be found. Contact an "
+                            "administrator before activating again.",
                         )
                         return
                     target_channel = active_channel
                 panel = await self.bot.upsert_panel(guild_id, target_channel, config)
                 await self.bot.edit_ephemeral(
                     interaction,
-                    f"Guild Armory är aktiv i {target_channel.mention}. "
+                    f"Guild Armory is active in {target_channel.mention}. "
                     f"Panel: {panel.jump_url}",
                 )
             except discord.Forbidden, discord.HTTPException:
@@ -112,25 +112,25 @@ class GuildArmoryCommands(commands.Cog):
                 )
                 await self.bot.edit_ephemeral(
                     interaction,
-                    "Panelen kunde inte uppdateras. Kontrollera botens "
-                    "kanalbehörigheter och försök igen.",
+                    "The panel could not be updated. Check the bot's channel "
+                    "permissions and try again.",
                 )
             except Exception:
                 _LOGGER.exception("Unexpected Guild Armory activation failure")
                 await self.bot.edit_ephemeral(
-                    interaction, "Aktiveringen misslyckades. Försök igen senare."
+                    interaction, "Activation failed. Please try again later."
                 )
             else:
                 _LOGGER.info("guild_armory_activated")
 
     @armory.command(
-        name="manage", description="Hantera dina Guild Armory-karaktärer privat"
+        name="manage", description="Add and edit your Guild Armory characters"
     )
     @app_commands.guild_only()
     async def manage(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message(
-                "Öppna hanteringen från den server där karaktären registrerades.",
+                "Open management from the server where the character was registered.",
                 ephemeral=True,
             )
             return
@@ -314,14 +314,13 @@ class ArmoryBot(commands.Bot):
             )
             dm = await user.create_dm()
             embed = discord.Embed(
-                title="Registrera i Guild Armory",
+                title="Register with Guild Armory",
                 description=(
                     f"Server: **{self.guild_label(config.guild_id)}**. "
-                    "Öppna formuläret med knappen och klistra in hela din "
-                    "karaktärslänk från WoW Armory. Länken skickas privat. "
-                    "Du kan registrera upp till tre karaktärer. "
-                    "Använd länken WoW Forever Armory (EU) nedan för att hitta "
-                    "din karaktär."
+                    "Open the form with the Add & Edit button and paste your full "
+                    "WoW Armory character URL. You can register up to three "
+                    "characters. Use the WoW Forever Armory (EU) link below to "
+                    "find your character."
                 ),
                 color=discord.Color.blurple(),
             )
@@ -334,7 +333,7 @@ class ArmoryBot(commands.Bot):
                 config.guild_id, payload.user_id, message.id
             )
         except discord.Forbidden, discord.NotFound:
-            # The persistent panel's private modal is the fallback when DMs are closed.
+            # Add & Edit remains available on the panel when DMs are closed.
             return
         except discord.HTTPException, TimeoutError:
             _LOGGER.warning("Guild Armory reaction flow could not start")
@@ -365,20 +364,19 @@ class ArmoryBot(commands.Bot):
             await interaction.response.defer(ephemeral=True, thinking=True)
         except discord.DiscordException, TimeoutError:
             return
-        result = "Registreringen misslyckades. Kontrollera länken och försök igen."
+        result = "Registration failed. Check the URL and try again."
         try:
             path = validate_armory_url(value, self.armory_client)
             verified = await self._verify_member(guild_id, interaction.user.id)
             if verified is None:
                 result = (
-                    "Du behöver vara medlem i den här servern "
-                    "för att ändra dess Armory."
+                    "You must be a member of this server to edit its Armory."
                 )
             else:
                 guild, member = verified
                 config = await self.store.get_guild(guild_id)
                 if config is None:
-                    result = "Guild Armory är inte längre aktiv i den här servern."
+                    result = "Guild Armory is no longer active in this server."
                 else:
                     async with self.member_lock(guild_id, member.id):
                         if replace_path is None:
@@ -389,7 +387,7 @@ class ArmoryBot(commands.Bot):
                                     "character_registration_rejected_duplicate"
                                 )
                                 result = (
-                                    "Den här karaktären finns redan i din Guild Armory."
+                                    "This character is already in your Guild Armory."
                                 )
                                 await self.edit_ephemeral(interaction, result)
                                 return
@@ -402,13 +400,13 @@ class ArmoryBot(commands.Bot):
                             if flow == "already_full":
                                 _LOGGER.info("character_registration_rejected_limit")
                                 result = (
-                                    "Du har redan tre karaktärer. Ta bort en "
-                                    "innan du lägger till fler."
+                                    "You already have three characters. Remove one "
+                                    "before adding another."
                                 )
                                 await self.edit_ephemeral(interaction, result)
                                 return
                             if flow == "unconfigured":
-                                result = "Guild Armory är inte aktiv."
+                                result = "Guild Armory is not active."
                                 await self.edit_ephemeral(interaction, result)
                                 return
                         try:
@@ -418,13 +416,13 @@ class ArmoryBot(commands.Bot):
                                 )
                         except TimeoutError:
                             result = (
-                                "WoW Armory tog för lång tid på sig. "
-                                "Försök igen senare."
+                                "The WoW Armory request timed out. "
+                                "Please try again later."
                             )
                             await self.edit_ephemeral(interaction, result)
                             return
                         if character.name is None and character.level is None:
-                            result = "Ingen karaktär hittades på den Armory-länken."
+                            result = "No character was found at that Armory URL."
                             await self.edit_ephemeral(interaction, result)
                             return
                         pending_dm_id = await self.store.flow_message(
@@ -475,53 +473,57 @@ class ArmoryBot(commands.Bot):
                         await self.update_member_dm(member, state, pending_dm_id)
                         if row_updated:
                             result = (
-                                "Karaktären har sparats och raden har uppdaterats "
-                                "i Guild Armory-kanalen."
+                                "Character saved and the overview updated in the "
+                                "Guild Armory channel."
                             )
                         else:
                             result = (
-                                "Karaktären har sparats. Raden uppdateras "
-                                "när kanalen är tillgänglig."
+                                "Character saved. The overview will update when "
+                                "the channel is available."
                             )
         except ArmoryParseError:
             result = (
-                "WoW Armory returnerade oläsbara karaktärsdata. Försök igen senare."
+                "The WoW Armory returned unreadable character data. "
+                "Please try again later."
             )
         except CharacterLimitReached:
             _LOGGER.info("character_registration_rejected_limit")
             result = (
-                "Du har redan tre karaktärer. Ta bort en innan du lägger till fler."
+                "You already have three characters. Remove one before adding another."
             )
         except DuplicateCharacter:
             _LOGGER.info("character_registration_rejected_duplicate")
-            result = "Den här karaktären finns redan i din Guild Armory."
+            result = "This character is already in your Guild Armory."
         except CharacterNotFound:
-            result = "Karaktären som skulle ersättas finns inte längre i din lista."
+            result = "The character to replace is no longer in your list."
         except ValueError:
             result = (
-                "Ange en fullständig karaktärslänk från den officiella "
-                "WoW Armory-sidan."
+                "Enter a full character URL from the official WoW Armory."
             )
         except ArmoryHTTPError as exc:
             _LOGGER.warning(
                 "Armory profile request failed", extra={"status": exc.status}
             )
             result = (
-                "Karaktären hittades inte i WoW Armory."
+                "The character was not found in the WoW Armory."
                 if exc.status == 404
-                else "WoW Armory är tillfälligt otillgängligt. Försök igen senare."
+                else "The WoW Armory is temporarily unavailable. "
+                "Please try again later."
             )
         except ArmoryTimeoutError:
             _LOGGER.warning("Armory profile request timed out")
-            result = "WoW Armory tog för lång tid på sig. Försök igen senare."
+            result = "The WoW Armory request timed out. Please try again later."
         except ArmoryClientError:
             _LOGGER.warning("Armory profile request failed")
-            result = "WoW Armory kunde inte nås. Försök igen senare."
+            result = "Could not reach the WoW Armory. Please try again later."
         except discord.DiscordException, OSError, TimeoutError:
-            result = "Guild Armory kunde inte uppdateras just nu. Försök igen senare."
+            result = (
+                "Guild Armory could not be updated right now. "
+                "Please try again later."
+            )
             _LOGGER.warning("Guild Armory registration encountered a service failure")
         except Exception:
-            result = "Registreringen misslyckades. Försök igen senare."
+            result = "Registration failed. Please try again later."
             _LOGGER.exception("Unexpected Guild Armory registration failure")
         await self.edit_ephemeral(interaction, result)
 
@@ -610,22 +612,32 @@ class ArmoryBot(commands.Bot):
         if message is None:
             self._require_bot_identity()
             message = await channel.send(
-                content="Guild Armory",
+                content=f"<@{state.user_id}>",
                 file=discord.File(BytesIO(png), filename=filename),
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=[discord.Object(id=state.user_id)],
+                    roles=False,
+                    replied_user=False,
+                ),
             )
         else:
             self._require_bot_identity()
             if not self._is_bot_attachment(message, filename):
                 self._require_bot_identity()
                 message = await channel.send(
-                    content="Guild Armory",
+                    content=f"<@{state.user_id}>",
                     file=discord.File(BytesIO(png), filename=filename),
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        users=[discord.Object(id=state.user_id)],
+                        roles=False,
+                        replied_user=False,
+                    ),
                 )
             else:
                 await message.edit(
-                    content="Guild Armory",
+                    content=f"<@{state.user_id}>",
                     attachments=[discord.File(BytesIO(png), filename=filename)],
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -656,11 +668,11 @@ class ArmoryBot(commands.Bot):
                     message = None
             content = (
                 f"Server: {self.guild_label(state.guild_id)}. "
-                f"Din Guild Armory är uppdaterad "
-                f"({len(state.characters)} av 3 karaktärer)."
+                f"Your Guild Armory is updated "
+                f"({len(state.characters)} of 3 characters)."
                 if state.characters
                 else f"Server: {self.guild_label(state.guild_id)}. "
-                "Din Guild Armory är tom. Lägg till en karaktär när du vill."
+                "Your Guild Armory is empty. Add a character whenever you are ready."
             )
             view = GuildPanelView(self, state.guild_id)
             if message is None:
@@ -695,17 +707,16 @@ class ArmoryBot(commands.Bot):
             state = await self.store.member(guild_id, interaction.user.id)
             if verified is None or state is None:
                 text = (
-                    "Ingen registrerade karaktärer hittades för dig i den här servern."
+                    "No registered characters were found for you in this server."
                 )
                 view: discord.ui.View = GuildPanelView(self, guild_id)
             elif not state.characters:
                 text = (
-                    "Din lista är tom. Lägg till en karaktär via det privata "
-                    "formuläret."
+                    "Your list is empty. Add a character using the form."
                 )
                 view = GuildPanelView(self, guild_id)
             else:
-                text = f"Du har {len(state.characters)} av 3 möjliga karaktärer."
+                text = f"You have {len(state.characters)} of 3 characters."
                 view = CharacterSelectView(self, guild_id, interaction.user.id, state)
             await interaction.edit_original_response(
                 content=text, view=view, allowed_mentions=discord.AllowedMentions.none()
@@ -715,7 +726,7 @@ class ArmoryBot(commands.Bot):
         except Exception:
             _LOGGER.exception("Unexpected Guild Armory management failure")
             await self.edit_ephemeral(
-                interaction, "Hanteringen kunde inte öppnas. Försök igen senare."
+                interaction, "Management could not be opened. Please try again later."
             )
 
     async def remove_character(
@@ -729,7 +740,7 @@ class ArmoryBot(commands.Bot):
             verified = await self._verify_member(guild_id, interaction.user.id)
             if verified is None:
                 await self.edit_ephemeral(
-                    interaction, "Du är inte medlem i den här servern."
+                    interaction, "You are not a member of this server."
                 )
                 return
             _, member = verified
@@ -743,30 +754,30 @@ class ArmoryBot(commands.Bot):
                 await self.update_member_dm(member, state, state.manage_message_id)
                 await self.edit_ephemeral(
                     interaction,
-                    "Karaktären har tagits bort."
+                    "Character removed."
                     if state.characters
-                    else "Karaktären har tagits bort. Din rad är nu tom.",
+                    else "Character removed. Your overview is now empty.",
                 )
         except CharacterNotFound:
             await self.edit_ephemeral(
-                interaction, "Karaktären finns inte längre i din lista."
+                interaction, "The character is no longer in your list."
             )
         except BotIdentityUnavailable:
             _LOGGER.warning("Character removal deferred until bot identity returns")
             await self.edit_ephemeral(
-                interaction, "Borttagningen kunde inte slutföras just nu."
+                interaction, "The character could not be removed right now."
             )
         except discord.DiscordException, OSError, TimeoutError:
             _LOGGER.warning(
                 "Guild Armory character removal encountered a service failure"
             )
             await self.edit_ephemeral(
-                interaction, "Borttagningen kunde inte slutföras just nu."
+                interaction, "The character could not be removed right now."
             )
         except Exception:
             _LOGGER.exception("Unexpected Guild Armory character removal failure")
             await self.edit_ephemeral(
-                interaction, "Borttagningen kunde inte slutföras just nu."
+                interaction, "The character could not be removed right now."
             )
 
     async def on_ready(self) -> None:

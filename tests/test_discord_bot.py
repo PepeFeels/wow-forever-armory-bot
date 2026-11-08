@@ -17,7 +17,7 @@ from wow_forever_armory.discord_bot import (
     GuildArmoryCommands,
 )
 from wow_forever_armory.guild_armory_store import GuildArmoryStore
-from wow_forever_armory.guild_armory_views import GuildPanelView
+from wow_forever_armory.guild_armory_views import CharacterSelectView, GuildPanelView
 from wow_forever_armory.models import Character
 
 PREFIX = "en-us/forever/eu/armory/character"
@@ -106,20 +106,55 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         panel.add_reaction.assert_awaited_once_with("⚔️")
         self.assertEqual((await self.store.get_guild(111)).panel_message_id, 333)
 
-    async def test_panel_view_has_private_registration_management_and_official_link(
+    async def test_panel_view_has_add_edit_and_official_link(
         self,
     ) -> None:
         view = GuildPanelView(self.bot, 111)
         buttons = [
             child for child in view.children if isinstance(child, discord.ui.Button)
         ]
-        self.assertEqual(buttons[0].custom_id, "guild-armory:register:111")
-        self.assertEqual(buttons[1].custom_id, "guild-armory:manage:111")
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual(buttons[0].label, "Add & Edit")
+        self.assertEqual(buttons[0].custom_id, "guild-armory:manage:111")
         self.assertEqual(
-            buttons[2].url,
-            "https://worldofwarcraft.blizzard.com/en-gb/forever/eu/armory",
+            buttons[1].url,
+            "https://worldofwarcraft.blizzard.com/en-us/forever/eu/armory/",
         )
-        self.assertIn("(EU)", buttons[2].label)
+        self.assertIn("(EU)", buttons[1].label)
+        self.assertFalse(
+            any("Register Privately" in (item.label or "") for item in buttons)
+        )
+
+    async def test_add_edit_button_opens_character_management(self) -> None:
+        view = GuildPanelView(self.bot, 111)
+        self.bot.open_management = AsyncMock()
+        interaction = self.interaction()
+        await view.children[0].callback(interaction)
+        self.bot.open_management.assert_awaited_once_with(interaction, 111)
+
+    async def test_management_menu_supports_adding_and_editing_characters(self) -> None:
+        await self.store.finish_flow(
+            111,
+            456,
+            "Hero",
+            f"{PREFIX}/hero",
+            Character(name="Hero", surname="Woodsong", level=60),
+        )
+        state = await self.store.member(111, 456)
+        view = CharacterSelectView(self.bot, 111, 456, state)
+        self.assertTrue(
+            any(
+                isinstance(item, discord.ui.Button) and item.label == "Add Character"
+                for item in view.children
+            )
+        )
+        self.assertTrue(
+            any(isinstance(item, discord.ui.Select) for item in view.children)
+        )
+        selector = next(
+            item for item in view.children if isinstance(item, discord.ui.Select)
+        )
+        self.assertEqual(selector.options[0].label, "Hero Woodsong")
 
     async def test_bot_uses_only_non_privileged_guild_and_reaction_intents(
         self,
@@ -502,6 +537,31 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.sync_member_row(state)
         owned.edit.assert_awaited_once()
         channel.send.assert_not_awaited()
+        self.assertEqual(owned.edit.await_args.kwargs["content"], "<@456>")
+        self.assertFalse(owned.edit.await_args.kwargs["allowed_mentions"].users)
+
+    async def test_new_member_row_mentions_its_owner_once(self) -> None:
+        await self.store.finish_flow(
+            111, 456, "Hero", f"{PREFIX}/hero", Character(name="Hero", level=60)
+        )
+        state = await self.store.member(111, 456)
+        self.bot._connection.user = SimpleNamespace(id=1)
+        channel = MagicMock(spec=discord.TextChannel)
+        self.bot._find_attachment_message = AsyncMock(return_value=None)
+        channel.send = AsyncMock(return_value=MagicMock(id=889))
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        with patch(
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
+        ):
+            await self.bot.sync_member_row(state)
+        channel.send.assert_awaited_once()
+        kwargs = channel.send.await_args.kwargs
+        self.assertEqual(kwargs["content"], "<@456>")
+        allowed = kwargs["allowed_mentions"]
+        self.assertEqual([user.id for user in allowed.users], [456])
+        self.assertFalse(allowed.everyone)
+        self.assertFalse(allowed.roles)
 
     async def test_empty_row_is_untouched_when_bot_identity_is_missing(self) -> None:
         await self.store.finish_flow(
@@ -577,7 +637,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.flow_message(111, 456), 777)
         embed = dm.send.await_args.kwargs["embed"]
         view = dm.send.await_args.kwargs["view"]
-        self.assertIn("privat", embed.description.lower())
+        self.assertIn("Add & Edit", embed.description)
         self.assertIn("Armory (EU)", embed.description)
         self.assertIsInstance(view, GuildPanelView)
 
@@ -592,12 +652,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_raw_reaction_add(self.payload())
         self.assertEqual(await self.store.begin_flow(111, 456, 333), "already_pending")
         view = GuildPanelView(self.bot, 111)
-        self.assertTrue(
-            any(
-                getattr(item, "custom_id", "").startswith("guild-armory:register")
-                for item in view.children
-            )
-        )
+        self.assertEqual(view.children[0].label, "Add & Edit")
 
     async def test_wrong_reaction_and_wrong_panel_do_nothing(self) -> None:
         self.bot.fetch_user = AsyncMock()
@@ -647,7 +702,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             state, fresh_paths=frozenset({state.characters[0].path})
         )
         self.assertIn(
-            "sparats", interaction.edit_original_response.await_args.kwargs["content"]
+            "saved", interaction.edit_original_response.await_args.kwargs["content"]
         )
 
     async def test_three_limit_duplicates_and_replace_are_reported_privately(
@@ -671,13 +726,14 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         duplicate_interaction = self.interaction()
         await self.bot.submit_character_url(duplicate_interaction, 111, urls[0])
         self.assertIn(
-            "finns redan",
+            "already",
             duplicate_interaction.edit_original_response.await_args.kwargs["content"],
         )
         fourth = self.interaction()
         await self.bot.submit_character_url(fourth, 111, urls[3])
         self.assertIn(
-            "tre karaktärer", fourth.edit_original_response.await_args.kwargs["content"]
+            "three characters",
+            fourth.edit_original_response.await_args.kwargs["content"],
         )
         replacement = self.interaction()
         await self.bot.submit_character_url(
@@ -687,7 +743,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             replace_path="en-us/forever/eu/armory/character/hero-1",
         )
         self.assertIn(
-            "sparats", replacement.edit_original_response.await_args.kwargs["content"]
+            "saved", replacement.edit_original_response.await_args.kwargs["content"]
         )
         state = await self.store.member(111, 456)
         self.assertEqual(len(state.characters), 3)
@@ -816,5 +872,5 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.bot._verify_member.assert_awaited_once_with(111, 456)
         self.core.fetch_character.assert_not_awaited()
         self.assertIn(
-            "medlem", interaction.edit_original_response.await_args.kwargs["content"]
+            "member", interaction.edit_original_response.await_args.kwargs["content"]
         )

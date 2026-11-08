@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.1.0 — release candidate
+
+Prepared for independent review on `feature/v1.1.0`; this release has not been
+published or deployed. Production remains on v1.0.0 pending separate approval.
+
+### Included
+
+- English Discord interface with the Add & Edit flow and preserved sword
+  reaction registration.
+- Member-owned overview messages with controlled initial mentions and silent
+  automatic image updates.
+- Compact one-to-three-character graphics with profession progress bars,
+  available surnames, adaptive character-name sizing, and nine bundled HD
+  Classic class icons.
+- Backward-compatible character snapshot parsing and persistence; no SQLite
+  schema migration is introduced.
+
+### Compatibility and operational notes
+
+- Package metadata identifies this candidate as version 1.1.0.
+- The installer requires a clean exact-SHA checkout on `feature/v1.1.0` based on
+  the v1.0.0 base commit `4ac05712259e26560d1818746f5cee90e6793f78`.
+- Production remains on v1.0.0 until a separately approved release procedure.
+
 ## v1.0.0 — release candidate
 
 This is the first stable-release candidate, prepared from the verified v0.2.0

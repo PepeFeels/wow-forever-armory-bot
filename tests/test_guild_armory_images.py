@@ -6,12 +6,23 @@ from io import BytesIO
 
 from PIL import Image
 
-from wow_forever_armory.guild_armory_images import render_intro_panel, render_member_row
+from wow_forever_armory.guild_armory_images import (
+    _INTRO_COPY,
+    render_intro_panel,
+    render_member_row,
+)
 from wow_forever_armory.guild_armory_store import StoredCharacter
 from wow_forever_armory.models import Character
 
 
 class GuildArmoryImageTests(unittest.TestCase):
+    def test_intro_copy_is_english_and_explains_registration_controls(self) -> None:
+        self.assertTrue(all(text.isascii() for text in _INTRO_COPY))
+        copy = " ".join(_INTRO_COPY)
+        self.assertIn("sword", copy)
+        self.assertIn("Add & Edit", copy)
+        self.assertNotIn("Register Privately", copy)
+
     def test_intro_panel_is_a_readable_sized_png(self) -> None:
         result = render_intro_panel()
         self.assertTrue(result.startswith(b"\x89PNG\r\n\x1a\n"))

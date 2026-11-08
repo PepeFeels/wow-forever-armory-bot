@@ -13,11 +13,12 @@ from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image, ImageDraw
 
 from wow_forever_armory.graphic_renderer import (
+    _CLASS_ICON_FILES,
     UI_LABELS,
     ArmoryGraphicRequest,
     GraphicAssetError,
@@ -25,9 +26,13 @@ from wow_forever_armory.graphic_renderer import (
     GraphicStat,
     PvPInfo,
     _character_title,
+    _draw_profession_row,
+    _fit_character_title,
     _fit_text,
+    _font,
     _freshness_label,
     _is_outdated,
+    _load_class_icon,
     _load_logo,
     _load_portrait,
     _panel_section_layout,
@@ -129,7 +134,7 @@ def _fixture_requests() -> dict[str, ArmoryGraphicRequest]:
 class GraphicRendererTests(unittest.TestCase):
     def test_dimensions_and_golden_snapshots_for_all_modes(self) -> None:
         requests = _fixture_requests()
-        expected_sizes = {"one": (800, 900), "two": (1200, 900), "three": (1800, 900)}
+        expected_sizes = {"one": (800, 520), "two": (1200, 520), "three": (1800, 520)}
         expected_hashes = json.loads(GOLDEN.read_text()) if GOLDEN.exists() else {}
         observed: dict[str, str] = {}
         PREVIEWS.mkdir(parents=True, exist_ok=True)
@@ -161,13 +166,12 @@ class GraphicRendererTests(unittest.TestCase):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 output_size(count)
 
-    def test_missing_statistics_compact_that_section_and_rebalance_professions(
+    def test_compact_panel_layout_removes_statistics_section(
         self,
     ) -> None:
-        with_stats = _panel_section_layout(True)
-        without_stats = _panel_section_layout(False)
-        self.assertEqual(with_stats, (360, 378, 416, 43))
-        self.assertEqual(without_stats, (305, 323, 366, 50))
+        self.assertEqual(_panel_section_layout(), (158, 174, 207, 48))
+        self.assertNotIn("CHARACTER OVERVIEW", UI_LABELS)
+        self.assertNotIn("CHARACTER STATS", UI_LABELS)
 
     def test_request_requires_display_name_and_safe_character_count(self) -> None:
         hero = _character("Hero", "Mage")
@@ -207,12 +211,69 @@ class GraphicRendererTests(unittest.TestCase):
             _character_title(_character("Aelwyn", "Druid", surname="Woodsong")),
             "Aelwyn Woodsong",
         )
+
+    def test_profession_progress_label_contains_name_and_numeric_progress(self) -> None:
+        profession = Profession(
+            "Leatherworking", skill=115, max_skill=150, category="primary"
+        )
+        self.assertEqual(_skill_value(profession), "115/150")
+        draw = MagicMock()
+        draw.textlength.side_effect = lambda text, font: len(text) * font.size * 0.55
+        _draw_profession_row(
+            draw,
+            "Leatherworking",
+            _skill_value(profession),
+            0,
+            0,
+            250,
+            _font(14),
+            _font(12),
+        )
+        self.assertEqual(draw.rounded_rectangle.call_count, 2)
+        labels = [call.args[1] for call in draw.text.call_args_list]
+        self.assertIn("Leatherworking", labels)
+        self.assertIn("115/150", labels)
+        request = ArmoryGraphicRequest(
+            "Member", (_character("Hero", "Druid", professions=(profession,)),)
+        )
+        image = Image.open(BytesIO(render_armory_overview(request)))
+        self.assertEqual(image.size, (800, 520))
         self.assertEqual(
             _character_title(
                 _character("Aelwyn Woodsong", "Druid", surname="Woodsong")
             ),
             "Aelwyn Woodsong",
         )
+
+    def test_adaptive_name_font_preserves_size_and_fits_long_surname(self) -> None:
+        canvas = Image.new("RGB", (500, 100))
+        draw = ImageDraw.Draw(canvas)
+        normal = _character("Ryn", "Druid", surname="Oakfall")
+        normal_title, normal_font = _fit_character_title(
+            draw, normal, 400, base_size=26
+        )
+        self.assertEqual(normal_title, "Ryn Oakfall")
+        self.assertEqual(normal_font.size, 26)
+
+        long_name = _character(
+            "Aeltherion", "Warrior", surname="Whispering-Wind"
+        )
+        fitted_title, fitted_font = _fit_character_title(
+            draw, long_name, 409, base_size=26
+        )
+        self.assertEqual(fitted_title, "Aeltherion Whispering-Wind")
+        self.assertLess(fitted_font.size, 26)
+        self.assertLessEqual(draw.textlength(fitted_title, font=fitted_font), 409)
+
+    def test_surname_is_preserved_before_given_name_ellipsis(self) -> None:
+        canvas = Image.new("RGB", (300, 100))
+        draw = ImageDraw.Draw(canvas)
+        character = _character(
+            "ExtremelyLongGivenNameThatCannotFit", "Mage", surname="Whispering-Wind"
+        )
+        title, font = _fit_character_title(draw, character, 220, base_size=26)
+        self.assertTrue(title.endswith("Whispering-Wind"))
+        self.assertLessEqual(draw.textlength(title, font=font), 220)
 
     def test_long_unicode_names_fit_without_overflow(self) -> None:
         image = Image.new("RGB", (500, 100))
@@ -401,19 +462,46 @@ class GraphicRendererTests(unittest.TestCase):
         self.assertLess(peak, 128 * 1024 * 1024)
         self.assertLess(len(rendered), 8 * 1024 * 1024)
 
+    def test_all_nine_class_icon_mappings_load_original_transparent_pngs(self) -> None:
+        expected = {
+            "druid": "druidhd.png",
+            "hunter": "hunterhd.png",
+            "mage": "magehd.png",
+            "paladin": "paladinhd.png",
+            "priest": "priesthd.png",
+            "rogue": "roguehd.png",
+            "shaman": "shamanhd.png",
+            "warlock": "warlockhd.png",
+            "warrior": "warriorhd.png",
+        }
+        self.assertEqual(_CLASS_ICON_FILES, expected)
+        for character_class in expected:
+            with self.subTest(character_class=character_class):
+                icon = _load_class_icon(character_class.title())
+                self.assertIsNotNone(icon)
+                self.assertEqual(icon.mode, "RGBA")
+                self.assertIn(icon.size, {(224, 224), (240, 240)})
+                self.assertEqual(icon.getchannel("A").getextrema(), (0, 255))
+
     def test_class_icons_are_distinct_and_unknown_class_has_safe_fallback(self) -> None:
         signatures = []
         for name, character_class in (
             ("Druid", "Druid"),
-            ("Warrior", "Warrior"),
+            ("Hunter", "Hunter"),
             ("Mage", "Mage"),
+            ("Paladin", "Paladin"),
+            ("Priest", "Priest"),
+            ("Rogue", "Rogue"),
+            ("Shaman", "Shaman"),
+            ("Warlock", "Warlock"),
+            ("Warrior", "Warrior"),
             ("Unknown", "Unknown Class"),
         ):
             png = render_armory_overview(
                 ArmoryGraphicRequest("Member", (_character(name, character_class),))
             )
             image = Image.open(BytesIO(png)).convert("RGB")
-            signatures.append(image.crop((38, 158, 170, 290)).tobytes())
+            signatures.append(image.crop((38, 36, 170, 168)).tobytes())
         self.assertEqual(len(set(signatures)), len(signatures))
 
 

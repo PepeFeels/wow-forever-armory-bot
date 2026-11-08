@@ -21,8 +21,9 @@ from .guild_armory_store import StoredCharacter
 from .models import Character, Profession
 
 _ASSET_DIR: Final = Path(__file__).with_name("assets")
+_CLASS_ICON_DIR: Final = _ASSET_DIR / "class_icons"
 _FONT_DIR: Final = _ASSET_DIR / "fonts"
-_OUTPUT_SIZES: Final = {1: (800, 900), 2: (1200, 900), 3: (1800, 900)}
+_OUTPUT_SIZES: Final = {1: (800, 520), 2: (1200, 520), 3: (1800, 520)}
 _STALE_AFTER: Final = timedelta(days=30)
 _MAX_LOGO_BYTES: Final = 8 * 1024 * 1024
 _MAX_PORTRAIT_BYTES: Final = 2 * 1024 * 1024
@@ -47,6 +48,17 @@ _CLASS_COLORS: Final = {
     "warlock": (148, 130, 201),
     "warrior": (199, 156, 110),
 }
+_CLASS_ICON_FILES: Final = {
+    "druid": "druidhd.png",
+    "hunter": "hunterhd.png",
+    "mage": "magehd.png",
+    "paladin": "paladinhd.png",
+    "priest": "priesthd.png",
+    "rogue": "roguehd.png",
+    "shaman": "shamanhd.png",
+    "warlock": "warlockhd.png",
+    "warrior": "warriorhd.png",
+}
 _PRIMARY_ORDER: Final = (
     "alchemy",
     "blacksmithing",
@@ -63,8 +75,6 @@ _PRIMARY_ORDER: Final = (
 _SECONDARY_NAMES: Final = ("Cooking", "Fishing", "First Aid")
 _BIDI_CONTROLS = re.compile("[\u202a-\u202e\u2066-\u2069]")
 UI_LABELS: Final = (
-    "CHARACTER OVERVIEW",
-    "CHARACTER STATS",
     "PROFESSIONS",
     "SECONDARY SKILLS",
     "PVP",
@@ -129,6 +139,7 @@ class GraphicCharacter:
         """Adapt only fields the existing Armory Core actually normalizes."""
         return cls(
             name=character.name,
+            surname=character.surname,
             level=character.level,
             race=character.race,
             character_class=character.character_class,
@@ -189,11 +200,10 @@ def output_size(character_count: int) -> tuple[int, int]:
         raise ValueError("An overview requires one to three characters") from exc
 
 
-def _panel_section_layout(has_stats: bool) -> tuple[int, int, int, int]:
-    """Return stat divider, profession heading/row positions, and row spacing."""
-    if has_stats:
-        return 360, 378, 416, 43
-    return 305, 323, 366, 50
+def _panel_section_layout(has_stats: bool = False) -> tuple[int, int, int, int]:
+    """Return compact divider, profession heading/row positions, and spacing."""
+    del has_stats
+    return 158, 174, 207, 48
 
 
 def _clean_text(value: object, *, limit: int = 512) -> str:
@@ -337,6 +347,24 @@ def _class_color(character_class: str | None) -> tuple[int, int, int]:
     return _CLASS_COLORS.get(_clean_text(character_class).casefold(), (159, 170, 186))
 
 
+def _load_class_icon(character_class: str | None) -> Image.Image | None:
+    class_key = _clean_text(character_class).casefold()
+    filename = _CLASS_ICON_FILES.get(class_key)
+    if filename is None:
+        return None
+    path = _CLASS_ICON_DIR / filename
+    try:
+        with Image.open(path) as source:
+            if source.format != "PNG" or source.mode != "RGBA":
+                raise GraphicAssetError(f"The bundled {class_key} icon is not RGBA PNG")
+            if source.width < 1 or source.height < 1:
+                raise GraphicAssetError(f"The bundled {class_key} icon is empty")
+            source.load()
+            return source.copy()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise GraphicAssetError(f"The bundled {class_key} icon is unavailable") from exc
+
+
 def _draw_class_placeholder(
     canvas: Image.Image,
     box: tuple[int, int, int, int],
@@ -364,12 +392,30 @@ def _draw_class_placeholder(
         outline=_GOLD_LIGHT,
         width=2,
     )
-    _draw_class_symbol(
-        draw,
-        center,
-        max(10, emblem_radius - 5),
-        _clean_text(character.character_class).casefold(),
-    )
+    class_icon = _load_class_icon(character.character_class)
+    if class_icon is None:
+        _draw_class_symbol(
+            draw,
+            center,
+            max(10, emblem_radius - 5),
+            _clean_text(character.character_class).casefold(),
+        )
+    else:
+        icon_size = max(1, emblem_radius * 2 - 6)
+        class_icon.thumbnail((icon_size, icon_size), Image.Resampling.LANCZOS)
+        icon_left = center[0] - class_icon.width // 2
+        icon_top = center[1] - class_icon.height // 2
+        canvas.paste(class_icon, (icon_left, icon_top), class_icon.getchannel("A"))
+        draw.ellipse(
+            (
+                center[0] - emblem_radius,
+                center[1] - emblem_radius,
+                center[0] + emblem_radius,
+                center[1] + emblem_radius,
+            ),
+            outline=_GOLD_LIGHT,
+            width=2,
+        )
     class_name = _fit_text(
         draw,
         _clean_text(character.character_class).upper() or "UNKNOWN CLASS",
@@ -507,6 +553,44 @@ def _character_title(character: GraphicCharacter) -> str:
     return name
 
 
+def _fit_character_title(
+    draw: ImageDraw.ImageDraw,
+    character: GraphicCharacter,
+    width: int,
+    *,
+    base_size: int,
+) -> tuple[str, ImageFont.FreeTypeFont]:
+    """Reduce the title size before truncating, preserving a known surname."""
+    title = _character_title(character)
+    for size in range(base_size, 13, -1):
+        font = _font(size, bold=True, serif=True)
+        if draw.textlength(title, font=font) <= width:
+            return title, font
+
+    font = _font(14, bold=True, serif=True)
+    surname = _clean_text(character.surname, limit=80)
+    name = _clean_text(character.name, limit=120)
+    if surname:
+        given_name = (
+            name[: -len(surname)].rstrip()
+            if name.casefold().endswith(surname.casefold())
+            else name
+        )
+        surname_width = draw.textlength(surname, font=font)
+        if surname_width > width:
+            return _fit_text(draw, surname, font, width, limit=80), font
+        given_width = width - surname_width - draw.textlength(" ", font=font)
+        ellipsis_width = draw.textlength("…", font=font)
+        given_fit = (
+            _fit_text(draw, given_name, font, max(0, int(given_width)), limit=120)
+            if given_name and given_width >= ellipsis_width
+            else ""
+        )
+        return f"{given_fit} {surname}".strip(), font
+
+    return _fit_text(draw, title, font, width, limit=200), font
+
+
 def _valid_number(value: object) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -619,73 +703,6 @@ def format_pvp(pvp: PvPInfo | None) -> tuple[str, ...]:
     return tuple(lines) or ("No PvP Data",)
 
 
-def _draw_discord_mark(draw: ImageDraw.ImageDraw, x: int, y: int, size: int) -> None:
-    width, height = size, round(size * 0.76)
-    draw.rounded_rectangle(
-        (x, y + 3, x + width, y + height), radius=10, fill=(231, 234, 244)
-    )
-    draw.arc((x + 3, y, x + width - 3, y + 23), 180, 360, fill=(231, 234, 244), width=8)
-    eye_y = y + height // 2
-    for eye_x in (x + width // 3, x + width * 2 // 3):
-        draw.ellipse((eye_x - 3, eye_y - 2, eye_x + 3, eye_y + 4), fill=(11, 22, 39))
-    draw.arc(
-        (x + 16, y + height - 16, x + width - 16, y + height + 1),
-        0,
-        180,
-        fill=(11, 22, 39),
-        width=2,
-    )
-
-
-def _draw_header(
-    canvas: Image.Image,
-    display_name: str,
-    logo: Image.Image | None,
-) -> None:
-    width, _ = canvas.size
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(
-        (17, 15, width - 17, 124), radius=18, fill=(7, 17, 31), outline=_GOLD, width=3
-    )
-    draw.line((29, 117, width - 29, 117), fill=(119, 86, 39), width=1)
-
-    if logo is not None:
-        logo_box = (36, 21, 132, 113)
-        logo.thumbnail(
-            (logo_box[2] - logo_box[0], logo_box[3] - logo_box[1]),
-            Image.Resampling.LANCZOS,
-        )
-        logo_x = logo_box[0] + (logo_box[2] - logo_box[0] - logo.width) // 2
-        logo_y = logo_box[1] + (logo_box[3] - logo_box[1] - logo.height) // 2
-        canvas.paste(logo, (logo_x, logo_y), logo)
-
-    right_title = "CHARACTER OVERVIEW"
-    title_font = _font(21 if width <= 800 else 25, bold=True, serif=True)
-    # Reserve enough room for the complete heading even on the 800px layout.
-    title_box = (width - 36 - 350, 42, width - 36, 89)
-    title_text = _fit_text(
-        draw, right_title, title_font, title_box[2] - title_box[0], limit=40
-    )
-    draw.text(
-        (title_box[2], (title_box[1] + title_box[3]) // 2),
-        title_text,
-        font=title_font,
-        fill=_GOLD_LIGHT,
-        anchor="rm",
-    )
-
-    icon_x = 157
-    icon_size = 41 if width <= 800 else 46
-    _draw_discord_mark(draw, icon_x, 42, icon_size)
-    name_left = icon_x + icon_size + 18
-    name_right = title_box[0] - 23
-    name_font = _font(28 if width <= 800 else 34, bold=True, serif=True)
-    name_text = _fit_text(
-        draw, display_name, name_font, max(40, name_right - name_left), limit=256
-    )
-    draw.text((name_left, 46), name_text, font=name_font, fill=_GOLD_LIGHT)
-
-
 def _draw_ornamental_border(
     draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int]
 ) -> None:
@@ -745,9 +762,11 @@ def _draw_identity(
 
     info_x = portrait_box[2] + 15
     info_width = right - 18 - info_x
-    title_font = _font(26 if panel_width < 650 else 31, bold=True, serif=True)
-    title = _fit_text(
-        draw, _character_title(character), title_font, info_width, limit=160
+    title, title_font = _fit_character_title(
+        draw,
+        character,
+        info_width,
+        base_size=26 if panel_width < 650 else 31,
     )
     draw.text((info_x, top + 20), title, font=title_font, fill=_GOLD_LIGHT)
 
@@ -772,48 +791,6 @@ def _draw_identity(
     spec_font = _font(16 if panel_width < 650 else 18, serif=True)
     spec_text = _fit_text(draw, f"{spec}{talent}", spec_font, info_width, limit=160)
     draw.text((info_x, top + 94), spec_text, font=spec_font, fill=_MUTED)
-
-
-def _draw_stats(
-    draw: ImageDraw.ImageDraw,
-    character: GraphicCharacter,
-    panel: tuple[int, int, int, int],
-    count: int,
-) -> None:
-    left, top, right, _ = panel
-    padding = 23
-    inner_left, inner_right = left + padding, right - padding
-    font_size = 17 if count == 3 else 19
-    _section_heading(
-        draw,
-        "CHARACTER STATS",
-        inner_left,
-        top + 196,
-        inner_right - inner_left,
-        size=22,
-    )
-    stats = _stat_lines(character)
-    if not stats:
-        draw.text(
-            (inner_left, top + 235),
-            "No Stats Available",
-            font=_font(font_size),
-            fill=_MUTED,
-        )
-        return
-    row_y = top + 235
-    row_font = _font(font_size)
-    value_width = 100
-    for label, value in stats:
-        label_text = _fit_text(
-            draw, label, row_font, inner_right - inner_left - value_width - 12, limit=48
-        )
-        value_text = _fit_text(draw, value, row_font, value_width, limit=48)
-        draw.text((inner_left, row_y), label_text, font=row_font, fill=_PAPER)
-        draw.text(
-            (inner_right, row_y), value_text, font=row_font, fill=_PAPER, anchor="ra"
-        )
-        row_y += 25
 
 
 def _draw_professions(
@@ -900,28 +877,47 @@ def _draw_profession_row(
     font: ImageFont.FreeTypeFont,
     icon_font: ImageFont.FreeTypeFont,
 ) -> None:
-    icon_size = 23
+    del icon_font
+    bar_height = 30
+    bar_top = y
+    bar_bottom = y + bar_height
     draw.rounded_rectangle(
-        (x, y, x + icon_size, y + icon_size),
-        radius=5,
-        fill=(28, 38, 48),
-        outline=(149, 111, 55),
+        (x, bar_top, x + width, bar_bottom),
+        radius=7,
+        fill=(21, 31, 43),
+        outline=(105, 80, 46),
         width=1,
     )
+    parts = value.split("/", 1)
+    try:
+        current = float(parts[0].replace(",", ""))
+        maximum = float(parts[1].replace(",", "")) if len(parts) == 2 else 0
+        ratio = min(1.0, current / maximum) if maximum > 0 else 0.0
+    except ValueError:
+        ratio = 0.0
+    if ratio:
+        draw.rounded_rectangle(
+            (
+                x + 1,
+                bar_top + 1,
+                x + max(1, round((width - 2) * ratio)),
+                bar_bottom - 1,
+            ),
+            radius=6,
+            fill=(90, 67, 34),
+        )
+    text_font = _font(max(11, int(font.size) - 1), bold=True)
+    label_width = max(20, width - 90)
+    label = _fit_text(draw, name, text_font, label_width, limit=48)
+    value_text = _fit_text(draw, value, text_font, min(82, width // 3), limit=32)
+    draw.text((x + 9, bar_top + 6), label, font=text_font, fill=_PAPER)
     draw.text(
-        (x + icon_size // 2, y + icon_size // 2),
-        _profession_initials(name),
-        font=icon_font,
+        (x + width - 8, bar_top + 6),
+        value_text,
+        font=text_font,
         fill=_GOLD_LIGHT,
-        anchor="mm",
+        anchor="ra",
     )
-    value_width = min(82, max(54, width // 4))
-    label_width = max(20, width - icon_size - 8 - value_width - 4)
-    label_font = font
-    label = _fit_text(draw, name, label_font, label_width, limit=48)
-    value_text = _fit_text(draw, value, font, value_width, limit=32)
-    draw.text((x + icon_size + 7, y + 3), label, font=label_font, fill=_PAPER)
-    draw.text((x + width, y + 3), value_text, font=font, fill=_PAPER, anchor="ra")
 
 
 def _draw_footer(
@@ -939,9 +935,9 @@ def _draw_footer(
     updated_x = inner_left + column_width + gap
     heading_size = 19 if count == 3 else 21
     body_size = 15 if count == 3 else 17
-    _section_heading(draw, "PVP", pvp_x, top + 615, column_width, size=heading_size)
+    _section_heading(draw, "PVP", pvp_x, top + 400, column_width, size=heading_size)
     _section_heading(
-        draw, "LAST UPDATED", updated_x, top + 615, column_width, size=heading_size
+        draw, "LAST UPDATED", updated_x, top + 400, column_width, size=heading_size
     )
     body_font = _font(body_size)
 
@@ -950,16 +946,16 @@ def _draw_footer(
     for index, line in enumerate(pvp_lines[:2]):
         fitted = _fit_text(draw, line, body_font, column_width, limit=90)
         draw.text(
-            (pvp_x, top + 652 + index * 24), fitted, font=body_font, fill=pvp_color
+            (pvp_x, top + 435 + index * 22), fitted, font=body_font, fill=pvp_color
         )
 
     updated = _timestamp_label(character.last_updated)
     updated_text = _fit_text(draw, updated, body_font, column_width, limit=64)
-    draw.text((updated_x, top + 652), updated_text, font=body_font, fill=_PAPER)
+    draw.text((updated_x, top + 435), updated_text, font=body_font, fill=_PAPER)
     freshness = _freshness_label(character)
     if freshness:
         freshness_font = _font(11, bold=True)
-        draw.text((updated_x, top + 681), freshness, font=freshness_font, fill=_MUTED)
+        draw.text((updated_x, top + 450), freshness, font=freshness_font, fill=_MUTED)
 
 
 def _freshness_label(character: GraphicCharacter) -> str:
@@ -995,17 +991,15 @@ def _draw_panel(
     _draw_identity(canvas, character, panel)
     draw = ImageDraw.Draw(canvas)
     inner_left, inner_right = left + 20, right - 20
-    has_stats = bool(_stat_lines(character))
     middle_offset, profession_heading, profession_rows, profession_gap = (
-        _panel_section_layout(has_stats)
+        _panel_section_layout()
     )
     middle_divider = top + middle_offset
-    for y in (top + 180, middle_divider, top + 585):
+    for y in (middle_divider, top + 390):
         draw.line((inner_left, y, inner_right, y), fill=(157, 110, 48), width=2)
         draw.line(
             (inner_left + 3, y + 3, inner_right - 3, y + 3), fill=(58, 51, 43), width=1
         )
-    _draw_stats(draw, character, panel, count)
     _draw_professions(
         draw,
         character,
@@ -1023,15 +1017,7 @@ def render_armory_overview(request: ArmoryGraphicRequest) -> bytes:
     count = len(request.characters)
     width, height = output_size(count)
     canvas = _background((width, height))
-    try:
-        logo = _load_logo()
-    except GraphicAssetError:
-        # Keep development/test builds usable without redistributing an
-        # unlicensed logo; do not draw a substitute for the official mark.
-        logo = None
-    _draw_header(canvas, request.discord_display_name, logo)
-
-    margin, gap, top, bottom = 20, 18, 142, height - 20
+    margin, gap, top, bottom = 20, 18, 20, height - 20
     panel_width = (width - margin * 2 - gap * (count - 1)) // count
     for index, character in enumerate(request.characters):
         left = margin + index * (panel_width + gap)

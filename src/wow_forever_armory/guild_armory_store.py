@@ -25,6 +25,7 @@ def _character_json(character: Character) -> str:
     return json.dumps(
         {
             "name": character.name,
+            "surname": character.surname,
             "level": character.level,
             "race": character.race,
             "character_class": character.character_class,
@@ -85,6 +86,7 @@ def _character_from_json(payload: str) -> Character:
     )
     return Character(
         name=value.get("name"),
+        surname=value.get("surname"),
         level=value.get("level"),
         race=value.get("race"),
         character_class=value.get("character_class"),
