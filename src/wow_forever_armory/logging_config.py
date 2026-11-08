@@ -26,12 +26,22 @@ _SAFE_METADATA_TYPES: dict[str, type | tuple[type, ...]] = {
     "attempt": int,
     "guild_count": int,
     "guilds_recovered": int,
+    "guilds_incomplete": int,
+    "guilds_deferred": int,
     "member_rows_recovered": int,
+    "member_rows_created": int,
+    "member_rows_removed": int,
+    "members_skipped": int,
+    "member_rows_deferred": int,
+    "member_state_load_failures": int,
     "panels_recovered": int,
+    "persistent_views_registered": int,
+    "slash_commands_synced": int,
     "character_count": int,
     "outcome": str,
     "operation": str,
     "reason": str,
+    "exception_type": str,
 }
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _AUTH_RE = re.compile(r"(?im)(authorization\s*[:=]\s*)[^\r\n]+")

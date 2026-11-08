@@ -1,12 +1,13 @@
 # WoW Forever Armory Bot
 
-v1.1.0 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and member-row recovery. Production remains on v1.0.0; publication and production upgrade require separate approval and host verification.
+v1.1.1 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and observable, idempotent recovery. Production remains on v1.1.0; publication and production upgrade require separate approval and host verification.
 
 ## Architecture
 
 - `client.py`, `parser.py`, and `models.py` remain the Armory Core. The Core fetches only validated relative paths over HTTPS, refuses redirects, applies timeouts, and parses public profile data.
 - `guild_armory_urls.py` accepts only HTTPS URLs on `worldofwarcraft.blizzard.com` with the supported locale/region/character path. It converts the URL to a Core path and asks the Core to validate it before any request.
 - `guild_armory_store.py` persists active guild panels, pending flows, members, row message IDs, character paths, normalized profile snapshots, and timestamps in SQLite. Short local database operations are serialized; write transactions do not span Discord or Armory requests.
+- Startup and recovery events distinguish Discord Gateway connection, READY, setup, and recovery outcomes. Recovery counters separate synchronized, created, removed, skipped, and deferred member rows. Failure logs omit exception messages and tracebacks.
 - `guild_armory_images.py` renders the English instruction panel and one wide PNG row per member locally with Pillow. The intro background and nine HD class icons are bundled; no remote images or fonts are downloaded.
 - `graphic_renderer.py` renders English character overview PNGs for one to three authorized characters. It uses bundled DejaVu fonts and an optional separately provisioned WoW Forever logo, and is called from the existing member-row synchronization path.
 - `guild_armory_views.py` contains persistent registration and management buttons and private URL modals. `discord_bot.py` connects commands, reaction events, persistence, Core requests, and row-message recovery.
@@ -95,7 +96,7 @@ Do not run this command for offline tests. It connects to Discord and syncs eith
 
 Production installation, SQLite backup/restore, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The repository includes reviewed systemd templates and an installer; running it changes host state and requires an approved maintenance procedure. This documentation update does not install or activate anything.
 
-Version history, the v1.1.0 release-candidate notes, the historical v1.0.0 release notes, and operational troubleshooting are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.1.0.md](RELEASE_NOTES_v1.1.0.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+Version history, the v1.1.1 release-candidate notes, the historical v1.1.0 and v1.0.0 release notes, and operational troubleshooting are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.1.1.md](RELEASE_NOTES_v1.1.1.md), [RELEASE_NOTES_v1.1.0.md](RELEASE_NOTES_v1.1.0.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 The character overview renderer's supported fields, unavailable-data placeholders, bundled asset licenses, preview generation, and development review process are documented in [GRAPHIC_RENDERER.md](GRAPHIC_RENDERER.md). The renderer does not expand the Armory scraper or retrieve portraits/statistics/PvP data from other sources.
 

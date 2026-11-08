@@ -1,6 +1,7 @@
 # WoW Forever Armory Bot v1.1.0 — Release Candidate
 
-**Status:** Prepared for independent review; not published or deployed.
+**Status:** Historical v1.1.0 release notes. Retained as the record of the
+release scope and its original operational gate.
 
 v1.1.0 updates the Discord interface to English and provides an Add & Edit
 workflow while preserving sword reaction registration. Member overview messages
@@ -24,14 +25,15 @@ The character snapshot format adds an optional surname field. Existing snapshots
 without that field remain readable. No SQLite schema migration is introduced;
 upgrades should retain the existing database and verified backup procedures.
 
-The installer accepts a clean exact-SHA checkout on `feature/v1.1.0` whose
-history descends from v1.0.0 base commit
+At the time of this release, the installer accepted a clean exact-SHA checkout
+on `feature/v1.1.0` whose history descended from v1.0.0 base commit
 `4ac05712259e26560d1818746f5cee90e6793f78`. The installer retains its stopped
 and disabled unit requirements, isolated database snapshot verification, and
 atomic release switch. Installation does not start or enable services.
 
-Production remains on v1.0.0. Any production installation or activation requires
-separate approval and the reviewed procedure in [OPERATIONS.md](OPERATIONS.md).
+Production was on v1.0.0 during this release's preparation. Any production
+installation or activation required separate approval and the reviewed
+procedure in [OPERATIONS.md](OPERATIONS.md).
 
 ## Verification
 

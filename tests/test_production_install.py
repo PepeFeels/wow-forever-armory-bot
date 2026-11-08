@@ -214,7 +214,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=feature/v1.1.0",
+                    "--initial-branch=release/v1.1.1",
                     str(repo),
                 ],
                 check=True,
@@ -252,6 +252,12 @@ class ProductionInstallTests(unittest.TestCase):
                     _check_repository(repo, "0" * 40)
                 with self.assertRaisesRegex(InstallError, "full lowercase"):
                     _check_repository(repo, "HEAD")
+                subprocess.run(
+                    ["git", "-C", str(repo), "branch", "--move", "wrong-branch"],
+                    check=True,
+                )
+                with self.assertRaisesRegex(InstallError, "approved release branch"):
+                    _check_repository(repo, head)
 
     def test_production_config_does_not_pin_a_guild(self) -> None:
         example = (

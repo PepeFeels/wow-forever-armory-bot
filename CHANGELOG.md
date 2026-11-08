@@ -1,9 +1,29 @@
 # Changelog
 
-## v1.1.0 — release candidate
+## v1.1.1 — release candidate
 
-Prepared for independent review on `feature/v1.1.0`; this release has not been
-published or deployed. Production remains on v1.0.0 pending separate approval.
+Prepared on `release/v1.1.1` for independent release review. This corrective
+release adds Discord setup and recovery observability, accurate member-row
+counters, privacy-safe error reporting, explicit setup/synchronization failure
+handling, and consistent deferred classification for panel network and timeout
+failures. Recovery remains idempotent across reconnects. The original PROD
+incident cause is not established by these changes; production remains on
+v1.1.0 pending separate approval and production evidence.
+
+### Compatibility and operational notes
+
+- Package metadata identifies this candidate as version 1.1.1.
+- No database schema migration or production configuration change is included.
+- The installer requires a clean exact-SHA checkout on `release/v1.1.1` whose
+  history descends from the approved v1.1.0 checkpoint
+  `e6b8c0ce4e1444d87ff87f29df2802a49bc1ad3f`.
+
+## v1.1.0 — released
+
+Originally prepared for independent review on `feature/v1.1.0`, then published
+from approved release commit
+`e6b8c0ce4e1444d87ff87f29df2802a49bc1ad3f`. It is the production baseline for
+the v1.1.1 corrective release preparation.
 
 ### Included
 
@@ -19,10 +39,11 @@ published or deployed. Production remains on v1.0.0 pending separate approval.
 
 ### Compatibility and operational notes
 
-- Package metadata identifies this candidate as version 1.1.0.
+- Package metadata identified this release as version 1.1.0.
 - The installer requires a clean exact-SHA checkout on `feature/v1.1.0` based on
   the v1.0.0 base commit `4ac05712259e26560d1818746f5cee90e6793f78`.
-- Production remains on v1.0.0 until a separately approved release procedure.
+- At v1.1.0 preparation time, production remained on v1.0.0 pending its
+  separately approved release procedure.
 
 ## v1.0.0 — release candidate
 

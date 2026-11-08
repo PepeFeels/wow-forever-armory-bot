@@ -1,8 +1,8 @@
 # Manual production cutover review procedure
 
 This document records the legacy v0.2.0 initial database migration procedure.
-For a v1.1.0 code-only release upgrade, follow `OPERATIONS.md`; production
-remains on v1.0.0 until that upgrade is separately approved.
+For the v1.1.1 code-only release upgrade, follow `OPERATIONS.md`; production
+remains on v1.1.0 until that upgrade is separately approved.
 
 This is a reviewed operator checklist, not an executable cutover script. It is
 intentionally manual because the legacy process does not honor the new runtime
@@ -163,6 +163,7 @@ rollback copy, and quarantined WAL/SHM sidecars.
 ## Release integration gate
 
 The production installer accepts a clean exact-SHA checkout on
-`feature/v1.1.0` based on the v1.0.0 release commit. The active production
-release remains v1.0.0 until a separately approved production upgrade. This
-legacy cutover procedure does not authorize changes to the production checkout.
+`release/v1.1.1` based on the approved v1.1.0 checkpoint
+`e6b8c0ce4e1444d87ff87f29df2802a49bc1ad3f`. The active production release
+remains v1.1.0 until a separately approved production upgrade. This procedure
+does not authorize changes to the production checkout.

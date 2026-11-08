@@ -68,6 +68,34 @@ is scoped to stored guild/channel/message references. Do not manually delete
 panel or member messages owned by another account, and do not reset SQLite
 records to force reconstruction.
 
+For v1.1.1 and later, the startup sequence is logged as
+`bot_startup_started`, `discord_connection_starting`,
+`discord_bot_setup_started`, `global_slash_commands_synced`,
+`discord_bot_setup_completed`, `discord_gateway_connected`,
+`discord_connected`, `discord_ready_event_received`,
+`guild_armory_recovery_started`, per-guild recovery events, and
+`guild_armory_recovery_completed`. Test-guild installations log
+`slash_commands_synced_to_test_guild` instead of the global sync event.
+Recovery completion includes aggregate counts for recovered, created, removed,
+skipped, and deferred member rows, panel results, incomplete/deferred guilds,
+and member-state load failures. An empty member with no existing Discord row is
+counted as skipped; deleting an obsolete row is counted as removed. A state-load
+failure logs `guild_armory_recovery_state_load_failed` followed by a failed
+completion event.
+
+`logging_configured` confirms only that the initial application logger wrote
+to its configured stream. Missing later lifecycle events do not prove that
+recovery failed or succeeded, and these additional events do not establish the
+cause of an earlier production incident. Compare the whole startup sequence in
+the correct service unit's journal and time window. The
+`discord_bot_setup_failed`,
+`discord_bot_setup_completed`, `discord_gateway_connected`,
+`discord_ready_event_received`, and recovery events distinguish setup,
+Gateway, READY callback, and database/Discord recovery stages without logging
+guild or member identifiers. Recovery exception events record only a fixed
+reason and exception class; they omit exception text and traceback to prevent
+secrets, IDs, URLs, or user data from entering the journal.
+
 ## Rollback
 
 For an approved code rollback, first stop and disable both the Armory bot

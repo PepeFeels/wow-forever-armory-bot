@@ -3,6 +3,7 @@
 import asyncio
 import os
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,8 @@ from wow_forever_armory.discord_bot import (
     ArmoryBot,
     BotIdentityUnavailable,
     GuildArmoryCommands,
+    GuildRecoveryResult,
+    MemberRowSyncOutcome,
 )
 from wow_forever_armory.guild_armory_store import GuildArmoryStore
 from wow_forever_armory.guild_armory_views import CharacterSelectView, GuildPanelView
@@ -165,14 +168,84 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(intents.message_content)
         self.assertFalse(intents.members)
 
+    async def test_discord_event_dispatch_runs_connect_then_ready_callbacks(
+        self,
+    ) -> None:
+        await self.bot._async_setup_hook()
+        loop = asyncio.get_running_loop()
+        events: list[str] = []
+        on_connect = AsyncMock(side_effect=lambda: events.append("connect"))
+        on_ready = AsyncMock(side_effect=lambda: events.append("ready"))
+        with (
+            patch.object(self.bot, "on_connect", on_connect),
+            patch.object(self.bot, "on_ready", on_ready),
+        ):
+            existing_tasks = asyncio.all_tasks(loop)
+            self.bot.dispatch("connect")
+            dispatched_tasks = asyncio.all_tasks(loop) - existing_tasks
+            await asyncio.gather(*dispatched_tasks)
+            existing_tasks = asyncio.all_tasks(loop)
+            self.bot.dispatch("ready")
+            dispatched_tasks = asyncio.all_tasks(loop) - existing_tasks
+            await asyncio.gather(*dispatched_tasks)
+        on_connect.assert_awaited_once_with()
+        on_ready.assert_awaited_once_with()
+        self.assertEqual(events, ["connect", "ready"])
+
     async def test_setup_syncs_commands_only_to_test_guild(self) -> None:
         self.bot.add_cog = AsyncMock()
         self.bot.tree.copy_global_to = MagicMock()
         self.bot.tree.sync = AsyncMock()
-        await self.bot.setup_hook()
+        with self.assertLogs("wow_forever_armory.discord_bot", level="INFO") as logs:
+            await self.bot.setup_hook()
         guild = self.bot.tree.copy_global_to.call_args.kwargs["guild"]
         self.assertEqual(guild.id, 999)
         self.bot.tree.sync.assert_awaited_once_with(guild=guild)
+        self.assertIn("discord_bot_setup_started", "\n".join(logs.output))
+        self.assertIn("slash_commands_synced_to_test_guild", "\n".join(logs.output))
+        self.assertIn("discord_bot_setup_completed", "\n".join(logs.output))
+
+    async def test_setup_hook_failure_is_logged_and_propagated(self) -> None:
+        sensitive = "Aeltherion Whispering-Wind 123456789012345678"
+        self.bot.store.initialize = AsyncMock(side_effect=RuntimeError(sensitive))
+        with self.assertLogs("wow_forever_armory.discord_bot", level="ERROR") as logs:
+            with self.assertRaisesRegex(
+                RuntimeError, "Discord bot setup failed"
+            ) as captured:
+                await self.bot.setup_hook()
+        output = "\n".join(logs.output)
+        self.assertIn("discord_bot_setup_failed", output)
+        self.assertNotIn(sensitive, output)
+        self.assertNotIn("Traceback", output)
+        self.assertTrue(captured.exception.__suppress_context__)
+        self.assertNotIn(
+            sensitive, "".join(traceback.format_exception(captured.exception))
+        )
+
+    async def test_global_command_sync_failure_never_logs_setup_or_ready_success(
+        self,
+    ) -> None:
+        self.bot.test_guild_id = None
+        self.bot.add_cog = AsyncMock()
+        self.bot.tree.sync = AsyncMock(
+            side_effect=RuntimeError(
+                "token=synthetic private URL?token=secret discord_id=123456789012345678"
+            )
+        )
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            with self.assertRaisesRegex(RuntimeError, "Discord bot setup failed"):
+                await self.bot.setup_hook()
+        self.assertEqual(logger.log.call_args.args[1], "discord_bot_setup_failed")
+        self.assertEqual(
+            logger.log.call_args.kwargs["extra"],
+            {"exception_type": "RuntimeError", "reason": "setup_hook"},
+        )
+        events = [call.args[0] for call in logger.info.call_args_list]
+        self.assertIn("discord_bot_setup_started", events)
+        self.assertNotIn("global_slash_commands_synced", events)
+        self.assertNotIn("discord_bot_setup_completed", events)
+        self.assertNotIn("discord_ready_event_received", events)
+        self.assertNotIn("guild_armory_recovery_started", events)
 
     async def test_setup_globally_syncs_when_no_development_guild_is_configured(
         self,
@@ -288,10 +361,14 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.fetch_message = AsyncMock(side_effect=[panel, row, panel, row])
         channel.send = AsyncMock()
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
-        with patch(
-            "wow_forever_armory.discord_bot.render_stored_member_overview",
-            return_value=b"PNG",
+        with (
+            patch(
+                "wow_forever_armory.discord_bot.render_stored_member_overview",
+                return_value=b"PNG",
+            ),
+            self.assertLogs("wow_forever_armory.discord_bot", level="INFO") as logs,
         ):
+            await self.bot.on_connect()
             await self.bot.on_ready()
             await self.bot.on_disconnect()
             await self.bot.on_ready()
@@ -299,16 +376,97 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.edit.await_count, 2)
         channel.send.assert_not_awaited()
         self.assertTrue(self.bot._recovered)
+        output = "\n".join(logs.output)
+        self.assertIn("discord_gateway_connected", output)
+        self.assertIn("discord_ready_event_received", output)
+        self.assertIn("guild_armory_recovery_started", output)
+        self.assertIn("guild_armory_recovery_completed", output)
+        self.assertIn("discord_disconnected_recovery_scheduled", output)
 
     async def test_failed_recovery_is_retried_on_next_ready(self) -> None:
         config = await self.store.get_guild(111)
         self.bot.store.guilds = AsyncMock(return_value=(config,))
-        self.bot._recover_guild = AsyncMock(side_effect=[False, True])
+        self.bot._recover_guild = AsyncMock(
+            side_effect=[GuildRecoveryResult(False), GuildRecoveryResult(True)]
+        )
         await self.bot.on_ready()
         self.assertFalse(self.bot._recovered)
         await self.bot.on_ready()
         self.assertTrue(self.bot._recovered)
         self.assertEqual(self.bot._recover_guild.await_count, 2)
+
+    async def test_recovery_completion_logs_aggregate_counts(self) -> None:
+        config = await self.store.get_guild(111)
+        self.bot.store.guilds = AsyncMock(return_value=(config,))
+        self.bot._recover_guild = AsyncMock(
+            return_value=GuildRecoveryResult(
+                True,
+                panels_recovered=1,
+                member_rows_recovered=2,
+                member_rows_created=1,
+                member_rows_removed=1,
+                members_skipped=1,
+                member_rows_deferred=1,
+                member_state_load_failures=1,
+            )
+        )
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            await self.bot.on_ready()
+        completed = next(
+            call
+            for call in logger.info.call_args_list
+            if call.args and call.args[0] == "guild_armory_recovery_completed"
+        )
+        self.assertEqual(
+            completed.kwargs["extra"],
+            {
+                "guild_count": 1,
+                "guilds_recovered": 1,
+                "guilds_incomplete": 0,
+                "guilds_deferred": 0,
+                "panels_recovered": 1,
+                "member_rows_recovered": 2,
+                "member_rows_created": 1,
+                "member_rows_removed": 1,
+                "members_skipped": 1,
+                "member_rows_deferred": 1,
+                "member_state_load_failures": 1,
+                "outcome": "success",
+            },
+        )
+
+    async def test_recovery_state_load_error_is_logged_as_incomplete(self) -> None:
+        self.bot.store.guilds = AsyncMock(side_effect=RuntimeError("fixture"))
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            await self.bot.on_ready()
+        logger.log.assert_called_once()
+        self.assertEqual(
+            logger.log.call_args.args[1], "guild_armory_recovery_state_load_failed"
+        )
+        self.assertEqual(
+            logger.log.call_args.kwargs["extra"],
+            {"exception_type": "RuntimeError", "reason": "guild_state_load"},
+        )
+        logger.error.assert_called_once_with(
+            "guild_armory_recovery_completed",
+            extra={"outcome": "failed", "reason": "state_load"},
+        )
+        self.assertFalse(self.bot._recovered)
+
+    async def test_guild_channel_recovery_failure_is_reported(self) -> None:
+        config = await self.store.get_guild(111)
+        self.bot.get_armory_channel = AsyncMock(side_effect=RuntimeError("fixture"))
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            result = await self.bot._recover_guild(config)
+        self.assertFalse(result.recovered)
+        logger.log.assert_called_once()
+        self.assertEqual(
+            logger.log.call_args.args[1], "guild_armory_guild_recovery_failed"
+        )
+        logger.error.assert_called_once_with(
+            "guild_armory_guild_recovery_completed",
+            extra={"outcome": "failed", "reason": "channel_lookup"},
+        )
 
     async def test_recovery_failure_for_one_member_does_not_skip_others(self) -> None:
         first = await self.store.finish_flow(
@@ -324,14 +482,410 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         channel.fetch_message = AsyncMock(return_value=panel)
         self.bot.get_armory_channel = AsyncMock(return_value=channel)
         self.bot.sync_member_row = AsyncMock(
-            side_effect=[RuntimeError("first row unavailable"), None]
+            side_effect=[
+                RuntimeError("first row unavailable"),
+                MemberRowSyncOutcome.UPDATED,
+            ]
         )
         recovered = await self.bot._recover_guild(await self.store.get_guild(111))
-        self.assertFalse(recovered)
+        self.assertFalse(recovered.recovered)
         self.assertEqual(
             [call.args[0].user_id for call in self.bot.sync_member_row.await_args_list],
             [first.user_id, second.user_id],
         )
+        self.assertEqual(recovered.member_rows_deferred, 1)
+        self.assertEqual(recovered.member_rows_recovered, 1)
+
+    async def test_empty_member_with_existing_row_is_counted_as_removed(self) -> None:
+        await self.store.finish_flow(
+            111, 601, "Empty", f"{PREFIX}/empty", Character(name="Empty")
+        )
+        state = await self.store.remove_character(111, 601, f"{PREFIX}/empty")
+        old = MagicMock(spec=discord.Message)
+        self.mark_owned(old, "guild-armory-111-601.png")
+        old.delete = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        self.bot._find_attachment_message = AsyncMock(return_value=old)
+
+        outcome = await self.bot.sync_member_row(state)
+
+        self.assertEqual(outcome, MemberRowSyncOutcome.REMOVED)
+        old.delete.assert_awaited_once()
+        self.assertIsNone((await self.store.member(111, 601)).row_message_id)
+
+    async def test_empty_member_without_row_is_counted_as_skipped(self) -> None:
+        await self.store.finish_flow(
+            111, 602, "Empty", f"{PREFIX}/empty-2", Character(name="Empty")
+        )
+        state = await self.store.remove_character(111, 602, f"{PREFIX}/empty-2")
+        self.bot._connection.user = SimpleNamespace(id=1)
+        self.bot.get_armory_channel = AsyncMock(
+            return_value=MagicMock(spec=discord.TextChannel)
+        )
+        self.bot._find_attachment_message = AsyncMock(return_value=None)
+
+        outcome = await self.bot.sync_member_row(state)
+
+        self.assertEqual(outcome, MemberRowSyncOutcome.SKIPPED)
+
+    async def test_one_character_existing_row_is_counted_as_updated(self) -> None:
+        await self.store.finish_flow(
+            111, 603, "One", f"{PREFIX}/one", Character(name="One")
+        )
+        state = await self.store.member(111, 603)
+        row = MagicMock(spec=discord.Message)
+        row.id = 1603
+        self.mark_owned(row, "guild-armory-111-603.png")
+        row.edit = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        self.bot._find_attachment_message = AsyncMock(return_value=row)
+        with patch(
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
+        ):
+            outcome = await self.bot.sync_member_row(state)
+        self.assertEqual(outcome, MemberRowSyncOutcome.UPDATED)
+        row.edit.assert_awaited_once()
+
+    async def test_multiple_characters_new_row_is_counted_as_created(self) -> None:
+        await self.store.finish_flow(
+            111, 604, "Two A", f"{PREFIX}/two-a", Character(name="Two A")
+        )
+        await self.store.finish_flow(
+            111, 604, "Two B", f"{PREFIX}/two-b", Character(name="Two B")
+        )
+        state = await self.store.member(111, 604)
+        self.bot._connection.user = SimpleNamespace(id=1)
+        created = MagicMock(spec=discord.Message)
+        created.id = 1604
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.send = AsyncMock(return_value=created)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        self.bot._find_attachment_message = AsyncMock(return_value=None)
+        with patch(
+            "wow_forever_armory.discord_bot.render_stored_member_overview",
+            return_value=b"PNG",
+        ):
+            outcome = await self.bot.sync_member_row(state)
+        self.assertEqual(outcome, MemberRowSyncOutcome.CREATED)
+        channel.send.assert_awaited_once()
+
+    async def test_recovery_counts_existing_created_removed_and_skipped_rows(
+        self,
+    ) -> None:
+        await self.store.finish_flow(
+            111, 611, "Empty Row", f"{PREFIX}/empty-row", Character(name="Empty")
+        )
+        await self.store.remove_character(111, 611, f"{PREFIX}/empty-row")
+        await self.store.finish_flow(
+            111, 612, "Empty", f"{PREFIX}/empty-no-row", Character(name="Empty")
+        )
+        await self.store.remove_character(111, 612, f"{PREFIX}/empty-no-row")
+        await self.store.finish_flow(
+            111, 613, "One", f"{PREFIX}/one", Character(name="One")
+        )
+        await self.store.finish_flow(
+            111, 614, "Two A", f"{PREFIX}/two-a", Character(name="Two A")
+        )
+        await self.store.finish_flow(
+            111, 614, "Two B", f"{PREFIX}/two-b", Character(name="Two B")
+        )
+        panel = MagicMock(spec=discord.Message)
+        self.mark_owned(panel, "guild-armory-panel-111.png")
+        panel.add_reaction = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=panel)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        self.bot.sync_member_row = AsyncMock(
+            side_effect=[
+                MemberRowSyncOutcome.REMOVED,
+                MemberRowSyncOutcome.SKIPPED,
+                MemberRowSyncOutcome.UPDATED,
+                MemberRowSyncOutcome.CREATED,
+            ]
+        )
+
+        result = await self.bot._recover_guild(await self.store.get_guild(111))
+
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.member_rows_recovered, 1)
+        self.assertEqual(result.member_rows_created, 1)
+        self.assertEqual(result.member_rows_removed, 1)
+        self.assertEqual(result.members_skipped, 1)
+
+    async def test_recovery_records_member_state_load_failure(self) -> None:
+        config = await self.store.get_guild(111)
+        panel = MagicMock(spec=discord.Message)
+        self.mark_owned(panel, "guild-armory-panel-111.png")
+        panel.add_reaction = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=panel)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        self.store.members = AsyncMock(side_effect=RuntimeError("private fixture"))
+
+        result = await self.bot._recover_guild(config)
+
+        self.assertFalse(result.recovered)
+        self.assertEqual(result.member_state_load_failures, 1)
+        self.assertEqual(result.member_rows_recovered, 0)
+
+    async def test_missing_guild_channel_is_deferred(self) -> None:
+        config = await self.store.get_guild(111)
+        self.bot.get_armory_channel = AsyncMock(return_value=None)
+
+        result = await self.bot._recover_guild(config)
+
+        self.assertFalse(result.recovered)
+        self.assertTrue(result.deferred)
+        self.assertEqual(result.member_rows_deferred, 0)
+
+    async def _assert_panel_operation_failure_is_deferred(
+        self, operation: str, error: Exception, reason: str
+    ) -> None:
+        await self.store.activate_guild(222, 223, 224)
+        for guild_id, user_id in ((111, 701), (111, 702), (222, 703)):
+            await self.store.finish_flow(
+                guild_id,
+                user_id,
+                f"Hero{user_id}",
+                f"{PREFIX}/hero-{user_id}",
+                Character(name=f"Hero{user_id}"),
+            )
+        first_config = await self.store.get_guild(111)
+        first_channel = MagicMock(spec=discord.TextChannel)
+        first_channel.send = AsyncMock()
+        first_panel = MagicMock(spec=discord.Message)
+        self.mark_owned(first_panel, "guild-armory-panel-111.png")
+        first_panel.add_reaction = AsyncMock()
+        if operation == "fetch":
+            first_channel.fetch_message = AsyncMock(side_effect=error)
+        elif operation in {"upsert", "upsert_without_fetch"}:
+            if operation == "upsert_without_fetch":
+                del first_channel.fetch_message
+            else:
+                foreign_panel = MagicMock(spec=discord.Message)
+                foreign_panel.author = SimpleNamespace(id=2)
+                foreign_panel.attachments = []
+                first_channel.fetch_message = AsyncMock(return_value=foreign_panel)
+            self.bot.upsert_panel = AsyncMock(side_effect=error)
+        else:
+            first_channel.fetch_message = AsyncMock(return_value=first_panel)
+            first_panel.add_reaction = AsyncMock(side_effect=error)
+
+        second_channel = MagicMock(spec=discord.TextChannel)
+        second_channel.send = AsyncMock()
+        second_panel = MagicMock(spec=discord.Message)
+        self.mark_owned(second_panel, "guild-armory-panel-222.png")
+        second_panel.add_reaction = AsyncMock()
+        second_channel.fetch_message = AsyncMock(return_value=second_panel)
+
+        async def channel_for(channel_id: int):
+            return {222: first_channel, 223: second_channel}[channel_id]
+
+        self.bot.get_armory_channel = AsyncMock(side_effect=channel_for)
+        self.bot.sync_member_row = AsyncMock(
+            return_value=MemberRowSyncOutcome.UPDATED
+        )
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            await self.bot.on_ready()
+
+        self.assertEqual(self.bot.sync_member_row.await_count, 3)
+        self.assertEqual(self.bot.get_armory_channel.await_count, 2)
+        self.assertFalse(self.bot._recovered)
+        expected_event = (
+            "guild_armory_reaction_restore_deferred"
+            if operation == "reaction"
+            else "guild_armory_panel_recovery_deferred"
+        )
+        self.assertTrue(
+            any(
+                call.args[1] == expected_event
+                and call.kwargs["extra"]["reason"] == reason
+                for call in logger.log.call_args_list
+            ),
+            logger.log.call_args_list,
+        )
+        completed = next(
+            call
+            for call in logger.error.call_args_list
+            if call.args[0] == "guild_armory_recovery_completed"
+        )
+        self.assertEqual(
+            completed.kwargs["extra"],
+            {
+                "guild_count": 2,
+                "guilds_recovered": 1,
+                "guilds_incomplete": 1,
+                "guilds_deferred": 1,
+                "panels_recovered": 1,
+                "member_rows_recovered": 3,
+                "member_rows_created": 0,
+                "member_rows_removed": 0,
+                "members_skipped": 0,
+                "member_rows_deferred": 0,
+                "member_state_load_failures": 0,
+                "outcome": "incomplete",
+            },
+        )
+        first_channel.send.assert_not_awaited()
+        second_channel.send.assert_not_awaited()
+        if operation in {"upsert", "upsert_without_fetch"}:
+            self.bot.upsert_panel.assert_awaited_once_with(
+                111, first_channel, first_config
+            )
+
+    async def test_panel_fetch_timeout_is_deferred_and_other_work_continues(self):
+        await self._assert_panel_operation_failure_is_deferred(
+            "fetch", TimeoutError("private panel timeout"), "panel_fetch"
+        )
+
+    async def test_panel_fetch_api_failure_is_deferred_separately(self):
+        error = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable"), "private response"
+        )
+        await self._assert_panel_operation_failure_is_deferred(
+            "fetch", error, "panel_fetch"
+        )
+
+    async def test_panel_upsert_timeout_is_deferred_and_other_work_continues(self):
+        await self._assert_panel_operation_failure_is_deferred(
+            "upsert", TimeoutError("private panel timeout"), "panel_upsert"
+        )
+
+    async def test_panel_upsert_api_failure_is_deferred_separately(self):
+        error = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable"), "private response"
+        )
+        await self._assert_panel_operation_failure_is_deferred(
+            "upsert", error, "panel_upsert"
+        )
+
+    async def test_panel_upsert_without_fetch_method_classifies_timeout_as_deferred(
+        self,
+    ):
+        await self._assert_panel_operation_failure_is_deferred(
+            "upsert_without_fetch",
+            TimeoutError("private panel timeout"),
+            "panel_upsert",
+        )
+
+    async def test_sword_reaction_timeout_is_deferred_and_other_work_continues(self):
+        await self._assert_panel_operation_failure_is_deferred(
+            "reaction", TimeoutError("private reaction timeout"), "reaction_restore"
+        )
+
+    async def test_sword_reaction_api_failure_is_deferred_separately(self):
+        error = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable"), "private response"
+        )
+        await self._assert_panel_operation_failure_is_deferred(
+            "reaction", error, "reaction_restore"
+        )
+
+    async def test_channel_lookup_discord_timeout_and_unexpected_errors_classify(self):
+        config = await self.store.get_guild(111)
+        cases = (
+            (discord.DiscordException("private discord error"), True),
+            (TimeoutError("private timeout detail"), True),
+            (RuntimeError("private unexpected detail"), False),
+        )
+        for error, deferred in cases:
+            with self.subTest(error_type=type(error).__name__):
+                self.bot.get_armory_channel = AsyncMock(side_effect=error)
+                result = await self.bot._recover_guild(config)
+                self.assertFalse(result.recovered)
+                self.assertEqual(result.deferred, deferred)
+
+    async def test_multiple_guild_recovery_continues_and_aggregates_partial_failure(
+        self,
+    ) -> None:
+        second_guild = 222
+        await self.store.activate_guild(second_guild, 223, 224)
+        configs = await self.store.guilds()
+        self.bot.store.guilds = AsyncMock(return_value=configs)
+        self.bot._recover_guild = AsyncMock(
+            side_effect=[
+                GuildRecoveryResult(
+                    True,
+                    panels_recovered=1,
+                    member_rows_recovered=1,
+                    member_rows_created=1,
+                    member_rows_removed=1,
+                    members_skipped=1,
+                ),
+                GuildRecoveryResult(
+                    False,
+                    member_rows_deferred=2,
+                    member_state_load_failures=1,
+                    deferred=True,
+                ),
+            ]
+        )
+        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
+            await self.bot.on_ready()
+        self.assertEqual(self.bot._recover_guild.await_count, 2)
+        self.assertFalse(self.bot._recovered)
+        completed = next(
+            call
+            for call in logger.error.call_args_list
+            if call.args[0] == "guild_armory_recovery_completed"
+        )
+        self.assertEqual(
+            completed.kwargs["extra"],
+            {
+                "guild_count": 2,
+                "guilds_recovered": 1,
+                "guilds_incomplete": 1,
+                "guilds_deferred": 1,
+                "panels_recovered": 1,
+                "member_rows_recovered": 1,
+                "member_rows_created": 1,
+                "member_rows_removed": 1,
+                "members_skipped": 1,
+                "member_rows_deferred": 2,
+                "member_state_load_failures": 1,
+                "outcome": "incomplete",
+            },
+        )
+
+    async def test_discord_timeout_and_unexpected_member_errors_continue_recovery(
+        self,
+    ) -> None:
+        first = await self.store.finish_flow(
+            111, 621, "First", f"{PREFIX}/first", Character(name="First")
+        )
+        second = await self.store.finish_flow(
+            111, 622, "Second", f"{PREFIX}/second", Character(name="Second")
+        )
+        panel = MagicMock(spec=discord.Message)
+        self.mark_owned(panel, "guild-armory-panel-111.png")
+        panel.add_reaction = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.fetch_message = AsyncMock(return_value=panel)
+        self.bot.get_armory_channel = AsyncMock(return_value=channel)
+        for error in (
+            discord.DiscordException("private Discord response"),
+            TimeoutError("private timeout response"),
+            RuntimeError("private unexpected response"),
+        ):
+            with self.subTest(error_type=type(error).__name__):
+                self.bot.sync_member_row = AsyncMock(
+                    side_effect=[error, MemberRowSyncOutcome.UPDATED]
+                )
+                with self.assertLogs(
+                    "wow_forever_armory.discord_bot", level="WARNING"
+                ) as logs:
+                    result = await self.bot._recover_guild(
+                        await self.store.get_guild(111)
+                    )
+                self.assertFalse(result.recovered)
+                self.assertEqual(result.member_rows_deferred, 1)
+                self.assertEqual(result.member_rows_recovered, 1)
+                self.assertEqual(self.bot.sync_member_row.await_count, 2)
+                self.assertNotIn(str(first.user_id), "\n".join(logs.output))
+                self.assertNotIn(str(second.user_id), "\n".join(logs.output))
 
     async def test_concurrent_row_updates_send_one_message_and_edit_it(self) -> None:
         await self.store.finish_flow(

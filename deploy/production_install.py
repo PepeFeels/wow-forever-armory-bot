@@ -26,8 +26,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deploy.production_db_snapshot import verify_database_snapshot
 
-BASE_CHECKPOINT_SHA = "4ac05712259e26560d1818746f5cee90e6793f78"
-BRANCH = "feature/v1.1.0"
+BASE_CHECKPOINT_SHA = "e6b8c0ce4e1444d87ff87f29df2802a49bc1ad3f"
+BRANCH = "release/v1.1.1"
 SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")
@@ -255,7 +255,7 @@ def _check_repository(repo: Path, release_sha: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", release_sha):
         raise InstallError("release SHA must be a full lowercase commit hash")
     if _git(repo, "branch", "--show-current") != BRANCH:
-        raise InstallError("repository is not on the approved feature branch")
+        raise InstallError("repository is not on the approved release branch")
     if _git(repo, "status", "--porcelain"):
         raise InstallError("repository must be clean before installation")
     if _git(repo, "rev-parse", "HEAD") != release_sha:

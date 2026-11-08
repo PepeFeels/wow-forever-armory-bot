@@ -7,6 +7,8 @@ import logging
 import os
 import stat
 from asyncio import to_thread
+from dataclasses import dataclass
+from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 
@@ -45,6 +47,45 @@ _MAX_TOKEN_FILE_BYTES = 4096
 
 class BotIdentityUnavailable(RuntimeError):
     """Discord row synchronization cannot run without the authenticated bot user."""
+
+
+class MemberRowSyncOutcome(StrEnum):
+    """Result of reconciling one member's Discord overview message."""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    REMOVED = "removed"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True, slots=True)
+class GuildRecoveryResult:
+    """Safe aggregate outcome for one guild's startup recovery attempt."""
+
+    recovered: bool
+    panels_recovered: int = 0
+    member_rows_recovered: int = 0
+    member_rows_created: int = 0
+    member_rows_removed: int = 0
+    members_skipped: int = 0
+    member_rows_deferred: int = 0
+    member_state_load_failures: int = 0
+    deferred: bool = False
+
+
+def _log_recovery_exception(
+    event: str,
+    exc: Exception,
+    *,
+    reason: str,
+    level: int = logging.ERROR,
+) -> None:
+    """Log useful failure classification without exception text or traceback."""
+    _LOGGER.log(
+        level,
+        event,
+        extra={"exception_type": type(exc).__name__, "reason": reason},
+    )
 
 
 class GuildArmoryCommands(commands.Cog):
@@ -170,19 +211,42 @@ class ArmoryBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         _LOGGER.info("discord_bot_setup_started")
-        await self.store.initialize()
-        await self.add_cog(GuildArmoryCommands(self))
-        configs = await self.store.guilds()
-        for config in configs:
-            self.add_view(GuildPanelView(self, config.guild_id))
-        if self.test_guild_id is not None:
-            test_guild = discord.Object(id=self.test_guild_id)
-            self.tree.copy_global_to(guild=test_guild)
-            await self.tree.sync(guild=test_guild)
-            _LOGGER.info("slash_commands_synced_to_test_guild")
-        else:
-            synced = await self.tree.sync()
-            _LOGGER.info("global_slash_commands_synced", extra={"count": len(synced)})
+        try:
+            await self.store.initialize()
+            await self.add_cog(GuildArmoryCommands(self))
+            configs = await self.store.guilds()
+            for config in configs:
+                self.add_view(GuildPanelView(self, config.guild_id))
+            if self.test_guild_id is not None:
+                test_guild = discord.Object(id=self.test_guild_id)
+                self.tree.copy_global_to(guild=test_guild)
+                synced = await self.tree.sync(guild=test_guild)
+                _LOGGER.info(
+                    "slash_commands_synced_to_test_guild",
+                    extra={
+                        "guild_count": 1,
+                        "persistent_views_registered": len(configs),
+                        "slash_commands_synced": len(synced),
+                    },
+                )
+            else:
+                synced = await self.tree.sync()
+                _LOGGER.info(
+                    "global_slash_commands_synced",
+                    extra={
+                        "persistent_views_registered": len(configs),
+                        "slash_commands_synced": len(synced),
+                    },
+                )
+        except Exception as exc:
+            _log_recovery_exception(
+                "discord_bot_setup_failed", exc, reason="setup_hook"
+            )
+            raise RuntimeError("Discord bot setup failed") from None
+        _LOGGER.info(
+            "discord_bot_setup_completed",
+            extra={"persistent_views_registered": len(configs)},
+        )
 
     def activation_lock(self, guild_id: int) -> asyncio.Lock:
         return self._activation_locks[guild_id % _LOCK_STRIPES]
@@ -532,10 +596,10 @@ class ArmoryBot(commands.Bot):
         state: MemberState,
         *,
         fresh_paths: frozenset[str] = frozenset(),
-    ) -> None:
+    ) -> MemberRowSyncOutcome:
         async with self.row_lock(state.guild_id, state.user_id):
             self._require_bot_identity()
-            await self._sync_member_row(state, fresh_paths=fresh_paths)
+            return await self._sync_member_row(state, fresh_paths=fresh_paths)
 
     def _require_bot_identity(self) -> discord.ClientUser:
         user = self.user
@@ -550,7 +614,7 @@ class ArmoryBot(commands.Bot):
         state: MemberState,
         *,
         fresh_paths: frozenset[str] = frozenset(),
-    ) -> None:
+    ) -> MemberRowSyncOutcome:
         latest_state = await self.store.member(state.guild_id, state.user_id)
         if latest_state is not None:
             state = latest_state
@@ -573,6 +637,7 @@ class ArmoryBot(commands.Bot):
                     pass
             if old is None:
                 old = await self._find_attachment_message(channel, filename)
+            removed = False
             if old is not None:
                 self._require_bot_identity()
                 if self._is_bot_attachment(old, filename):
@@ -580,9 +645,14 @@ class ArmoryBot(commands.Bot):
                         await old.delete()
                     except discord.NotFound:
                         pass
+                    else:
+                        removed = True
             await self.store.set_row_message(state.guild_id, state.user_id, None)
-            _LOGGER.info("member_image_removed")
-            return
+            if removed:
+                _LOGGER.info("member_image_removed")
+                return MemberRowSyncOutcome.REMOVED
+            _LOGGER.info("member_image_absent_for_empty_member")
+            return MemberRowSyncOutcome.SKIPPED
         guild = self.get_guild(state.guild_id)
         member = guild.get_member(state.user_id) if guild is not None else None
         display_name = member.display_name if member is not None else state.display_name
@@ -595,6 +665,7 @@ class ArmoryBot(commands.Bot):
             )
         filename = f"guild-armory-{state.guild_id}-{state.user_id}.png"
         message: discord.Message | None = None
+        created = False
         fetch_message = getattr(channel, "fetch_message", None)
         if (
             state.row_message_id is not None
@@ -621,6 +692,7 @@ class ArmoryBot(commands.Bot):
                     replied_user=False,
                 ),
             )
+            created = True
         else:
             self._require_bot_identity()
             if not self._is_bot_attachment(message, filename):
@@ -635,6 +707,7 @@ class ArmoryBot(commands.Bot):
                         replied_user=False,
                     ),
                 )
+                created = True
             else:
                 await message.edit(
                     content=f"<@{state.user_id}>",
@@ -643,6 +716,11 @@ class ArmoryBot(commands.Bot):
                 )
         await self.store.set_row_message(state.guild_id, state.user_id, message.id)
         _LOGGER.info("member_image_updated")
+        return (
+            MemberRowSyncOutcome.CREATED
+            if created
+            else MemberRowSyncOutcome.UPDATED
+        )
 
     def _is_bot_attachment(self, message: discord.Message, filename: str) -> bool:
         return bool(
@@ -780,42 +858,99 @@ class ArmoryBot(commands.Bot):
                 interaction, "The character could not be removed right now."
             )
 
+    async def on_connect(self) -> None:
+        """Report Gateway connection before READY-triggered recovery begins."""
+        _LOGGER.info("discord_gateway_connected")
+
     async def on_ready(self) -> None:
         _LOGGER.info("discord_connected")
+        _LOGGER.info("discord_ready_event_received")
         async with self._recovery_lock:
             if self._recovered:
+                _LOGGER.info(
+                    "guild_armory_recovery_skipped",
+                    extra={"outcome": "already_recovered"},
+                )
                 return
-            all_recovered = True
+            _LOGGER.info("guild_armory_recovery_started")
             try:
                 configs = await self.store.guilds()
-            except Exception:
-                _LOGGER.exception("Could not load Guild Armory recovery state")
+            except Exception as exc:
+                _log_recovery_exception(
+                    "guild_armory_recovery_state_load_failed",
+                    exc,
+                    reason="guild_state_load",
+                )
+                _LOGGER.error(
+                    "guild_armory_recovery_completed",
+                    extra={"outcome": "failed", "reason": "state_load"},
+                )
                 return
-            _LOGGER.info(
-                "guild_armory_recovery_started", extra={"guild_count": len(configs)}
-            )
+            all_recovered = True
             recovered_guilds = 0
+            panels_recovered = 0
+            member_rows_recovered = 0
+            member_rows_created = 0
+            member_rows_removed = 0
+            members_skipped = 0
+            member_rows_deferred = 0
+            member_state_load_failures = 0
+            guilds_deferred = 0
             for config in configs:
                 try:
-                    if not await self._recover_guild(config):
+                    result = await self._recover_guild(config)
+                    panels_recovered += result.panels_recovered
+                    member_rows_recovered += result.member_rows_recovered
+                    member_rows_created += result.member_rows_created
+                    member_rows_removed += result.member_rows_removed
+                    members_skipped += result.members_skipped
+                    member_rows_deferred += result.member_rows_deferred
+                    member_state_load_failures += result.member_state_load_failures
+                    guilds_deferred += int(result.deferred)
+                    if not result.recovered:
                         all_recovered = False
                     else:
                         recovered_guilds += 1
-                except discord.DiscordException, OSError, TimeoutError:
+                except (discord.DiscordException, OSError, TimeoutError) as exc:
                     all_recovered = False
-                    _LOGGER.warning("Guild Armory recovery deferred for a guild")
-                except BotIdentityUnavailable:
+                    guilds_deferred += 1
+                    _log_recovery_exception(
+                        "guild_armory_recovery_deferred",
+                        exc,
+                        reason="guild_recovery",
+                    )
+                except BotIdentityUnavailable as exc:
                     all_recovered = False
-                    _LOGGER.warning("Guild Armory recovery deferred until bot identity")
-                except Exception:
+                    guilds_deferred += 1
+                    _log_recovery_exception(
+                        "guild_armory_recovery_deferred",
+                        exc,
+                        reason="bot_identity",
+                    )
+                except Exception as exc:
                     all_recovered = False
-                    _LOGGER.exception("Unexpected Guild Armory recovery failure")
+                    _log_recovery_exception(
+                        "guild_armory_recovery_failed",
+                        exc,
+                        reason="guild_recovery",
+                    )
             self._recovered = all_recovered
-            _LOGGER.info(
+            log_method = _LOGGER.info if all_recovered else _LOGGER.error
+            log_method(
                 "guild_armory_recovery_completed",
                 extra={
                     "guild_count": len(configs),
                     "guilds_recovered": recovered_guilds,
+                    "guilds_incomplete": len(configs) - recovered_guilds,
+                    "guilds_deferred": guilds_deferred,
+                    "panels_recovered": panels_recovered,
+                    "member_rows_recovered": member_rows_recovered,
+                    "member_rows_created": member_rows_created,
+                    "member_rows_removed": member_rows_removed,
+                    "members_skipped": members_skipped,
+                    "member_rows_deferred": member_rows_deferred,
+                    "member_state_load_failures": member_state_load_failures,
+                    "outcome": "success" if all_recovered else "incomplete",
                 },
             )
 
@@ -824,21 +959,68 @@ class ArmoryBot(commands.Bot):
             self._recovered = False
         _LOGGER.info("discord_disconnected_recovery_scheduled")
 
-    async def _recover_guild(self, config: GuildConfig) -> bool:
-        channel = await self.get_armory_channel(config.channel_id)
+    async def _recover_guild(self, config: GuildConfig) -> GuildRecoveryResult:
+        try:
+            channel = await self.get_armory_channel(config.channel_id)
+        except (discord.DiscordException, OSError, TimeoutError) as exc:
+            _LOGGER.warning(
+                "guild_armory_guild_recovery_completed",
+                extra={"outcome": "deferred", "reason": "channel_lookup"},
+            )
+            _log_recovery_exception(
+                "guild_armory_channel_lookup_deferred",
+                exc,
+                reason="channel_lookup",
+                level=logging.WARNING,
+            )
+            return GuildRecoveryResult(False, deferred=True)
+        except Exception as exc:
+            _log_recovery_exception(
+                "guild_armory_guild_recovery_failed",
+                exc,
+                reason="channel_lookup",
+            )
+            _LOGGER.error(
+                "guild_armory_guild_recovery_completed",
+                extra={"outcome": "failed", "reason": "channel_lookup"},
+            )
+            return GuildRecoveryResult(False)
         if channel is None:
-            return False
+            _LOGGER.warning(
+                "guild_armory_guild_recovery_completed",
+                extra={"outcome": "deferred", "reason": "channel_unavailable"},
+            )
+            return GuildRecoveryResult(False, deferred=True)
         recovered = True
         panels_recovered = 0
         member_rows_recovered = 0
+        member_rows_created = 0
+        member_rows_removed = 0
+        members_skipped = 0
+        member_rows_deferred = 0
+        member_state_load_failures = 0
+        deferred = False
         async with self.activation_lock(config.guild_id):
             fetch_message = getattr(channel, "fetch_message", None)
             if fetch_message is None:
                 try:
                     await self.upsert_panel(config.guild_id, channel, config)
-                except Exception:
+                except (discord.DiscordException, OSError, TimeoutError) as exc:
                     recovered = False
-                    _LOGGER.exception("Guild Armory panel recovery failed")
+                    deferred = True
+                    _log_recovery_exception(
+                        "guild_armory_panel_recovery_deferred",
+                        exc,
+                        reason="panel_upsert",
+                        level=logging.WARNING,
+                    )
+                except Exception as exc:
+                    recovered = False
+                    _log_recovery_exception(
+                        "guild_armory_panel_recovery_failed",
+                        exc,
+                        reason="panel_upsert",
+                    )
                 else:
                     panels_recovered = 1
             else:
@@ -847,53 +1029,170 @@ class ArmoryBot(commands.Bot):
                     if not self._is_bot_attachment(
                         panel, f"guild-armory-panel-{config.guild_id}.png"
                     ):
-                        panel = await self.upsert_panel(
-                            config.guild_id, channel, config
-                        )
-                    try:
-                        await panel.add_reaction(_SWORD)
-                    except discord.DiscordException:
-                        recovered = False
-                        _LOGGER.warning("Guild Armory reaction could not be restored")
-                    else:
-                        panels_recovered = 1
+                        try:
+                            panel = await self.upsert_panel(
+                                config.guild_id, channel, config
+                            )
+                        except (
+                            discord.DiscordException,
+                            OSError,
+                            TimeoutError,
+                        ) as exc:
+                            recovered = False
+                            deferred = True
+                            panel = None
+                            _log_recovery_exception(
+                                "guild_armory_panel_recovery_deferred",
+                                exc,
+                                reason="panel_upsert",
+                                level=logging.WARNING,
+                            )
+                        except Exception as exc:
+                            recovered = False
+                            panel = None
+                            _log_recovery_exception(
+                                "guild_armory_panel_recovery_failed",
+                                exc,
+                                reason="panel_upsert",
+                            )
+                    if panel is not None:
+                        try:
+                            await panel.add_reaction(_SWORD)
+                        except (
+                            discord.DiscordException,
+                            OSError,
+                            TimeoutError,
+                        ) as exc:
+                            recovered = False
+                            deferred = True
+                            _log_recovery_exception(
+                                "guild_armory_reaction_restore_deferred",
+                                exc,
+                                reason="reaction_restore",
+                                level=logging.WARNING,
+                            )
+                        except Exception as exc:
+                            recovered = False
+                            _log_recovery_exception(
+                                "guild_armory_reaction_restore_failed",
+                                exc,
+                                reason="reaction_restore",
+                            )
+                        else:
+                            panels_recovered = 1
                 except discord.NotFound:
                     try:
                         await self.upsert_panel(config.guild_id, channel, config)
                         panels_recovered = 1
-                    except Exception:
+                    except (discord.DiscordException, OSError, TimeoutError) as exc:
                         recovered = False
-                        _LOGGER.exception("Guild Armory panel recovery failed")
-                except discord.DiscordException:
+                        deferred = True
+                        _log_recovery_exception(
+                            "guild_armory_panel_recovery_deferred",
+                            exc,
+                            reason="panel_upsert",
+                            level=logging.WARNING,
+                        )
+                    except Exception as exc:
+                        recovered = False
+                        _log_recovery_exception(
+                            "guild_armory_panel_recovery_failed",
+                            exc,
+                            reason="panel_upsert",
+                        )
+                except (discord.DiscordException, OSError, TimeoutError) as exc:
                     recovered = False
-                    _LOGGER.warning("Guild Armory panel recovery deferred")
-                except Exception:
+                    deferred = True
+                    _log_recovery_exception(
+                        "guild_armory_panel_recovery_deferred",
+                        exc,
+                        reason="panel_fetch",
+                        level=logging.WARNING,
+                    )
+                except Exception as exc:
                     recovered = False
-                    _LOGGER.exception("Unexpected Guild Armory panel recovery failure")
-        for state in await self.store.members(config.guild_id):
+                    _log_recovery_exception(
+                        "guild_armory_panel_recovery_failed",
+                        exc,
+                        reason="panel_fetch",
+                    )
+        try:
+            members = await self.store.members(config.guild_id)
+        except Exception as exc:
+            recovered = False
+            member_state_load_failures = 1
+            _log_recovery_exception(
+                "guild_armory_member_state_load_failed",
+                exc,
+                reason="member_state_load",
+            )
+            members = ()
+        for state in members:
             try:
-                await self.sync_member_row(state)
-            except BotIdentityUnavailable:
+                outcome = await self.sync_member_row(state)
+            except BotIdentityUnavailable as exc:
                 recovered = False
-                _LOGGER.warning(
-                    "Guild Armory member row recovery deferred until identity"
+                deferred = True
+                member_rows_deferred += 1
+                _log_recovery_exception(
+                    "guild_armory_member_row_recovery_deferred",
+                    exc,
+                    reason="bot_identity",
+                    level=logging.WARNING,
                 )
-            except discord.DiscordException, OSError, TimeoutError:
+            except (discord.DiscordException, OSError, TimeoutError) as exc:
                 recovered = False
-                _LOGGER.warning("Guild Armory member row recovery deferred")
-            except Exception:
+                deferred = True
+                member_rows_deferred += 1
+                _log_recovery_exception(
+                    "guild_armory_member_row_recovery_deferred",
+                    exc,
+                    reason="member_row_sync",
+                    level=logging.WARNING,
+                )
+            except Exception as exc:
                 recovered = False
-                _LOGGER.exception("Unexpected Guild Armory member row recovery failure")
+                member_rows_deferred += 1
+                _log_recovery_exception(
+                    "guild_armory_member_row_recovery_failed",
+                    exc,
+                    reason="member_row_sync",
+                )
             else:
-                member_rows_recovered += 1
-        _LOGGER.info(
+                match outcome:
+                    case MemberRowSyncOutcome.CREATED:
+                        member_rows_created += 1
+                    case MemberRowSyncOutcome.UPDATED:
+                        member_rows_recovered += 1
+                    case MemberRowSyncOutcome.REMOVED:
+                        member_rows_removed += 1
+                    case MemberRowSyncOutcome.SKIPPED:
+                        members_skipped += 1
+        log_method = _LOGGER.info if recovered else _LOGGER.error
+        log_method(
             "guild_armory_guild_recovery_completed",
             extra={
                 "panels_recovered": panels_recovered,
                 "member_rows_recovered": member_rows_recovered,
+                "member_rows_created": member_rows_created,
+                "member_rows_removed": member_rows_removed,
+                "members_skipped": members_skipped,
+                "member_rows_deferred": member_rows_deferred,
+                "member_state_load_failures": member_state_load_failures,
+                "outcome": "success" if recovered else "incomplete",
             },
         )
-        return recovered
+        return GuildRecoveryResult(
+            recovered=recovered,
+            panels_recovered=panels_recovered,
+            member_rows_recovered=member_rows_recovered,
+            member_rows_created=member_rows_created,
+            member_rows_removed=member_rows_removed,
+            members_skipped=members_skipped,
+            member_rows_deferred=member_rows_deferred,
+            member_state_load_failures=member_state_load_failures,
+            deferred=deferred,
+        )
 
 
 def create_bot() -> ArmoryBot:

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from wow_forever_armory import logging_config
 from wow_forever_armory.client import ArmoryClient
-from wow_forever_armory.discord_bot import ArmoryBot
+from wow_forever_armory.discord_bot import ArmoryBot, _log_recovery_exception
 from wow_forever_armory.guild_armory_store import GuildArmoryStore
 from wow_forever_armory.logging_config import UTCLogFormatter, configure_logging
 
@@ -99,16 +99,78 @@ class LoggingConfigTests(unittest.TestCase):
             configure_logging(environ={"ARMORY_LOG_FORMAT": "json"})
             logger = logging.getLogger("wow_forever_armory.json_test")
             logger.info(
-                "character_registered",
-                extra={"character_count": 2, "user_id": 123, "status": 200},
+                "guild_armory_recovery_completed",
+                extra={
+                    "character_count": 2,
+                    "guild_count": 1,
+                    "guilds_recovered": 1,
+                    "panels_recovered": 1,
+                    "member_rows_recovered": 3,
+                    "member_rows_created": 1,
+                    "member_rows_removed": 1,
+                    "members_skipped": 1,
+                    "member_rows_deferred": 2,
+                    "member_state_load_failures": 1,
+                    "guilds_incomplete": 1,
+                    "guilds_deferred": 1,
+                    "persistent_views_registered": 1,
+                    "slash_commands_synced": 2,
+                    "outcome": "success",
+                    "exception_type": "RuntimeError",
+                    "user_id": 123,
+                    "status": 200,
+                },
             )
         payload = json.loads(stderr.getvalue().splitlines()[-1])
         self.assertEqual(payload["level"], "INFO")
-        self.assertEqual(payload["event"], "character_registered")
+        self.assertEqual(payload["event"], "guild_armory_recovery_completed")
         self.assertEqual(payload["character_count"], 2)
+        self.assertEqual(payload["member_rows_recovered"], 3)
+        self.assertEqual(payload["member_rows_created"], 1)
+        self.assertEqual(payload["member_rows_removed"], 1)
+        self.assertEqual(payload["members_skipped"], 1)
+        self.assertEqual(payload["member_rows_deferred"], 2)
+        self.assertEqual(payload["member_state_load_failures"], 1)
+        self.assertEqual(payload["guilds_incomplete"], 1)
+        self.assertEqual(payload["guilds_deferred"], 1)
+        self.assertEqual(payload["persistent_views_registered"], 1)
+        self.assertEqual(payload["slash_commands_synced"], 2)
+        self.assertEqual(payload["outcome"], "success")
         self.assertEqual(payload["status"], 200)
         self.assertNotIn("user_id", payload)
         self.assertTrue(payload["timestamp"].endswith("Z"))
+
+    def test_recovery_exception_logs_type_without_sensitive_message_or_traceback(
+        self,
+    ) -> None:
+        stderr = io.StringIO()
+        token = "synthetic.token.value-that-must-not-appear"
+        credential = "/run/credentials/discord-token"
+        discord_id = "123456789012345678"
+        user_data = "Aeltherion Whispering-Wind"
+        sensitive_url = "https://example.invalid/path?token=query-secret&user=private"
+        message = f"{token} {credential} {discord_id} {user_data} {sensitive_url}"
+        with patch("wow_forever_armory.logging_config.sys.stderr", stderr):
+            configure_logging(
+                environ={"ARMORY_LOG_FORMAT": "json"}, secrets=(token,)
+            )
+            try:
+                raise RuntimeError(message)
+            except RuntimeError as exc:
+                _log_recovery_exception(
+                    "guild_armory_member_row_recovery_failed",
+                    exc,
+                    reason="member_row_sync",
+                )
+        output = stderr.getvalue()
+        payload = json.loads(output.splitlines()[-1])
+        self.assertEqual(payload["event"], "guild_armory_member_row_recovery_failed")
+        self.assertEqual(payload["exception_type"], "RuntimeError")
+        self.assertEqual(payload["reason"], "member_row_sync")
+        for value in (token, credential, discord_id, user_data, sensitive_url):
+            self.assertNotIn(value, output)
+        self.assertNotIn("exception", payload)
+        self.assertNotIn("Traceback", output)
 
     def test_repeated_configuration_emits_each_text_event_once(self) -> None:
         stderr = io.StringIO()
@@ -146,6 +208,31 @@ class LoggingConfigTests(unittest.TestCase):
                 ),
                 1,
             )
+
+    def test_info_from_application_modules_and_discord_reaches_owned_handlers(
+        self,
+    ) -> None:
+        stderr = io.StringIO()
+        with patch("wow_forever_armory.logging_config.sys.stderr", stderr):
+            configure_logging(environ={"ARMORY_LOG_LEVEL": "INFO"})
+            for name, event in (
+                ("wow_forever_armory.discord_bot", "bot_info_probe"),
+                ("wow_forever_armory.client", "client_info_probe"),
+                ("wow_forever_armory.guild_armory_store", "store_info_probe"),
+                ("discord.gateway", "gateway_info_probe"),
+            ):
+                logger = logging.getLogger(name)
+                logger.info(event)
+                self.assertEqual(logger.getEffectiveLevel(), logging.INFO)
+        output = stderr.getvalue()
+        for event in (
+            "bot_info_probe",
+            "client_info_probe",
+            "store_info_probe",
+            "gateway_info_probe",
+        ):
+            self.assertIn(event, output)
+        self.assertEqual(output.count("bot_info_probe"), 1)
 
     def test_single_json_event_emits_exactly_one_json_object(self) -> None:
         stderr = io.StringIO()
