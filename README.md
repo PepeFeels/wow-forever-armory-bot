@@ -1,6 +1,6 @@
 # WoW Forever Armory Bot
 
-v1.1.2 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and observable, idempotent recovery. This hotfix gives the Discord bot logger a stable name so INFO lifecycle events also work when launched with `python -m`. Production remains on v1.1.0; publication and production upgrade require separate approval and host verification.
+v1.1.2 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and observable, idempotent recovery. This hotfix gives the Discord bot logger a stable name so INFO lifecycle events also work when launched with `python -m`. Production currently runs v1.1.1 at `de1ffb89a366ae1e4ba73db2a30804698d218e40`. The pre-documentation v1.1.2 candidate commit is `f9d4200f3cd1783195de237cbe75060a4c5ae64e`; after this documentation commit it is the parent revision, not the final release SHA. Use the resulting branch HEAD as the final release SHA. Publication and production upgrade require separate approval and host verification.
 
 ## Architecture
 

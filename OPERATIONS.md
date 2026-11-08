@@ -76,9 +76,13 @@ or backup directory. The unit templates and launcher must be byte-identical to
 the installed versions; runtime configuration changes need a separately
 reviewed installation.
 
-Run only after a release-specific approval, from the clean approved checkout
-on `release/v1.1.2`. Production remains on v1.1.0 until a separate production
-approval authorizes an upgrade:
+Current production runs v1.1.1 at
+`de1ffb89a366ae1e4ba73db2a30804698d218e40`. The pre-documentation v1.1.2
+candidate commit is `f9d4200f3cd1783195de237cbe75060a4c5ae64e`; after this
+documentation commit it is the parent revision, not the final release SHA.
+Use the resulting branch HEAD as the final release SHA. Run only after
+release-specific approval, from the clean approved checkout on
+`release/v1.1.2`:
 
 ```bash
 # Configuration-changing: stages code and atomically switches the release link.
