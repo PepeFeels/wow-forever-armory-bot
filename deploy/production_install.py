@@ -27,7 +27,7 @@ if not __package__:
 from deploy.production_db_snapshot import verify_database_snapshot
 
 BASE_CHECKPOINT_SHA = "9f5548d3763b42d38fff0613ef2cfd6c3b560d07"
-BRANCH = "feature/v0.2.0-discord"
+BRANCH = "release/v1.0.0"
 SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")

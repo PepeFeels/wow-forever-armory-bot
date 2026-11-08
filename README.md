@@ -1,6 +1,6 @@
 # WoW Forever Armory Bot
 
-Python bot foundation that displays public WoW Forever Armory profiles in a shared Discord guild channel. Version 0.2.0 adds an admin-activated, persistent Guild Armory over the existing Armory Core.
+v1.0.0 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and member-row recovery. Publication and production upgrade await final host verification.
 
 ## Architecture
 
@@ -93,7 +93,9 @@ Do not run this command for offline tests. It connects to Discord and syncs eith
 - The request semaphore and member-operation locks are process-local. Bot startup also holds an advisory filesystem lock to reject another local process using the same database path. Multi-host coordination is not implemented.
 - If Discord is unavailable after a registration commits, the stored snapshot lets startup recovery repair the row message. If a channel is permanently inaccessible or a database is lost, an administrator must restore permissions or the database backup.
 
-Operational deployment templates, SQLite backup/restore commands, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The systemd unit and timer files are preparation only and are not installed or enabled by this project.
+Production installation, SQLite backup/restore, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The repository includes reviewed systemd templates and an installer; running it changes host state and requires an approved maintenance procedure. This documentation update does not install or activate anything.
+
+Version history, the v1.0.0 release-candidate notes, and operational troubleshooting are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 The character overview renderer's supported fields, unavailable-data placeholders, bundled asset licenses, preview generation, and development review process are documented in [GRAPHIC_RENDERER.md](GRAPHIC_RENDERER.md). The renderer does not expand the Armory scraper or retrieve portraits/statistics/PvP data from other sources.
 
@@ -115,12 +117,14 @@ All automated tests use temporary SQLite files, synthetic profiles, and mocked D
 import asyncio
 from wow_forever_armory import ArmoryClient
 
+
 async def main() -> None:
     client = ArmoryClient(timeout=10, max_retries=2)
     character = await client.fetch_character(
         "en-us/forever/eu/armory/character/pepe-feels"
     )
     print(character.name, character.active_specialization)
+
 
 asyncio.run(main())
 ```

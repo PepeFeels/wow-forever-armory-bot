@@ -214,7 +214,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=feature/v0.2.0-discord",
+                    "--initial-branch=release/v1.0.0",
                     str(repo),
                 ],
                 check=True,

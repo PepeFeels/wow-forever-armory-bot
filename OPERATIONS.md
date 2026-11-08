@@ -1,14 +1,15 @@
-# Operational preparation (not deployed)
+# Production operations
 
-This document and the unit files under `deploy/systemd/` are deployment
-templates. Nothing in this repository installs, enables, starts, or changes a
-system service. The examples assume a dedicated `wow-armory` account, an
+The project includes deployment tooling and systemd templates. Installation,
+activation, upgrades, backups, and restores change host state and must follow an
+approved maintenance procedure. The production installation uses a dedicated
+`wow-armory` account, an
 application release at `/opt/wow-forever-armory-bot/current`, and private state
 under `/var/lib/wow-forever-armory-bot`.
 
 ## Installation preparation
 
-Before a separately approved deployment, create a dedicated unprivileged
+For a new host or a separately approved reinstall, create a dedicated unprivileged
 `wow-armory` user and group, install a reviewed release and its virtual
 environment under `/opt/wow-forever-armory-bot`, and make release files
 read-only to that account. The account should write only its state directory.
@@ -57,18 +58,26 @@ sudo systemctl enable --now wow-forever-armory-backup.timer
 
 ### Code-only upgrade of an installed release
 
-For a reviewed code-only update, keep the service and backup timer stopped and
-disabled. The installer supports `--upgrade-existing`: it validates the
+For a reviewed code-only update, stop and disable both the Armory service
+and backup timer during an approved maintenance window. Verify that both
+are inactive and disabled before invoking the installer. The installer
+supports `--upgrade-existing`: it validates the
 existing config and credential in place, requires the current link to point to
 a complete managed release, requires the new commit to descend from that
-release, and atomically switches `current`. It does not migrate, open for
-writing, replace, or back up the database; it does not rewrite the config,
-credential, systemd units, launcher, state directory, or backup directory. The
-unit templates and launcher must be byte-identical to the installed versions;
-runtime configuration changes need a separately reviewed installation.
+release, and atomically switches `current`. It does not invoke the installed
+startup database preflight against production state. Instead,
+`production_db_snapshot.py` copies the database and relevant WAL through
+read-only, no-follow descriptors into a private temporary directory and runs
+SQLite integrity/schema checks only on that copy. It validates source metadata
+before and after copying and fails closed if the source changes. The installer
+does not migrate or write to the production database or its sidecars, and does
+not rewrite the config, credential, systemd units, launcher, state directory,
+or backup directory. The unit templates and launcher must be byte-identical to
+the installed versions; runtime configuration changes need a separately
+reviewed installation.
 
 Run only after a release-specific approval, from the clean approved checkout
-on `feature/v0.2.0-discord`:
+on `release/v1.0.0`:
 
 ```bash
 # Configuration-changing: stages code and atomically switches the release link.
@@ -83,15 +92,14 @@ availability. The start preflight independently refuses an absent, empty,
 corrupt, or restore-gated database. No migration command is part of this
 upgrade path.
 
-To roll the code pointer back while stopped, preserve the new release and all
-state/backups, then atomically repoint `current` to the previous release. For
-this credential-permission fix, the previously installed release is known to
-reject systemd's root-owned `0440` credential; pointer rollback therefore
-restores the previous code artifact but does not restore a working service.
-If the new release fails after start, stop it, preserve the current database,
-and keep the service disabled while preparing a corrected credential-compatible
-release. Never restore an older database snapshot to solve a code-startup
-failure.
+For a code rollback, keep both units stopped and disabled, preserve the new
+release and all state/backups, and verify that the previous release supports
+the installed systemd credential-file interface and current database schema.
+Only then may an approved operator atomically repoint `current` and separately
+authorize service activation. A pointer rollback alone does not guarantee a
+working service. If compatibility is uncertain or fails, leave the service
+stopped and disabled while preparing a corrected compatible release.
+Never restore an older database snapshot merely to solve a code-startup failure.
 
 To deactivate in an approved rollback, stop and disable both units while
 retaining the database and backups:
@@ -287,21 +295,26 @@ task did not perform it.
 2. Create a verified online backup and confirm a recent backup is readable.
 3. Stage the new release beside the current release; do not overwrite the
    current release in place. Preserve the previous release directory/symlink.
-4. Stop the bot with `systemctl stop wow-forever-armory-bot.service` and verify
-   it is inactive. The process lock provides a second guard for restore.
-5. Keep the stable launcher in `/opt/wow-forever-armory-bot/bin` unchanged.
-   Atomically switch the `current` symlink to the staged release, then start
-   the service. Create a temporary symlink in the same parent and rename it
-   over `current` with `mv -Tf`. Do not run a second bot process for health
-   checks.
-6. Verify `systemctl is-active`, startup/connection and recovery logs, database
-   integrity, and controlled-guild panel/member behavior.
-7. If health checks fail, stop the service, switch `current` back to the prior
-   release, and start it. Restore the pre-upgrade database backup only if the
-   new version changed data incompatibly and the prior release cannot use the
-   current database. Verify integrity and recovery afterward.
+4. Stop and disable both `wow-forever-armory-bot.service` and
+   `wow-forever-armory-backup.timer`. Verify both are inactive and disabled.
+   Confirm no Armory process remains before installation.
+5. From the clean, approved release checkout, run the documented
+   `--upgrade-existing` installer. Do not manually replace the stable launcher
+   or systemd units. The installer verifies a database snapshot, stages the
+   release, and atomically switches `current` without starting either unit.
+6. Verify the release marker, `current`, database integrity, backup availability,
+   and systemd configuration. Only after separate approval, activate the bot
+   and backup timer and verify Discord connectivity, startup recovery,
+   panel/member behavior, and service health.
+7. If health checks fail, stop and disable both units and preserve the current
+   database, backups, and release artifacts. Verify credential-file and schema
+   compatibility before any pointer rollback. If the previous release is
+   compatible, an approved operator may atomically restore its pointer and
+   separately authorize activation. Otherwise keep the service stopped and
+   prepare a corrected release. Database restoration is a separate, explicitly
+   approved recovery operation, never an automatic response to startup failure.
 
-The current v0.2.0 code has no schema migration framework. Keep upgrades
+The v1.0.0 code has no schema migration framework. Keep upgrades
 backward-compatible with its current SQLite schema until a migration strategy
 is designed and reviewed. File-level SQLite backups do not protect against
 host loss; copy verified backups off-host through a separately reviewed
@@ -324,11 +337,10 @@ the required flock semantics and are not supported. The service unit does not
 manage unrelated/manual bot processes that ignore these locks.
 
 TASK 013C's observation that normal-runtime Armory INFO output was not yet
-verified remains open. Offline tests confirm the project handler emits INFO,
-but no live bot was started in this task, so normal journald capture has not
-been proven. Validate it during a separately approved service test. The
-previously observed 53 discord.py/Python 3.14 deprecation warnings also remain
-documented.
+verified remains open until journald output is inspected on the production
+host. Offline tests confirm the project handler emits INFO, but tests do not
+prove normal service capture. discord.py/Python 3.14 deprecation warnings also
+remain and should be reviewed when the upstream APIs are updated.
 
 ## TASK 016B review record
 
@@ -374,7 +386,7 @@ part of the approved deployment review.
 `deploy/production_install.py` is an administrator-only, fail-closed installer.
 It is preparation code and must not be run until reviewed and committed. It
 requires the full approved release SHA and checks that it exactly matches the
-clean checkout's HEAD on `feature/v0.2.0-discord`. It also verifies the release
+clean checkout's HEAD on `release/v1.0.0`. It also verifies the release
 is based on checkpoint `9f5548d3763b42d38fff0613ef2cfd6c3b560d07`. It builds
 the versioned release from that exact SHA, creates the locked `wow-armory` account and
 private directories, copies the supplied config and private credential,
