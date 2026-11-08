@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.3 — release candidate
+
+Prepared on `hotfix/v1.1.3-empty-guild-preflight` to correct startup preflight
+for initialized databases that contain zero guild rows. It continues to
+require the database file, private ownership and permissions, valid SQLite
+integrity, all required tables, no restore-in-progress marker, a configured
+database path, and no existing Armory process. No dummy guild or database
+migration is introduced.
+
+- Package metadata identifies this candidate as version 1.1.3.
+- Installer release branch is `release/v1.1.3`.
+- Installer ancestry checkpoint is the approved production v1.1.2 commit
+  `0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`.
+- The installer still preserves production state and does not start services.
+
 ## v1.1.2 — release candidate
 
 Prepared on `fix/v1.1.2-stable-logger` for independent review. This hotfix

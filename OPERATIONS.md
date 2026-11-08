@@ -76,13 +76,29 @@ or backup directory. The unit templates and launcher must be byte-identical to
 the installed versions; runtime configuration changes need a separately
 reviewed installation.
 
-Current production runs v1.1.1 at
-`de1ffb89a366ae1e4ba73db2a30804698d218e40`. The pre-documentation v1.1.2
-candidate commit is `f9d4200f3cd1783195de237cbe75060a4c5ae64e`; after this
-documentation commit it is the parent revision, not the final release SHA.
-Use the resulting branch HEAD as the final release SHA. Run only after
-release-specific approval, from the clean approved checkout on
-`release/v1.1.2`:
+Current production runs v1.1.2 at
+`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. The v1.1.3 hotfix candidate is
+based on that approved production commit. Run only after release-specific
+approval, from the clean approved checkout on `release/v1.1.3`:
+
+Before installation, record the installed shared preflight's SHA-256 and
+preserve a root-owned copy for rollback. The installer atomically replaces
+`/opt/wow-forever-armory-bot/bin/armory-db-preflight` before switching
+`current`; if installation later fails, the old application release can remain
+active with the new (more permissive for zero guild rows) preflight. Keep the
+backup until the release is accepted, and restore the previous preflight as
+well as the release pointer during a rollback. Do not alter other services or
+bots.
+
+```bash
+sudo sha256sum /opt/wow-forever-armory-bot/bin/armory-db-preflight
+sudo install -o root -g root -m 0700 \
+  /opt/wow-forever-armory-bot/bin/armory-db-preflight \
+  /var/lib/wow-forever-armory-bot/backups/armory-db-preflight.v1.1.2
+sudo sha256sum \
+  /opt/wow-forever-armory-bot/bin/armory-db-preflight \
+  /var/lib/wow-forever-armory-bot/backups/armory-db-preflight.v1.1.2
+```
 
 ```bash
 # Configuration-changing: stages code and atomically switches the release link.
@@ -93,8 +109,9 @@ sudo /usr/bin/python3.14 deploy/production_install.py \
 
 The release remains stopped and disabled. Before any approved start, verify
 `current`, release marker, systemd units, database integrity, and backup
-availability. The start preflight independently refuses an absent, empty,
-corrupt, or restore-gated database. No migration command is part of this
+availability. The start preflight independently refuses an absent, zero-byte,
+uninitialized, corrupt, or restore-gated database. A correctly initialized
+database with zero guild rows is accepted. No migration command is part of this
 upgrade path.
 
 For a code rollback, keep both units stopped and disabled, preserve the new
@@ -386,19 +403,20 @@ installed in this development environment. Full verification against the
 target Ubuntu host, actual account ownership, and credential delivery remains
 part of the approved deployment review.
 
-## TASK 019 final installation gate
+## v1.1.3 release installation gate
 
 `deploy/production_install.py` is an administrator-only, fail-closed installer.
-It is preparation code and must not be run until reviewed and committed. It
-requires the full approved release SHA and checks that it exactly matches the
-clean checkout's HEAD on `release/v1.1.2`. It also verifies the release
-descends from the approved v1.1.1 checkpoint
-`de1ffb89a366ae1e4ba73db2a30804698d218e40`. It builds
-the versioned release from that exact SHA, creates the locked `wow-armory` account and
-private directories, copies the supplied config and private credential,
-installs the unit and timer, verifies their syntax, and reloads systemd. It
-does **not** enable or start anything. It refuses to overwrite a different
-`current` release or proceed if a target unit is already active or enabled.
+It requires the full approved release SHA and checks that it exactly matches
+the clean checkout's HEAD on `release/v1.1.3`. It also verifies the release
+descends from the approved v1.1.2 production checkpoint
+`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. It builds
+the versioned release from that exact SHA. For an existing installation,
+`--upgrade-existing` validates the installed config and credential without
+rewriting them, requires installed runtime files to match the checkout, verifies
+a read-only database snapshot, and atomically switches `current`. It does not
+migrate or write the database, reinstall systemd files, or enable, start, or
+restart services. It refuses to replace an unmanaged or unexpected `current`
+release and fails if the target units are not stopped and disabled.
 
 The project owner confirmed PROD Guild ID `1549012880215638086` for initial
 deployment verification. The runtime, installer, and systemd preflight are not

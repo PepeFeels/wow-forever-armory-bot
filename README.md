@@ -1,6 +1,6 @@
 # WoW Forever Armory Bot
 
-v1.1.2 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and observable, idempotent recovery. This hotfix gives the Discord bot logger a stable name so INFO lifecycle events also work when launched with `python -m`. Production currently runs v1.1.1 at `de1ffb89a366ae1e4ba73db2a30804698d218e40`. The pre-documentation v1.1.2 candidate commit is `f9d4200f3cd1783195de237cbe75060a4c5ae64e`; after this documentation commit it is the parent revision, not the final release SHA. Use the resulting branch HEAD as the final release SHA. Publication and production upgrade require separate approval and host verification.
+v1.1.3 release candidate for the WoW Forever Armory Bot. It displays public WoW Forever Armory profiles and provides an admin-activated, persistent Guild Armory over the Armory Core, with per-guild registration and observable, idempotent recovery. This hotfix allows startup preflight to accept a valid initialized database with zero guilds while retaining integrity, schema, ownership, permission, restore-marker, and process checks. Production currently runs v1.1.2 at `0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. The v1.1.3 hotfix branch is based on that approved production commit; the final release SHA will be the approved `release/v1.1.3` HEAD. Publication and production upgrade require separate approval and host verification.
 
 ## Architecture
 
@@ -96,7 +96,7 @@ Do not run this command for offline tests. It connects to Discord and syncs eith
 
 Production installation, SQLite backup/restore, monitoring, upgrade and rollback guidance are in [OPERATIONS.md](OPERATIONS.md). The repository includes reviewed systemd templates and an installer; running it changes host state and requires an approved maintenance procedure. This documentation update does not install or activate anything.
 
-Version history, the v1.1.2 release-candidate notes, and historical v1.1.1, v1.1.0, and v1.0.0 release notes are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.1.2.md](RELEASE_NOTES_v1.1.2.md), [RELEASE_NOTES_v1.1.1.md](RELEASE_NOTES_v1.1.1.md), [RELEASE_NOTES_v1.1.0.md](RELEASE_NOTES_v1.1.0.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+Version history, the v1.1.3 release-candidate notes, and historical v1.1.2, v1.1.1, v1.1.0, and v1.0.0 release notes are in [CHANGELOG.md](CHANGELOG.md), [RELEASE_NOTES_v1.1.3.md](RELEASE_NOTES_v1.1.3.md), [RELEASE_NOTES_v1.1.2.md](RELEASE_NOTES_v1.1.2.md), [RELEASE_NOTES_v1.1.1.md](RELEASE_NOTES_v1.1.1.md), [RELEASE_NOTES_v1.1.0.md](RELEASE_NOTES_v1.1.0.md), [RELEASE_NOTES_v1.0.0.md](RELEASE_NOTES_v1.0.0.md), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 The character overview renderer's supported fields, unavailable-data placeholders, bundled asset licenses, preview generation, and development review process are documented in [GRAPHIC_RENDERER.md](GRAPHIC_RENDERER.md). The renderer does not expand the Armory scraper or retrieve portraits/statistics/PvP data from other sources.
 

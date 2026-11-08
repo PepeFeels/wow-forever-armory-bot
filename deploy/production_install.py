@@ -26,8 +26,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deploy.production_db_snapshot import verify_database_snapshot
 
-BASE_CHECKPOINT_SHA = "de1ffb89a366ae1e4ba73db2a30804698d218e40"
-BRANCH = "release/v1.1.2"
+BASE_CHECKPOINT_SHA = "0cb6377c1cb89e2594974e1c547c7d886ba7b8d4"
+BRANCH = "release/v1.1.3"
 SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")
@@ -608,6 +608,14 @@ def install(
     )
     if upgrade_existing:
         for source, destination in runtime_files:
+            if source.name == "armory-db-preflight.py":
+                _read_regular_file(
+                    destination,
+                    expected_owner=0,
+                    maximum_bytes=262144,
+                    exact_mode=0o755,
+                )
+                continue
             if (
                 not destination.is_file()
                 or source.read_bytes() != destination.read_bytes()
@@ -632,6 +640,10 @@ def install(
 
     release = BASE / "releases" / release_sha
     _install_release(repo, release, uid, gid, release_sha)
+    if upgrade_existing:
+        preflight_source = deploy / "systemd/armory-db-preflight.py"
+        preflight_destination = BASE / "bin/armory-db-preflight"
+        _copy_unit(preflight_source, preflight_destination, 0o755)
     _install_current_link(
         release,
         upgrade_existing=upgrade_existing,

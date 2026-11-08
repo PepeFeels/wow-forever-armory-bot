@@ -1,4 +1,4 @@
-"""Check package version and the v1.1.2 installer release gate."""
+"""Check package version and the v1.1.3 installer release gate."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ from deploy.production_install import BASE_CHECKPOINT_SHA, BRANCH
 
 
 class ReleaseMetadataTests(unittest.TestCase):
-    def test_package_version_is_v1_1_2(self) -> None:
+    def test_package_version_is_v1_1_3(self) -> None:
         project = tomllib.loads(
             (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         )["project"]
-        self.assertEqual(project["version"], "1.1.2")
+        self.assertEqual(project["version"], "1.1.3")
 
-    def test_installer_release_gate_matches_v1_1_2(self) -> None:
-        self.assertEqual(BRANCH, "release/v1.1.2")
+    def test_installer_release_gate_matches_v1_1_3(self) -> None:
+        self.assertEqual(BRANCH, "release/v1.1.3")
         self.assertEqual(
-            BASE_CHECKPOINT_SHA, "de1ffb89a366ae1e4ba73db2a30804698d218e40"
+            BASE_CHECKPOINT_SHA, "0cb6377c1cb89e2594974e1c547c7d886ba7b8d4"
         )
 
 

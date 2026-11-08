@@ -1,13 +1,11 @@
 # Manual production cutover review procedure
 
 This document records the legacy v0.2.0 initial database migration procedure.
-For the v1.1.2 code-only release upgrade, follow `OPERATIONS.md`. Current
-production runs v1.1.1 at
-`de1ffb89a366ae1e4ba73db2a30804698d218e40`. The pre-documentation v1.1.2
-candidate commit is `f9d4200f3cd1783195de237cbe75060a4c5ae64e`; after this
-documentation commit it is the parent revision, not the final release SHA.
-Use the resulting branch HEAD as the final release SHA. The upgrade still
-requires separate approval.
+For the v1.1.3 code-only release upgrade, follow `OPERATIONS.md`. Current
+production runs v1.1.2 at
+`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. The v1.1.3 hotfix branch is based
+on that approved production commit. The upgrade still requires separate
+approval.
 
 This is a reviewed operator checklist, not an executable cutover script. It is
 intentionally manual because the legacy process does not honor the new runtime
@@ -168,9 +166,6 @@ rollback copy, and quarantined WAL/SHM sidecars.
 ## Release integration gate
 
 The production installer accepts a clean exact-SHA checkout on
-`release/v1.1.2` based on the approved v1.1.1 checkpoint
-`de1ffb89a366ae1e4ba73db2a30804698d218e40`. Current production runs v1.1.1 at
-that checkpoint. The pre-documentation candidate commit
-`f9d4200f3cd1783195de237cbe75060a4c5ae64e` is the parent revision after this
-documentation commit; use the resulting branch HEAD as the final release SHA.
-This procedure does not authorize changes to the production checkout.
+`release/v1.1.3` based on the approved v1.1.2 production checkpoint
+`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. This procedure does not authorize
+changes to the production checkout.

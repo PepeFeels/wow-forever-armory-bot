@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Read-only startup gate for the migrated Guild Armory database."""
+"""Read-only startup gate for an initialized Guild Armory database."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def database_is_ready(path: str | Path, *, expected_owner: int | None = None) ->
             if not {"guilds", "members", "characters", "flows"}.issubset(tables):
                 return False
             guild_count = connection.execute("SELECT count(*) FROM guilds").fetchone()
-            return guild_count is not None and guild_count[0] > 0
+            return guild_count is not None
     except OSError, sqlite3.Error:
         return False
 

@@ -18,6 +18,7 @@ from deploy.production_install import (
     InstallError,
     _assert_units_stopped_and_disabled,
     _check_repository,
+    _copy_unit,
     _install_current_link,
     _install_release,
     _require_supported_runtime,
@@ -40,6 +41,21 @@ def _load_preflight():
 
 
 preflight = _load_preflight()
+
+
+def _create_preflight_database(path: Path, *, guild_count: int = 0) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            "CREATE TABLE guilds (guild_id INTEGER PRIMARY KEY);"
+            "CREATE TABLE members (guild_id INTEGER, user_id INTEGER);"
+            "CREATE TABLE characters (guild_id INTEGER, user_id INTEGER);"
+            "CREATE TABLE flows (guild_id INTEGER, user_id INTEGER);"
+        )
+        connection.executemany(
+            "INSERT INTO guilds VALUES (?)",
+            ((guild_id,) for guild_id in range(1, guild_count + 1)),
+        )
+    path.chmod(0o600)
 
 
 class ProductionInstallTests(unittest.TestCase):
@@ -214,7 +230,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=release/v1.1.2",
+                    "--initial-branch=release/v1.1.3",
                     str(repo),
                 ],
                 check=True,
@@ -388,7 +404,7 @@ class ProductionInstallTests(unittest.TestCase):
                 with self.assertRaises(InstallError):
                     validate_inputs(config, credential, expected_owner=os.getuid())
 
-    def test_preflight_rejects_missing_empty_uninitialized_and_gated_db(self) -> None:
+    def test_preflight_rejects_missing_empty_and_uninitialized_db(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             missing = root / "missing.sqlite3"
@@ -403,19 +419,76 @@ class ProductionInstallTests(unittest.TestCase):
                 pass
             self.assertFalse(preflight.database_is_ready(uninitialized))
 
-            initialized = root / "initialized.sqlite3"
-            with sqlite3.connect(initialized) as connection:
-                connection.executescript(
-                    "CREATE TABLE guilds (guild_id INTEGER PRIMARY KEY);"
-                    "CREATE TABLE members (guild_id INTEGER, user_id INTEGER);"
-                    "CREATE TABLE characters (guild_id INTEGER, user_id INTEGER);"
-                    "CREATE TABLE flows (guild_id INTEGER, user_id INTEGER);"
-                    "INSERT INTO guilds VALUES (1);"
+    def test_preflight_accepts_valid_zero_and_one_guild_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for guild_count in (0, 1):
+                with self.subTest(guild_count=guild_count):
+                    database = root / f"guilds-{guild_count}.sqlite3"
+                    _create_preflight_database(database, guild_count=guild_count)
+                    self.assertTrue(preflight.database_is_ready(database))
+
+    def test_preflight_rejects_missing_required_tables_and_corrupt_database(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_tables = root / "missing-tables.sqlite3"
+            with sqlite3.connect(missing_tables) as connection:
+                connection.execute("CREATE TABLE guilds (guild_id INTEGER)")
+            missing_tables.chmod(0o600)
+            self.assertFalse(preflight.database_is_ready(missing_tables))
+
+            corrupt = root / "corrupt.sqlite3"
+            corrupt.write_bytes(b"not a SQLite database")
+            corrupt.chmod(0o600)
+            self.assertFalse(preflight.database_is_ready(corrupt))
+
+    def test_preflight_rejects_wrong_owner_and_unsafe_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "private.sqlite3"
+            _create_preflight_database(database)
+            self.assertFalse(
+                preflight.database_is_ready(
+                    database, expected_owner=os.getuid() + 1
                 )
-            initialized.chmod(0o600)
-            self.assertTrue(preflight.database_is_ready(initialized))
-            Path(f"{initialized}.restore-in-progress").write_text("review")
-            self.assertFalse(preflight.database_is_ready(initialized))
+            )
+            database.chmod(0o640)
+            self.assertFalse(preflight.database_is_ready(database))
+
+    def test_preflight_restore_marker_blocks_initialized_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "initialized.sqlite3"
+            _create_preflight_database(database)
+            Path(f"{database}.restore-in-progress").write_text("review")
+            self.assertFalse(preflight.database_is_ready(database))
+
+    def test_installed_preflight_copy_keeps_empty_database_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = (
+                Path(__file__).parents[1]
+                / "deploy/systemd/armory-db-preflight.py"
+            )
+            destination = root / "bin/armory-db-preflight"
+            destination.parent.mkdir()
+            temporary_copy = destination.with_name(".armory-db-preflight.installing")
+            with (
+                patch("deploy.production_install.os.chown"),
+                patch("deploy.production_install.os.chmod") as chmod,
+            ):
+                _copy_unit(source, destination, 0o755)
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertFalse(temporary_copy.exists())
+            chmod.assert_called_once_with(temporary_copy, 0o755)
+
+            loader = SourceFileLoader("installed_armory_db_preflight", str(destination))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            self.assertIsNotNone(spec)
+            installed = importlib.util.module_from_spec(spec)
+            loader.exec_module(installed)
+            database = root / "empty-guilds.sqlite3"
+            _create_preflight_database(database)
+            self.assertTrue(installed.database_is_ready(database))
 
     def test_startup_preflight_is_guild_agnostic(self) -> None:
         with (
@@ -436,6 +509,18 @@ class ProductionInstallTests(unittest.TestCase):
         ):
             self.assertEqual(preflight.main(), 0)
 
+    def test_startup_preflight_requires_database_path(self) -> None:
+        with (
+            patch.dict(os.environ, {"ARMORY_DATABASE_PATH": ""}),
+            patch.object(preflight, "armory_process_present", return_value=False),
+            patch.object(
+                preflight.pwd,
+                "getpwnam",
+                return_value=SimpleNamespace(pw_uid=os.getuid()),
+            ),
+        ):
+            self.assertEqual(preflight.main(), 78)
+
     def test_preflight_finds_existing_armory_module_without_reading_env(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             proc = Path(temporary)
@@ -448,6 +533,15 @@ class ProductionInstallTests(unittest.TestCase):
                 b"DISCORD_BOT_TOKEN=synthetic-never-print\0"
             )
             self.assertTrue(preflight.armory_process_present(proc))
+
+    def test_existing_armory_process_still_blocks_preflight_database_check(self):
+        with (
+            patch.dict(os.environ, {"ARMORY_DATABASE_PATH": "/unused/database"}),
+            patch.object(preflight, "armory_process_present", return_value=True),
+            patch.object(preflight, "database_is_ready") as database_is_ready,
+        ):
+            self.assertEqual(preflight.main(), 78)
+            database_is_ready.assert_not_called()
 
     def test_bot_unit_uses_root_preflight_and_nonstarting_install_files(self) -> None:
         root = Path(__file__).parents[1]
@@ -462,9 +556,16 @@ class ProductionInstallTests(unittest.TestCase):
         self.assertIn("LoadCredential=discord-token:", unit)
         self.assertNotIn('"enable"', installer)
         self.assertNotIn('"start"', installer)
+        self.assertIn('deploy / "systemd/armory-db-preflight.py"', installer)
+        self.assertIn('BASE / "bin/armory-db-preflight"', installer)
+        self.assertIn(
+            "_copy_unit(preflight_source, preflight_destination, 0o755)", installer
+        )
         self.assertTrue(
             (root / "deploy/systemd/armory-db-preflight.py").stat().st_mode & 0o111
         )
+        self.assertIn('deploy / "systemd/armory-db-preflight.py"', installer)
+        self.assertIn('BASE / "bin/armory-db-preflight"', installer)
 
 
 if __name__ == "__main__":
