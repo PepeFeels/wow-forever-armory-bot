@@ -42,6 +42,7 @@ class ParserTests(unittest.TestCase):
         state = {
             "character": {
                 "name": "Pepe",
+                "surname": "Proudmoore",
                 "level": 28,
                 "class": {"id": 11, "name": "Druid"},
                 "race": {"id": 4, "name": "Night Elf"},
@@ -80,6 +81,7 @@ class ParserTests(unittest.TestCase):
         }
         character = parse_character(page(state))
         self.assertEqual(character.name, "Pepe")
+        self.assertEqual(character.surname, "Proudmoore")
         self.assertEqual(character.level, 28)
         self.assertEqual(character.character_class, "Druid")
         self.assertEqual(character.race, "Night Elf")
@@ -106,6 +108,10 @@ class ParserTests(unittest.TestCase):
             script(' \n var\tcharacterProfileInitialState\n=\n{"character":{}} ; \n')
         )
         self.assertEqual(state, {"character": {}})
+
+    def test_missing_surname_stays_missing(self) -> None:
+        character = parse_character(page({"character": {"name": "Pepe"}}))
+        self.assertIsNone(character.surname)
 
     def test_missing_or_malformed_assignment(self) -> None:
         for content in (

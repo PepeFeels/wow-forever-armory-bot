@@ -1,0 +1,3 @@
+# Reproducible build backend for the supported CPython 3.14 Linux x86_64 target.
+setuptools==80.9.0 \
+    --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922

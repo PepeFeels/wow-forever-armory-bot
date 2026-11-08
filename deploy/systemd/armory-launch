@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+: "${ARMORY_PYTHON:?ARMORY_PYTHON must point to the release Python interpreter}"
+
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+    token_file=${CREDENTIALS_DIRECTORY}/discord-token
+    if [ ! -f "$token_file" ] || [ ! -r "$token_file" ] || [ ! -s "$token_file" ]; then
+        printf '%s\n' 'Armory credential is unavailable.' >&2
+        exit 78
+    fi
+    # The application reads the systemd credential itself. Never copy its
+    # value into this shell or the child process environment.
+    unset DISCORD_BOT_TOKEN
+    DISCORD_BOT_TOKEN_FILE=$token_file
+    export DISCORD_BOT_TOKEN_FILE
+fi
+
+exec "$ARMORY_PYTHON" -m wow_forever_armory.discord_bot

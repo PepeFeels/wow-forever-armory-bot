@@ -34,3 +34,4 @@ class Character:
     spent_talent_points: int | None = None
     professions: tuple[Profession, ...] = ()
     armory_updated_at: datetime | None = None
+    surname: str | None = None
