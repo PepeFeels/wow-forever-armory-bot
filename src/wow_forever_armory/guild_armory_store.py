@@ -524,6 +524,24 @@ class GuildArmoryStore:
 
         return await self._run(operation)
 
+    async def update_character(
+        self, guild_id: int, user_id: int, path: str, character: Character
+    ) -> bool:
+        """Replace only one registered character snapshot, atomically."""
+        payload = _character_json(character)
+
+        def operation() -> bool:
+            with self._connection() as connection, self._transaction(connection):
+                return bool(
+                    connection.execute(
+                        """UPDATE characters SET character_json=?, updated_at=?
+                        WHERE guild_id=? AND user_id=? AND path=?""",
+                        (payload, _now(), guild_id, user_id, path),
+                    ).rowcount
+                )
+
+        return await self._run(operation)
+
     async def set_row_message(
         self, guild_id: int, user_id: int, message_id: int | None
     ) -> None:

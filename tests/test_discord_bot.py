@@ -221,6 +221,65 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(intents.message_content)
         self.assertFalse(intents.members)
 
+    async def test_refresh_updates_changed_character_and_member_image(self) -> None:
+        path = f"{PREFIX}/refresh-hero"
+        old = Character(name="Hero", surname="Woodsong", level=60)
+        await self.store.finish_flow(111, 456, "Hero", path, old)
+        self.bot.armory_client.fetch_character = AsyncMock(
+            return_value=Character(name="Hero", surname="Woodsong", level=70)
+        )
+        self.bot.sync_member_row = AsyncMock()
+
+        await self.bot.refresh_registered_characters()
+
+        state = await self.store.member(111, 456)
+        self.assertEqual(state.characters[0].character.level, 70)
+        self.bot.sync_member_row.assert_awaited_once_with(
+            state, fresh_paths=frozenset({path})
+        )
+
+    async def test_refresh_fetch_failure_preserves_snapshot_and_continues(self) -> None:
+        first_path = f"{PREFIX}/failed-hero"
+        second_path = f"{PREFIX}/changed-hero"
+        await self.store.finish_flow(
+            111, 456, "Hero", first_path, Character(name="Hero", level=60)
+        )
+        await self.store.finish_flow(
+            111, 457, "Other", second_path, Character(name="Other", level=60)
+        )
+        self.bot.armory_client.fetch_character = AsyncMock(
+            side_effect=[
+                RuntimeError("offline"),
+                Character(name="Other", level=70),
+            ]
+        )
+        self.bot.sync_member_row = AsyncMock()
+
+        await self.bot.refresh_registered_characters()
+
+        first = await self.store.member(111, 456)
+        second = await self.store.member(111, 457)
+        self.assertEqual(first.characters[0].character.level, 60)
+        self.assertEqual(second.characters[0].character.level, 70)
+        self.assertEqual(self.bot.armory_client.fetch_character.await_count, 2)
+        self.bot.sync_member_row.assert_awaited_once()
+
+    async def test_refresh_worker_is_not_duplicated_after_reconnect_ready(self) -> None:
+        entered = asyncio.Event()
+
+        async def worker() -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(self.bot, "_refresh_worker", worker):
+            self.bot._ensure_refresh_worker()
+            first_task = self.bot._refresh_task
+            await entered.wait()
+            self.bot._ensure_refresh_worker()
+            self.assertIs(self.bot._refresh_task, first_task)
+            await self.bot.close()
+            self.assertTrue(first_task.cancelled())
+
     async def test_discord_event_dispatch_runs_connect_then_ready_callbacks(
         self,
     ) -> None:
