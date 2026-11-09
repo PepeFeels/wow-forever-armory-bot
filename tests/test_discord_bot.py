@@ -247,21 +247,26 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         await self.store.finish_flow(
             111, 457, "Other", second_path, Character(name="Other", level=60)
         )
-        self.bot.armory_client.fetch_character = AsyncMock(
-            side_effect=[
-                RuntimeError("offline"),
-                Character(name="Other", level=70),
-            ]
-        )
+        refresh_tasks = []
+
+        async def fetch(path: str) -> Character:
+            refresh_tasks.append(asyncio.current_task())
+            if path == first_path:
+                raise RuntimeError("offline")
+            return Character(name="Other", level=70)
+
+        self.bot.armory_client.fetch_character = AsyncMock(side_effect=fetch)
         self.bot.sync_member_row = AsyncMock()
 
-        await self.bot.refresh_registered_characters()
+        with patch("wow_forever_armory.discord_bot._ARMORY_REFRESH_PACING", 0):
+            await self.bot.refresh_registered_characters()
 
         first = await self.store.member(111, 456)
         second = await self.store.member(111, 457)
         self.assertEqual(first.characters[0].character.level, 60)
         self.assertEqual(second.characters[0].character.level, 70)
         self.assertEqual(self.bot.armory_client.fetch_character.await_count, 2)
+        self.assertEqual(len(set(refresh_tasks)), 1)
         self.bot.sync_member_row.assert_awaited_once()
 
     async def test_refresh_worker_is_not_duplicated_after_reconnect_ready(self) -> None:

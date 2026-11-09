@@ -952,32 +952,27 @@ class ArmoryBot(commands.Bot):
                         level=logging.WARNING,
                     )
                     continue
-                tasks = [
-                    asyncio.create_task(
-                        self._refresh_character(state, registered.path)
-                    )
-                    for state in members
-                    for registered in state.characters
-                ]
-                if tasks:
-                    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-                    for outcome in outcomes:
-                        if isinstance(outcome, BaseException):
-                            failed += 1
+                for state in members:
+                    for registered in state.characters:
+                        try:
+                            outcome = await self._refresh_character(
+                                state, registered.path
+                            )
+                        except Exception as exc:
+                            outcome = "failed"
                             _log_recovery_exception(
                                 "armory_refresh_character_failed",
-                                outcome if isinstance(outcome, Exception) else RuntimeError(),
+                                exc,
                                 reason="character_refresh",
                                 level=logging.WARNING,
                             )
+                        checked += 1
+                        if outcome == "changed":
+                            changed += 1
+                        elif outcome == "unchanged":
+                            unchanged += 1
                         else:
-                            checked += 1
-                            if outcome == "changed":
-                                changed += 1
-                            elif outcome == "unchanged":
-                                unchanged += 1
-                            else:
-                                failed += 1
+                            failed += 1
         except Exception as exc:
             _log_recovery_exception(
                 "armory_refresh_cycle_failed",
