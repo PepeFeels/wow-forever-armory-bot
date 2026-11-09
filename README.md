@@ -57,7 +57,7 @@ Grant the bot these channel permissions:
 3. Add a character using its full WoW Forever Armory profile URL.
 4. Use the character controls to add another character, replace one, or remove one.
 
-Each member can have up to three characters per Discord server. Character registrations are managed through private interactions; the resulting overview is displayed in the shared panel channel.
+Each member can have up to three characters per Discord server. Character registrations are managed through private interactions; the resulting overview is displayed in the shared panel channel. Registered characters are checked against the Armory about every five minutes; the member image is refreshed only when normalized character data changes, without pinging the member again. The Armory's own last-updated timestamp can lag behind a check, so a successful check does not guarantee newer profile data.
 
 ## Privacy and data
 

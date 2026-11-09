@@ -42,6 +42,8 @@ from .parser import ArmoryParseError
 _LOGGER = logging.getLogger("wow_forever_armory.discord_bot")
 _LOCK_STRIPES = 32
 _MAX_TOKEN_FILE_BYTES = 4096
+_ARMORY_REFRESH_INTERVAL = 5 * 60
+_ARMORY_REFRESH_PACING = 0.2
 
 
 class BotIdentityUnavailable(RuntimeError):
@@ -200,6 +202,8 @@ class ArmoryBot(commands.Bot):
         self._activation_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
         self._recovered = False
         self._recovery_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_pending_rows: set[tuple[int, int]] = set()
 
     @staticmethod
     def _intents() -> discord.Intents:
@@ -818,6 +822,7 @@ class ArmoryBot(commands.Bot):
                     "guild_armory_recovery_skipped",
                     extra={"outcome": "already_recovered"},
                 )
+                self._ensure_refresh_worker()
                 return
             _LOGGER.info("guild_armory_recovery_started")
             try:
@@ -832,6 +837,7 @@ class ArmoryBot(commands.Bot):
                     "guild_armory_recovery_completed",
                     extra={"outcome": "failed", "reason": "state_load"},
                 )
+                self._ensure_refresh_worker()
                 return
             all_recovered = True
             recovered_guilds = 0
@@ -900,6 +906,159 @@ class ArmoryBot(commands.Bot):
                     "outcome": "success" if all_recovered else "incomplete",
                 },
             )
+            self._ensure_refresh_worker()
+
+    def _ensure_refresh_worker(self) -> None:
+        task = self._refresh_task
+        if task is None or task.done():
+            self._refresh_task = asyncio.create_task(
+                self._refresh_worker(), name="armory-character-refresh"
+            )
+            _LOGGER.info("armory_refresh_worker_started")
+
+    async def _refresh_worker(self) -> None:
+        try:
+            while True:
+                await self.refresh_registered_characters()
+                await asyncio.sleep(_ARMORY_REFRESH_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log_recovery_exception(
+                "armory_refresh_worker_failed", exc, reason="worker_cycle"
+            )
+            # Keep the worker alive after an unexpected cycle-level failure.
+            await asyncio.sleep(_ARMORY_REFRESH_INTERVAL)
+            if not self.is_closed():
+                self._refresh_task = asyncio.create_task(
+                    self._refresh_worker(), name="armory-character-refresh"
+                )
+
+    async def refresh_registered_characters(self) -> None:
+        """Refresh registered snapshots; isolate failures to each character."""
+        _LOGGER.info("armory_refresh_cycle_started")
+        checked = changed = unchanged = failed = 0
+        try:
+            configs = await self.store.guilds()
+            for config in configs:
+                try:
+                    members = await self.store.members(config.guild_id)
+                except Exception as exc:
+                    failed += 1
+                    _log_recovery_exception(
+                        "armory_refresh_member_load_failed",
+                        exc,
+                        reason="member_state_load",
+                        level=logging.WARNING,
+                    )
+                    continue
+                for state in members:
+                    for registered in state.characters:
+                        try:
+                            outcome = await self._refresh_character(
+                                state, registered.path
+                            )
+                        except Exception as exc:
+                            outcome = "failed"
+                            _log_recovery_exception(
+                                "armory_refresh_character_failed",
+                                exc,
+                                reason="character_refresh",
+                                level=logging.WARNING,
+                            )
+                        checked += 1
+                        if outcome == "changed":
+                            changed += 1
+                        elif outcome == "unchanged":
+                            unchanged += 1
+                        else:
+                            failed += 1
+        except Exception as exc:
+            _log_recovery_exception(
+                "armory_refresh_cycle_failed",
+                exc,
+                reason="cycle_state_load",
+                level=logging.WARNING,
+            )
+            failed += 1
+        finally:
+            _LOGGER.info(
+                "armory_refresh_cycle_completed",
+                extra={
+                    "checked": checked,
+                    "changed": changed,
+                    "unchanged": unchanged,
+                    "failed": failed,
+                },
+            )
+
+    async def _refresh_character(self, state: MemberState, path: str) -> str:
+        async with self.armory_semaphore:
+            await asyncio.sleep(_ARMORY_REFRESH_PACING)
+            try:
+                fresh = await self.armory_client.fetch_character(path)
+            except Exception as exc:
+                _log_recovery_exception(
+                    "armory_refresh_character_failed",
+                    exc,
+                    reason="armory_fetch",
+                    level=logging.WARNING,
+                )
+                return "failed"
+        if not fresh.name or fresh.level is None:
+            _LOGGER.warning(
+                "armory_refresh_character_failed",
+                extra={"reason": "incomplete_profile"},
+            )
+            return "failed"
+        persisted = False
+        try:
+            async with self.member_lock(state.guild_id, state.user_id):
+                latest = await self.store.member(state.guild_id, state.user_id)
+                registered = (
+                    next((item for item in latest.characters if item.path == path), None)
+                    if latest is not None
+                    else None
+                )
+                if registered is None:
+                    return "unchanged"
+                if fresh == registered.character:
+                    row_key = (state.guild_id, state.user_id)
+                    if row_key in self._refresh_pending_rows:
+                        await self.sync_member_row(latest)
+                        self._refresh_pending_rows.discard(row_key)
+                    return "unchanged"
+                changed = await self.store.update_character(
+                    state.guild_id, state.user_id, path, fresh
+                )
+                if not changed:
+                    return "unchanged"
+                persisted = True
+                latest = await self.store.member(state.guild_id, state.user_id)
+                if latest is not None:
+                    await self.sync_member_row(latest, fresh_paths=frozenset({path}))
+                    self._refresh_pending_rows.discard((state.guild_id, state.user_id))
+            return "changed"
+        except Exception as exc:
+            if persisted:
+                self._refresh_pending_rows.add((state.guild_id, state.user_id))
+            _log_recovery_exception(
+                "armory_refresh_character_failed",
+                exc,
+                reason="persist_or_discord_update",
+                level=logging.WARNING,
+            )
+            # Data may already be saved; the next cycle will retry Discord rendering.
+            return "failed"
+
+    async def close(self) -> None:
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            _LOGGER.info("armory_refresh_worker_stopped")
+        await super().close()
 
     async def on_disconnect(self) -> None:
         async with self._recovery_lock:
