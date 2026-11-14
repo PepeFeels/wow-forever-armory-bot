@@ -76,13 +76,15 @@ or backup directory. The unit templates and launcher must be byte-identical to
 the installed versions; runtime configuration changes need a separately
 reviewed installation.
 
-Current production remains v1.1.2 at
-`0cb6377c1cb89e2594974e1c547c7d886ba7b8d4`. v1.1.3 was published at
+Production was restored to working release
+`dcceeb85464e09e34b112e41b16a833226c72270` after the v1.1.4 candidate
+`a1a6a2ad95302f7e3c4900f18e91691f43631e18` was rejected by the installer.
+The v1.1.3 history includes commit
 `c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce`, but its production deployment
 was safely blocked because snapshot verification still rejected zero guilds.
-The v1.1.4 candidate is based on that v1.1.3 commit. Run only after
-release-specific approval, from the clean approved checkout on
-`release/v1.1.4`:
+The v2.0.0 candidate is based on the complete v1.1.4 source at `a1a6a2a…`.
+Any future installation requires a separately reviewed exact release pin and
+approval.
 
 Before installation, record the installed shared preflight's SHA-256 and
 preserve a root-owned copy for recovery planning. The installer atomically
@@ -433,13 +435,13 @@ installed in this development environment. Full verification against the
 target Ubuntu host, actual account ownership, and credential delivery remains
 part of the approved deployment review.
 
-## v1.1.4 release installation gate
+## v2.0.0 release installation gate
 
 `deploy/production_install.py` is an administrator-only, fail-closed installer.
 It requires the full approved release SHA and checks that it exactly matches
-the clean checkout's HEAD on `release/v1.1.4`. It also verifies the release
-descends from the published v1.1.3 checkpoint
-`c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce`. It builds
+the clean checkout's HEAD on `release/v2.0.0`. It also verifies the release
+descends from the reviewed v1.1.4 graphics checkpoint
+`a1a6a2ad95302f7e3c4900f18e91691f43631e18`. It builds
 the versioned release from that exact SHA. For an existing installation,
 `--upgrade-existing` validates the installed config and credential without
 rewriting them, requires installed runtime files to match the checkout, verifies
@@ -447,6 +449,15 @@ a read-only database snapshot, and atomically switches `current`. It does not
 migrate or write the database, reinstall systemd files, or enable, start, or
 restart services. It refuses to replace an unmanaged or unexpected `current`
 release and fails if the target units are not stopped and disabled.
+
+The version-controlled wrapper source is `deploy/production_wrapper.py`. It
+loads `release_sha`, `previous_sha`, and `installer_sha256` from
+`/etc/wow-forever-armory-bot/deployment-pin.json`, which must be a root-owned
+regular file with mode `0600`. Create that pin only after the v2.0.0 commit and
+the installed helper hash have been independently reviewed. Do not put the
+Discord token or other secrets in the pin. The wrapper sets `umask 077` for
+its audit files; the installer temporarily uses `umask 022` only while building
+the release and restores `077` before returning.
 
 The project owner confirmed PROD Guild ID `1549012880215638086` for initial
 deployment verification. The runtime, installer, and systemd preflight are not

@@ -1,4 +1,4 @@
-"""Check package version and the v1.1.4 installer release gate."""
+"""Check package version and the v2.0.0 installer release gate."""
 
 from __future__ import annotations
 
@@ -10,22 +10,22 @@ from deploy.production_install import BASE_CHECKPOINT_SHA, BRANCH
 
 
 class ReleaseMetadataTests(unittest.TestCase):
-    def test_package_version_is_v1_1_4(self) -> None:
+    def test_package_version_is_v2_0_0(self) -> None:
         project = tomllib.loads(
             (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         )["project"]
-        self.assertEqual(project["version"], "1.1.4")
+        self.assertEqual(project["version"], "2.0.0")
 
-    def test_installer_release_gate_matches_v1_1_4(self) -> None:
-        self.assertEqual(BRANCH, "release/v1.1.4")
+    def test_installer_release_gate_matches_v2_0_0(self) -> None:
+        self.assertEqual(BRANCH, "release/v2.0.0")
         self.assertEqual(
-            BASE_CHECKPOINT_SHA, "c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce"
+            BASE_CHECKPOINT_SHA, "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
         )
 
     def test_empty_database_rollback_keeps_compatible_preflight(self) -> None:
-        operations = (
-            Path(__file__).parents[1] / "OPERATIONS.md"
-        ).read_text(encoding="utf-8")
+        operations = (Path(__file__).parents[1] / "OPERATIONS.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             "Application rollback and preflight rollback are separate", operations
         )

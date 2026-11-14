@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.0.0 — release candidate
+
+Prepared from the complete v1.1.4 source line, including the approved graphics
+changes in `a1a6a2ad95302f7e3c4900f18e91691f43631e18`. This candidate fixes the
+installer's inherited restrictive-umask failure, adds safe structured
+installer diagnostics, and versions the production wrapper source. It preserves
+the existing SQLite schema, configuration, credential interface, and
+multi-guild Armory behavior. It has not been deployed, pushed, or tagged.
+
+- Package version and installer branch are `2.0.0` and `release/v2.0.0`.
+- Installer ancestry checkpoint is the reviewed graphics release
+  `a1a6a2ad95302f7e3c4900f18e91691f43631e18`.
+- The wrapper reads release and installer hashes from a root-owned mode `0600`
+  deployment pin created only after the candidate commit is reviewed.
+- Release build permissions are opened only to safe read/execute levels while
+  building; the wrapper restores its private `umask 077` afterward.
+
 ## v1.1.4 — release candidate
 
 Prepared on `hotfix/v1.1.4-empty-snapshot-verification` to allow the isolated

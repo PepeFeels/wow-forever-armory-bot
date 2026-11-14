@@ -1016,7 +1016,9 @@ class ArmoryBot(commands.Bot):
             async with self.member_lock(state.guild_id, state.user_id):
                 latest = await self.store.member(state.guild_id, state.user_id)
                 registered = (
-                    next((item for item in latest.characters if item.path == path), None)
+                    next(
+                        (item for item in latest.characters if item.path == path), None
+                    )
                     if latest is not None
                     else None
                 )

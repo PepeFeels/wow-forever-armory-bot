@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sqlite3
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -60,6 +62,126 @@ def _create_preflight_database(path: Path, *, guild_count: int = 0) -> None:
 
 
 class ProductionInstallTests(unittest.TestCase):
+    def test_release_build_uses_readable_modes_and_restores_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = io.BytesIO()
+            with tarfile.open(fileobj=bundle, mode="w") as archive:
+                for name in ("src/", "src/pkg/"):
+                    directory = tarfile.TarInfo(name)
+                    directory.type = tarfile.DIRTYPE
+                    directory.mode = 0o755
+                    archive.addfile(directory)
+                source = tarfile.TarInfo("src/pkg/module.py")
+                source.mode = 0o644
+                source_data = b"value = 1\n"
+                source.size = len(source_data)
+                archive.addfile(source, io.BytesIO(source_data))
+            archive_bytes = bundle.getvalue()
+
+            def fake_run(command, **kwargs):
+                if command[0] == "git":
+                    return subprocess.CompletedProcess(command, 0, stdout=archive_bytes)
+                if "-m" in command and "venv" in command:
+                    environment = Path(command[-1])
+                    binary_dir = environment / "bin"
+                    binary_dir.mkdir(parents=True, mode=0o777)
+                    interpreter = binary_dir / "python"
+                    descriptor = os.open(interpreter, os.O_CREAT | os.O_WRONLY, 0o777)
+                    os.close(descriptor)
+                if "compileall" in command:
+                    cache = root / "release/src/pkg/__pycache__"
+                    cache.mkdir(parents=True, mode=0o777)
+                    os.close(
+                        os.open(cache / "module.pyc", os.O_CREAT | os.O_WRONLY, 0o666)
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            release = root / "release"
+            previous_umask = os.umask(0o077)
+            try:
+                original_stat = Path.stat
+
+                def root_owned_stat(path, *, follow_symlinks=True):
+                    result = original_stat(path, follow_symlinks=follow_symlinks)
+                    return SimpleNamespace(st_uid=0, st_gid=0, st_mode=result.st_mode)
+
+                with (
+                    patch.object(production_install, "_require_supported_runtime"),
+                    patch.object(
+                        production_install.subprocess, "run", side_effect=fake_run
+                    ),
+                    patch.object(production_install.os, "chown"),
+                    patch.object(Path, "stat", root_owned_stat),
+                ):
+                    production_install._install_release(
+                        root, release, os.getuid(), os.getgid(), "a" * 40
+                    )
+                observed_umask = os.umask(0o022)
+                os.umask(observed_umask)
+                self.assertEqual(observed_umask, 0o077)
+                self.assertEqual(
+                    stat.S_IMODE((release / ".venv").stat().st_mode), 0o755
+                )
+                self.assertEqual(
+                    stat.S_IMODE((release / ".venv/bin/python").stat().st_mode),
+                    0o755,
+                )
+                self.assertEqual(
+                    stat.S_IMODE(
+                        (release / "src/pkg/__pycache__/module.pyc").stat().st_mode
+                    ),
+                    0o644,
+                )
+            finally:
+                os.umask(previous_umask)
+
+    def test_release_build_restores_umask_after_failure(self) -> None:
+        previous_umask = os.umask(0o077)
+        try:
+            with patch.object(
+                production_install,
+                "_install_release_impl",
+                side_effect=InstallError("synthetic failure"),
+            ):
+                with self.assertRaises(InstallError):
+                    production_install._install_release(
+                        Path("/synthetic/repo"),
+                        Path("/synthetic/release"),
+                        os.getuid(),
+                        os.getgid(),
+                        "a" * 40,
+                    )
+            observed_umask = os.umask(0o022)
+            os.umask(observed_umask)
+            self.assertEqual(observed_umask, 0o077)
+        finally:
+            os.umask(previous_umask)
+
+    def test_child_failure_reports_safe_executable_and_exit_code(self) -> None:
+        failure = subprocess.CalledProcessError(
+            1,
+            ["/usr/bin/python3.14", "-m", "pip"],
+            stderr="secret-token /etc/private/config",
+        )
+        with patch(
+            "deploy.production_install.subprocess.run", side_effect=failure
+        ) as run:
+            with self.assertRaises(InstallError) as raised:
+                production_install._run(["/usr/bin/python3.14", "-m", "pip"])
+
+        self.assertEqual(
+            str(raised.exception), "installation command failed: python3.14 (exit 1)"
+        )
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertNotIn("/etc/private/config", str(raised.exception))
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_installer_disables_source_tree_bytecode_writes(self) -> None:
+        self.assertTrue(production_install.sys.dont_write_bytecode)
+
     def test_upgrade_requires_units_confirmed_stopped_and_disabled(self) -> None:
         stopped = SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
         disabled = SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
@@ -213,9 +335,7 @@ class ProductionInstallTests(unittest.TestCase):
                 patch.object(production_install, "_check_repository"),
                 patch.object(production_install, "validate_inputs"),
                 patch.object(production_install, "_require_supported_runtime"),
-                patch.object(
-                    production_install, "_assert_units_stopped_and_disabled"
-                ),
+                patch.object(production_install, "_assert_units_stopped_and_disabled"),
                 patch.object(
                     production_install.pwd,
                     "getpwnam",
@@ -335,7 +455,7 @@ class ProductionInstallTests(unittest.TestCase):
                     "git",
                     "init",
                     "--quiet",
-                    "--initial-branch=release/v1.1.4",
+                    "--initial-branch=release/v2.0.0",
                     str(repo),
                 ],
                 check=True,
@@ -553,9 +673,7 @@ class ProductionInstallTests(unittest.TestCase):
             database = root / "private.sqlite3"
             _create_preflight_database(database)
             self.assertFalse(
-                preflight.database_is_ready(
-                    database, expected_owner=os.getuid() + 1
-                )
+                preflight.database_is_ready(database, expected_owner=os.getuid() + 1)
             )
             database.chmod(0o640)
             self.assertFalse(preflight.database_is_ready(database))
@@ -570,10 +688,7 @@ class ProductionInstallTests(unittest.TestCase):
     def test_installed_preflight_copy_keeps_empty_database_fix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = (
-                Path(__file__).parents[1]
-                / "deploy/systemd/armory-db-preflight.py"
-            )
+            source = Path(__file__).parents[1] / "deploy/systemd/armory-db-preflight.py"
             destination = root / "bin/armory-db-preflight"
             destination.parent.mkdir()
             temporary_copy = destination.with_name(".armory-db-preflight.installing")
