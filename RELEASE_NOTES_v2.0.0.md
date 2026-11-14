@@ -17,6 +17,8 @@ review. This candidate is not deployed, pushed, or tagged.
   deployment journal.
 - Includes the verified production wrapper source and validates its release
   pin from a root-owned mode `0600` policy file.
+- Uses a reviewed setuptools 84.1.0 build-backend pin with a verified wheel
+  hash; runtime dependencies were not changed by the audit.
 
 ## Compatibility and data
 

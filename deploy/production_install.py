@@ -447,6 +447,29 @@ def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
                     category="release_permissions_rejected",
                 )
 
+    # The generic walk only requires execute permission when a file already
+    # carries an execute bit. Explicitly validate the venv interpreter so a
+    # completed marker cannot make a non-executable Python pass reuse checks.
+    interpreter = release / ".venv/bin/python"
+    try:
+        info = interpreter.stat()
+    except OSError as exc:
+        raise InstallError(
+            "release Python interpreter is unavailable",
+            category="release_permissions_rejected",
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not _permits(info, uid, gid, 0o4)
+        or not _permits(info, uid, gid, 0o1)
+    ):
+        raise InstallError(
+            "service account cannot read and execute release Python",
+            category="release_permissions_rejected",
+        )
+
 
 def _validate_logo_asset(path: Path, service_uid: int, service_gid: int) -> None:
     if path.is_symlink() or not path.is_file():

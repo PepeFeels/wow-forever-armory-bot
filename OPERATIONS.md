@@ -152,6 +152,211 @@ guarantee a working service. If compatibility is uncertain or fails, leave the
 service stopped and disabled while preparing a corrected compatible release.
 Never restore an older database snapshot merely to solve a code-startup failure.
 
+### Read-only preflight before manual recovery
+
+The wrapper deliberately does not switch `current` back automatically after a
+failure once shutdown has started. It leaves both managed units stopped and
+disabled and records `manual_recovery_required`. Before an administrator
+chooses a recovery action, run the checks below. They inspect the journal, pin,
+manifest, current pointer, previous release, database signature, backup hash,
+and preserved preflight. They do not clear or rewrite audit files, change the
+pointer, restore a database, or change service state. The SQLite snapshot check
+uses a temporary private copy under `/tmp` and removes only that temporary
+copy.
+
+Run this read-only metadata check as root. It accepts `current` pointing either
+to the previous release or to v2.0.0, covering a failure after the installer has
+already switched the pointer. It stops on any mismatch:
+
+```bash
+sudo /usr/bin/python3.14 -I -B - <<'PY'
+import grp, hashlib, json, os, pwd, re, stat
+from pathlib import Path
+import sys
+
+root = Path("/var/lib/armory-deployment-audit")
+pin_path = Path("/etc/wow-forever-armory-bot/deployment-pin.json")
+journal_path = root / "deployment-state.json"
+base = Path("/opt/wow-forever-armory-bot")
+releases = base / "releases"
+current = base / "current"
+state = Path("/var/lib/wow-forever-armory-bot")
+database = state / "guild-armory.sqlite3"
+backups = state / "backups"
+
+def read_private_json(path, owner, mode):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == owner
+        assert stat.S_IMODE(info.st_mode) == mode and info.st_size <= 65536
+        raw = os.read(fd, 65537)
+    finally:
+        os.close(fd)
+    assert len(raw) <= 65536
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            assert key not in result, "duplicate JSON key"
+            result[key] = value
+        return result
+    return json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+
+def regular(path, owner, group, mode):
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == owner
+    assert info.st_gid == group and stat.S_IMODE(info.st_mode) == mode
+    return info
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+audit_info = root.lstat()
+assert stat.S_ISDIR(audit_info.st_mode) and audit_info.st_uid == 0
+assert stat.S_IMODE(audit_info.st_mode) == 0o700
+
+def service_has(mode, uid, gid, bit):
+    if uid == service_uid:
+        return bool(mode & (bit << 6))
+    if gid == service_gid:
+        return bool(mode & (bit << 3))
+    return bool(mode & bit)
+
+service_uid = pwd.getpwnam("wow-armory").pw_uid
+service_gid = grp.getgrnam("wow-armory").gr_gid
+
+def verify_release(path):
+    assert path.is_dir() and not path.is_symlink()
+    for directory, children, files in os.walk(path, followlinks=False):
+        for item in [Path(directory), *(Path(directory) / name for name in children)]:
+            if item.is_symlink():
+                continue
+            info = item.stat()
+            assert info.st_uid == 0 and not info.st_mode & 0o022
+            assert service_has(info.st_mode, service_uid, service_gid, 0o1)
+        for name in files:
+            item = Path(directory) / name
+            if item.is_symlink():
+                continue
+            info = item.stat()
+            assert info.st_uid == 0 and not info.st_mode & 0o022
+            assert service_has(info.st_mode, service_uid, service_gid, 0o4)
+            if info.st_mode & 0o111:
+                assert service_has(info.st_mode, service_uid, service_gid, 0o1)
+    interpreter = path / ".venv/bin/python"
+    info = interpreter.stat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0
+    assert not info.st_mode & 0o022
+    assert service_has(info.st_mode, service_uid, service_gid, 0o4)
+    assert service_has(info.st_mode, service_uid, service_gid, 0o1)
+
+pin = read_private_json(pin_path, 0, 0o600)
+journal = read_private_json(journal_path, 0, 0o600)
+assert set(pin) == {"release_sha", "previous_sha", "installer_sha256"}
+assert re.fullmatch(r"[0-9a-f]{40}", pin["release_sha"])
+assert re.fullmatch(r"[0-9a-f]{40}", pin["previous_sha"])
+assert re.fullmatch(r"[0-9a-f]{64}", pin["installer_sha256"])
+approved = pin["release_sha"]
+previous = pin["previous_sha"]
+assert journal["approved_release_sha"] == approved
+assert journal["previous_release_sha"] == previous
+assert journal["phase"] in {
+    "shutdown_started", "installer_started", "installer_returned",
+    "release_verified", "state_restoration_started", "manual_recovery_required",
+}
+assert current.is_symlink(), "current is not an approved release symlink"
+target = current.resolve(strict=True)
+previous_path = releases / previous
+approved_path = releases / approved
+assert target in {previous_path, approved_path}, "current points elsewhere"
+verify_release(previous_path)
+if target != previous_path:
+    verify_release(target)
+
+previous_marker = regular(previous_path / ".installation-complete", 0, 0, 0o444)
+assert (previous_path / ".installation-complete").read_text("ascii") == previous
+regular(target / ".installation-complete", 0, 0, 0o444)
+assert (target / ".installation-complete").read_text("ascii") == target.name
+
+db_info = regular(database, service_uid, service_gid, 0o600)
+signature = [db_info.st_dev, db_info.st_ino, db_info.st_size,
+             db_info.st_mtime_ns, db_info.st_ctime_ns, db_info.st_uid,
+             db_info.st_gid, db_info.st_mode]
+assert signature == journal["database_signature"], "database changed since shutdown"
+
+backup = Path(journal["database_backup"])
+assert backup.parent == backups and backup.name.startswith("guild-armory-")
+assert backup.suffix == ".sqlite3"
+regular(backup, service_uid, service_gid, 0o600)
+assert digest(backup) == journal["database_backup_sha256"]
+
+manifest_path = Path(journal["manifest"])
+assert manifest_path == root / f"deployment-{approved}.json"
+manifest = read_private_json(manifest_path, 0, 0o600)
+assert manifest["approved_release_sha"] == approved
+assert manifest["previous_release_sha"] == previous
+assert manifest["database_backup"] == str(backup)
+assert manifest["database_backup_sha256"] == journal["database_backup_sha256"]
+
+saved_preflight = Path(journal["shared_preflight_backup"])
+assert saved_preflight == root / f"armory-db-preflight.{previous}.py"
+regular(saved_preflight, 0, 0, 0o700)
+assert digest(saved_preflight) == journal["shared_preflight_sha256"]
+assert manifest["shared_preflight_backup"] == str(saved_preflight)
+assert manifest["shared_preflight_sha256"] == journal["shared_preflight_sha256"]
+
+sys.path.insert(0, "/opt/wow-forever-armory-bot/deployment-checkout")
+from deploy.production_db_snapshot import verify_database_snapshot
+verify_database_snapshot(database, expected_owner=service_uid, expected_group=service_gid)
+verify_database_snapshot(backup, expected_owner=service_uid, expected_group=service_gid)
+print(f"Metadata preflight passed; phase={journal['phase']}; current={target.name}; previous={previous}")
+PY
+```
+
+Then use the previous release's installed Python to run its read-only SQLite
+integrity check against both the live database and the verified backup. Replace
+`<PREVIOUS_SHA>` with the value checked against the pin above:
+
+```bash
+sudo -u wow-armory /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA>/.venv/bin/python -I -B -m wow_forever_armory.operations check --database /var/lib/wow-forever-armory-bot/guild-armory.sqlite3
+sudo -u wow-armory /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA>/.venv/bin/python -I -B -m wow_forever_armory.operations check --database /var/lib/wow-forever-armory-bot/backups/<BACKUP_NAME>
+sudo systemctl is-active wow-forever-armory-bot.service
+sudo systemctl is-enabled wow-forever-armory-bot.service
+sudo systemctl is-active wow-forever-armory-backup.timer
+sudo systemctl is-enabled wow-forever-armory-backup.timer
+sudo systemctl is-active wow-forever-armory-backup.service
+```
+
+The service and timer must already be inactive and disabled, and the backup
+service inactive. These `systemctl` commands only query state. If any check
+fails, do not change `current`, restore a database, clear the journal, or delete
+evidence; keep the system stopped and investigate the mismatch.
+
+If every check passes and a separate recovery approval is given, preserve the
+journal, manifest, backup, both release directories, and the compatible shared
+preflight. If `current` still points to v2.0.0, an administrator may atomically
+repoint it to the validated previous release with a new temporary symlink and
+same-filesystem rename. After separately approved authorization, and only after
+confirming the temporary name is unused:
+
+```bash
+sudo ln -s /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA> \
+  /opt/wow-forever-armory-bot/.current.recovery
+sudo mv -T /opt/wow-forever-armory-bot/.current.recovery \
+  /opt/wow-forever-armory-bot/current
+sudo readlink -e /opt/wow-forever-armory-bot/current
+```
+
+If `current` already points to the previous release, do not switch it again.
+Do not replace the database with the backup for a code-only failure. Keep
+services stopped until a separate activation decision.
+The pending journal is evidence and continues to block another deployment;
+archive or resolve it only under a separately reviewed recovery procedure.
+
 To deactivate in an approved rollback, stop and disable both units while
 retaining the database and backups:
 

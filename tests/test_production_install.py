@@ -552,6 +552,151 @@ class ProductionInstallTests(unittest.TestCase):
                 _install_release(repo, release, os.getuid(), os.getgid(), "a" * 40)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve this file")
 
+    def _make_completed_release(self, root: Path, release_sha: str) -> Path:
+        release = root / "releases" / release_sha
+        interpreter = release / ".venv/bin/python"
+        interpreter.parent.mkdir(parents=True, mode=0o750)
+        interpreter.write_bytes(b"python fixture")
+        interpreter.chmod(0o750)
+        payload = release / "src/package.py"
+        payload.parent.mkdir(parents=True, mode=0o750)
+        payload.write_bytes(b"preserved release data")
+        payload.chmod(0o640)
+        marker = release / ".installation-complete"
+        marker.write_text(release_sha, encoding="ascii")
+        marker.chmod(0o440)
+        for directory in (
+            release,
+            release / ".venv",
+            interpreter.parent,
+            payload.parent,
+        ):
+            directory.chmod(0o750)
+        return release
+
+    def _root_owned_release_stat(self, service_gid: int, overrides=None):
+        original_stat = Path.stat
+        overrides = overrides or {}
+
+        def root_owned_stat(path, *, follow_symlinks=True):
+            result = original_stat(path, follow_symlinks=follow_symlinks)
+            uid, gid, mode = overrides.get(path, (0, service_gid, result.st_mode))
+            return SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=mode)
+
+        return root_owned_stat
+
+    def test_completed_release_is_reused_without_rebuilding_or_changing_data(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release_sha = "a" * 40
+            release = self._make_completed_release(root, release_sha)
+            before = {
+                path.relative_to(release): path.read_bytes()
+                for path in release.rglob("*")
+                if path.is_file()
+            }
+            service_uid = os.getuid() + 1000
+            service_gid = os.getgid() + 1000
+            with (
+                patch.object(production_install, "_require_supported_runtime"),
+                patch.object(
+                    Path,
+                    "stat",
+                    self._root_owned_release_stat(service_gid),
+                ),
+                patch.object(production_install.subprocess, "run") as run,
+            ):
+                production_install._install_release_impl(
+                    root, release, service_uid, service_gid, release_sha
+                )
+            after = {
+                path.relative_to(release): path.read_bytes()
+                for path in release.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+            run.assert_not_called()
+
+    def test_completed_release_with_invalid_marker_is_preserved_and_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release_sha = "b" * 40
+            release = self._make_completed_release(root, release_sha)
+            marker = release / ".installation-complete"
+            marker.chmod(0o600)
+            marker.write_text("c" * 40, encoding="ascii")
+            marker.chmod(0o440)
+            payload = release / "src/package.py"
+            payload_before = payload.read_bytes()
+            service_gid = os.getgid() + 1000
+            with (
+                patch.object(production_install, "_require_supported_runtime"),
+                patch.object(
+                    Path,
+                    "stat",
+                    self._root_owned_release_stat(service_gid),
+                ),
+            ):
+                with self.assertRaisesRegex(InstallError, "mismatched marker"):
+                    production_install._install_release_impl(
+                        root, release, os.getuid() + 1000, service_gid, release_sha
+                    )
+            self.assertEqual(payload.read_bytes(), payload_before)
+            self.assertEqual(marker.read_text(encoding="ascii"), "c" * 40)
+
+    def test_completed_release_reuse_enforces_owner_read_and_execute_permissions(
+        self,
+    ) -> None:
+        service_uid = os.getuid() + 1000
+        service_gid = os.getgid() + 1000
+        cases = ("ownership", "readability", "execution")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                release_sha = "d" * 40
+                release = self._make_completed_release(root, release_sha)
+                payload = release / "src/package.py"
+                interpreter = release / ".venv/bin/python"
+                overrides = {}
+                if case == "ownership":
+                    overrides[payload] = (
+                        service_uid + 1,
+                        service_gid,
+                        payload.stat().st_mode,
+                    )
+                    message = "release file ownership or mode is unsafe"
+                elif case == "readability":
+                    overrides[payload] = (
+                        0,
+                        service_gid,
+                        stat.S_IFREG | 0o600,
+                    )
+                    message = "service account cannot read release file"
+                else:
+                    overrides[interpreter] = (
+                        0,
+                        service_gid,
+                        stat.S_IFREG | 0o640,
+                    )
+                    message = "cannot read and execute release Python"
+                with (
+                    patch.object(production_install, "_require_supported_runtime"),
+                    patch.object(
+                        Path,
+                        "stat",
+                        self._root_owned_release_stat(service_gid, overrides),
+                    ),
+                ):
+                    with self.assertRaisesRegex(InstallError, message):
+                        production_install._install_release_impl(
+                            root, release, service_uid, service_gid, release_sha
+                        )
+                self.assertEqual(payload.read_bytes(), b"preserved release data")
+
     def test_dependency_locks_pin_every_dependency_and_hash(self) -> None:
         root = Path(__file__).parents[1] / "deploy"
         for name in ("requirements-build.lock", "requirements-runtime.lock"):

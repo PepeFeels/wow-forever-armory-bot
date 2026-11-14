@@ -10,6 +10,8 @@ the existing SQLite schema, configuration, credential interface, and
 multi-guild Armory behavior. It has not been deployed, pushed, or tagged.
 
 - Package version and installer branch are `2.0.0` and `release/v2.0.0`.
+- Pins the build backend to setuptools 84.1.0 after an isolated vulnerability
+  audit identified advisories in the previous build-only pin.
 - Installer ancestry checkpoint is the reviewed graphics release
   `a1a6a2ad95302f7e3c4900f18e91691f43631e18`.
 - The wrapper reads release and installer hashes from a root-owned mode `0600`
