@@ -152,6 +152,48 @@ guarantee a working service. If compatibility is uncertain or fails, leave the
 service stopped and disabled while preparing a corrected compatible release.
 Never restore an older database snapshot merely to solve a code-startup failure.
 
+### Read-only v2.0.0 production preflight
+
+Before a separately approved deployment window, an administrator may run the
+candidate's standalone `deploy/production_preflight.py` to collect a read-only
+report. First verify the candidate's reviewed commit and clean working tree.
+Review the script source and its SHA-256 before running it with elevated
+privileges; it reads protected metadata, so do not run an unreviewed copy.
+
+```bash
+git -C /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate status --short --branch
+git -C /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate rev-parse HEAD
+sha256sum /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate/deploy/production_preflight.py
+sudo /usr/bin/python3.14 -I -B \
+  /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate/deploy/production_preflight.py
+```
+
+The script reports `PASS`, `FAIL`, or `UNKNOWN` for each check. Exit code 0
+means no failures or unknowns; 1 means at least one failure; 2 means there is
+at least one unknown and no failure. Any nonzero result is diagnostic only:
+the script never repairs a problem. Do not treat a report as deployment
+authorization.
+
+The script checks candidate and protected production checkout Git identity,
+Python 3.14 and x86_64, the `wow-armory` account, pinned release identity,
+`current` and the previous release marker, unit states, protected file
+metadata, installed wrapper/installer/preflight/unit/launcher hashes, the
+failed v1.1.4 journal and manifest, and whether the v2 target directory
+already exists. It does not read the configuration or Discord credential
+contents and does not print environment variables. It uses only `git` read
+queries and `systemctl is-active`/`is-enabled` queries.
+
+The database and newest backup are opened with SQLite `mode=ro&immutable=1`
+and `PRAGMA query_only=ON`. This does not create SQLite shared-memory files.
+If the bot or backup service is an active writer, or a database has WAL, SHM,
+or rollback-journal sidecars, integrity is reported as `UNKNOWN`: the preflight
+will not inspect a changing database, and immutable mode cannot include
+uncheckpointed WAL content safely.
+The preflight does not copy, checkpoint, restore, or otherwise change database
+or backup files. Resolve an unknown result with a separately reviewed
+read-only procedure; do not change service or database state as part of this
+preflight.
+
 ### Read-only preflight before manual recovery
 
 The wrapper deliberately does not switch `current` back automatically after a
