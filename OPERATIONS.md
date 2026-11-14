@@ -157,22 +157,44 @@ Never restore an older database snapshot merely to solve a code-startup failure.
 Before a separately approved deployment window, an administrator may run the
 candidate's standalone `deploy/production_preflight.py` to collect a read-only
 report. First verify the candidate's reviewed commit and clean working tree.
-Review the script source and its SHA-256 before running it with elevated
-privileges; it reads protected metadata, so do not run an unreviewed copy.
+The script requires an explicit expected candidate SHA and checks both the
+branch ref and `HEAD` against it.
+
+Do not run it as root directly from a developer-owned checkout. Root execution
+is allowed only from a reviewed copy in a root-owned, non-group/world-writable
+directory, and the candidate checkout it inspects must also be root-owned and
+write-protected. The script checks those conditions before running Git or
+reading production state. Git status and worktree inspection run only after
+the candidate tree is verified as root-owned and the exact `HEAD` and branch
+ref match the expected SHA; the script rejects local Git filter/include
+settings before checking worktree cleanliness. Stage both copies only under a
+separately approved administrator procedure; this documentation does not
+authorize changing production paths.
+
+For this reviewed candidate, the script SHA-256 is
+`612d6ec2c3915aec344395640839b5be6374e5dc44188febf1b6009c06a5d92c`. Compare
+the staged copy's hash with this value before the root-controlled run.
 
 ```bash
-git -C /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate status --short --branch
-git -C /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate rev-parse HEAD
-sha256sum /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate/deploy/production_preflight.py
+git -C <ROOT_OWNED_CANDIDATE_CHECKOUT> status --short --branch
+git -C <ROOT_OWNED_CANDIDATE_CHECKOUT> rev-parse HEAD
+sha256sum <ROOT_OWNED_REVIEWED_COPY>/production_preflight.py
 sudo /usr/bin/python3.14 -I -B \
-  /home/codex-dev/projects/wow-forever-armory-bot-v2-candidate/deploy/production_preflight.py
+  <ROOT_OWNED_REVIEWED_COPY>/production_preflight.py \
+  --candidate <ROOT_OWNED_CANDIDATE_CHECKOUT> \
+  --expected-candidate-sha <FULL_REVIEWED_CANDIDATE_SHA>
 ```
 
-The script reports `PASS`, `FAIL`, or `UNKNOWN` for each check. Exit code 0
-means no failures or unknowns; 1 means at least one failure; 2 means there is
-at least one unknown and no failure. Any nonzero result is diagnostic only:
-the script never repairs a problem. Do not treat a report as deployment
-authorization.
+The report separates **Current production health** from **v2.0.0 deployment
+prerequisites**. Missing v2.0.0 pins, checkout state, helper files, and target
+artifacts are `UNKNOWN` while they have not been provisioned; they are not
+reported as damage to the existing bot. Existing production health findings
+such as a missing database or invalid current release remain `FAIL`.
+
+Each check reports `PASS`, `FAIL`, or `UNKNOWN`. Exit code 0 means no failures
+or unknowns; 1 means at least one failure; 2 means there is at least one
+unknown and no failure. Any nonzero result is diagnostic only: the script
+never repairs a problem. Do not treat a report as deployment authorization.
 
 The script checks candidate and protected production checkout Git identity,
 Python 3.14 and x86_64, the `wow-armory` account, pinned release identity,
@@ -183,12 +205,14 @@ already exists. It does not read the configuration or Discord credential
 contents and does not print environment variables. It uses only `git` read
 queries and `systemctl is-active`/`is-enabled` queries.
 
-The database and newest backup are opened with SQLite `mode=ro&immutable=1`
-and `PRAGMA query_only=ON`. This does not create SQLite shared-memory files.
-If the bot or backup service is an active writer, or a database has WAL, SHM,
-or rollback-journal sidecars, integrity is reported as `UNKNOWN`: the preflight
-will not inspect a changing database, and immutable mode cannot include
-uncheckpointed WAL content safely.
+The database descriptor is opened with `O_RDONLY` and `O_NOFOLLOW`; SQLite
+checks use that already-open descriptor and run as the `wow-armory` account.
+The connection uses `mode=ro&immutable=1` and `PRAGMA query_only=ON` only when
+the writer service is confirmed inactive and no sidecars are present. This
+does not create SQLite shared-memory files. If the bot or backup service is an
+active writer, or a database has WAL, SHM, or rollback-journal sidecars,
+integrity is reported as `UNKNOWN`: the preflight will not inspect a changing
+database, and immutable mode cannot include uncheckpointed WAL content safely.
 The preflight does not copy, checkpoint, restore, or otherwise change database
 or backup files. Resolve an unknown result with a separately reviewed
 read-only procedure; do not change service or database state as part of this

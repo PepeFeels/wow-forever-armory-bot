@@ -43,6 +43,33 @@ BACKUP_TIMER = "wow-forever-armory-backup.timer"
 BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
+SYSTEM_PYTHON = "/usr/bin/python3.14"
+SQLITE_READONLY_CHECK = r"""
+import sqlite3, sys
+uri = f"file:/proc/self/fd/{sys.argv[1]}?mode=ro&immutable=1"
+try:
+    with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    print("PASS" if integrity == ("ok",) and
+          {"guilds", "members", "characters", "flows"} <= tables else "FAIL")
+except sqlite3.Error:
+    print("FAIL")
+"""
+GROUPS = {
+    "preflight_execution_source": "Preflight safety",
+    "python_and_architecture": "Preflight safety",
+    "candidate_git": "v2.0.0 deployment prerequisites",
+    "candidate_checkout": "v2.0.0 deployment prerequisites",
+    "production_checkout": "v2.0.0 deployment prerequisites",
+    "deployment_pin": "v2.0.0 deployment prerequisites",
+    "installed_helper_hashes": "v2.0.0 deployment prerequisites",
+    "v2_target_release": "v2.0.0 deployment prerequisites",
+    "deployment_recovery_ack": "v2.0.0 deployment prerequisites",
+    "failed_v1_1_4_manifest": "v2.0.0 deployment prerequisites",
+}
 CHILD_ENV = {
     "HOME": "/nonexistent",
     "LANG": "C.UTF-8",
@@ -58,6 +85,7 @@ CHILD_ENV = {
 
 @dataclass(frozen=True)
 class Result:
+    group: str
     status: str
     detail: str
 
@@ -65,8 +93,9 @@ class Result:
 class Preflight:
     """Collect fixed, non-sensitive diagnostics from production paths."""
 
-    def __init__(self, candidate: Path) -> None:
+    def __init__(self, candidate: Path, expected_candidate_sha: str) -> None:
         self.candidate = candidate
+        self.expected_candidate_sha = expected_candidate_sha
         self.checks: dict[str, Result] = {}
         self.pin: dict[str, str] | None = None
         self.service_uid: int | None = None
@@ -74,8 +103,47 @@ class Preflight:
         self.unit_states: dict[str, tuple[str, str]] = {}
         self.unit_states_checked = False
 
-    def add(self, name: str, status: str, detail: str) -> None:
-        self.checks[name] = Result(status, detail)
+    def add(
+        self,
+        name: str,
+        status: str,
+        detail: str,
+        *,
+        group: str = "Current production health",
+    ) -> None:
+        self.checks[name] = Result(GROUPS.get(name, group), status, detail)
+
+    @staticmethod
+    def _trusted_execution_source() -> bool:
+        """Reject root execution from a developer-writable source path."""
+        if os.geteuid() != 0:
+            return False
+        source = Path(__file__).absolute()
+        try:
+            info = source.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_mode & 0o022
+            ):
+                return False
+            parent = source.parent
+            while True:
+                parent_info = parent.lstat()
+                if (
+                    stat.S_ISLNK(parent_info.st_mode)
+                    or not stat.S_ISDIR(parent_info.st_mode)
+                    or parent_info.st_uid != 0
+                    or parent_info.st_mode & 0o022
+                ):
+                    return False
+                if parent == parent.parent:
+                    break
+                parent = parent.parent
+            return True
+        except OSError:
+            return False
 
     @staticmethod
     def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -113,13 +181,30 @@ class Preflight:
         )
 
     @staticmethod
+    def _walk_error(error: OSError) -> None:
+        raise error
+
+    @staticmethod
     def _trusted_checkout_tree(path: Path) -> bool:
         try:
+            if not path.is_absolute() or path.resolve(strict=True) != path:
+                return False
+            for parent in path.parents:
+                parent_info = parent.lstat()
+                if (
+                    stat.S_ISLNK(parent_info.st_mode)
+                    or not stat.S_ISDIR(parent_info.st_mode)
+                    or parent_info.st_uid != 0
+                    or parent_info.st_mode & 0o022
+                ):
+                    return False
             marker = path / ".git"
             marker_info = marker.lstat()
             if not stat.S_ISDIR(marker_info.st_mode):
                 return False
-            for directory, names, files in os.walk(path, followlinks=False):
+            for directory, names, files in os.walk(
+                path, followlinks=False, onerror=Preflight._walk_error
+            ):
                 for item in [
                     Path(directory),
                     *(Path(directory) / name for name in names + files),
@@ -137,6 +222,29 @@ class Preflight:
             return True
         except OSError:
             return False
+
+    def _git_config_is_safe(self, path: Path) -> bool:
+        result = self._git(
+            path, "config", "--local", "--no-includes", "--name-only", "--list"
+        )
+        if result.returncode != 0:
+            return False
+        unsafe_prefixes = ("filter.", "include.", "includeif.")
+        for raw_key in result.stdout.splitlines():
+            key = raw_key.strip().lower()
+            if (
+                key.startswith(unsafe_prefixes)
+                or key
+                in {
+                    "core.attributesfile",
+                    "core.excludesfile",
+                    "extensions.worktreeconfig",
+                }
+                or key == "diff.external"
+                or (key.startswith("diff.") and key.endswith(".textconv"))
+            ):
+                return False
+        return True
 
     @staticmethod
     def _secure_json(path: Path, *, owner: int, mode: int) -> dict[str, Any]:
@@ -214,19 +322,56 @@ class Preflight:
 
     def candidate_git(self) -> None:
         try:
+            if not re.fullmatch(r"[0-9a-f]{40}", self.expected_candidate_sha):
+                self.add(
+                    "candidate_git",
+                    "FAIL",
+                    "an explicit full expected candidate SHA is required",
+                )
+                return
+            if not self._trusted_checkout_tree(self.candidate):
+                self.add(
+                    "candidate_git",
+                    "FAIL",
+                    "candidate checkout is not root-owned and write-protected",
+                )
+                return
             branch = self._git(self.candidate, "branch", "--show-current")
             head = self._git(self.candidate, "rev-parse", "HEAD")
+            ref = self._git(self.candidate, "rev-parse", f"refs/heads/{BRANCH}")
+            if any(item.returncode for item in (branch, head, ref)):
+                raise ValueError
+            candidate_sha = head.stdout.strip()
+            if (
+                branch.stdout.strip() != BRANCH
+                or ref.stdout.strip() != self.expected_candidate_sha
+                or candidate_sha != self.expected_candidate_sha
+            ):
+                self.add(
+                    "candidate_git",
+                    "FAIL",
+                    "candidate branch or commit differs from the explicit expected SHA",
+                )
+                return
+            if not self._git_config_is_safe(self.candidate):
+                self.add(
+                    "candidate_git",
+                    "FAIL",
+                    "candidate Git config contains an external filter or include",
+                )
+                return
             status = self._git(
                 self.candidate, "status", "--porcelain", "--untracked-files=all"
             )
-            if any(item.returncode for item in (branch, head, status)):
+            if status.returncode != 0:
                 raise ValueError
-            if branch.stdout.strip() != BRANCH or status.stdout:
+            if status.stdout:
                 self.add(
-                    "candidate_git", "FAIL", "candidate branch or worktree is not clean"
+                    "candidate_git",
+                    "FAIL",
+                    "candidate worktree is not clean",
                 )
                 return
-            candidate_sha = head.stdout.strip()
             if not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
                 raise ValueError
             self.add("candidate_git", "PASS", f"clean {BRANCH} at {candidate_sha}")
@@ -281,6 +426,12 @@ class Preflight:
                 "PASS",
                 "root-owned private pin is valid; credential values were not read",
             )
+        except FileNotFoundError:
+            self.add(
+                "deployment_pin",
+                "UNKNOWN",
+                "v2.0.0 deployment pin has not been provisioned",
+            )
         except OSError, ValueError, KeyError, TypeError:
             self.add(
                 "deployment_pin",
@@ -293,44 +444,142 @@ class Preflight:
     ) -> tuple[str | None, bool]:
         label = "candidate_checkout" if candidate else "production_checkout"
         try:
-            if not candidate and not self._trusted_checkout_tree(path):
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                status = "FAIL" if candidate else "UNKNOWN"
+                detail = (
+                    "reviewed candidate checkout is missing"
+                    if candidate
+                    else "v2.0.0 production checkout has not been provisioned"
+                )
+                self.add(label, status, detail)
+                return None, False
+            if not self._trusted_checkout_tree(path):
                 self.add(
                     label,
                     "FAIL",
-                    "production checkout is not a root-owned, write-protected "
-                    "full Git clone",
+                    "checkout is not a root-owned, write-protected full Git clone",
                 )
                 return None, False
             root = self._git(path, "rev-parse", "--show-toplevel")
             branch = self._git(path, "branch", "--show-current")
             head = self._git(path, "rev-parse", "HEAD")
+            if not candidate and self.pin is None:
+                if any(item.returncode for item in (root, branch, head)):
+                    raise ValueError
+                branch_name = branch.stdout.strip()
+                head_sha = head.stdout.strip()
+                if (
+                    Path(root.stdout.strip()) != path
+                    or not branch_name
+                    or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                ):
+                    self.add(
+                        label,
+                        "UNKNOWN",
+                        "production checkout branch or commit is not available",
+                    )
+                    return None, False
+                current_ref = self._git(path, "rev-parse", f"refs/heads/{branch_name}")
+                if (
+                    current_ref.returncode != 0
+                    or current_ref.stdout.strip() != head_sha
+                ):
+                    self.add(
+                        label,
+                        "UNKNOWN",
+                        "production checkout branch identity is not verifiable",
+                    )
+                    return head_sha, False
+                if not self._git_config_is_safe(path):
+                    self.add(
+                        label,
+                        "FAIL",
+                        "checkout Git config contains an external filter or include",
+                    )
+                    return head_sha, False
+                worktree_status = self._git(
+                    path, "status", "--porcelain", "--untracked-files=all"
+                )
+                if worktree_status.returncode != 0:
+                    raise ValueError
+                if worktree_status.stdout:
+                    self.add(
+                        label,
+                        "FAIL",
+                        "production checkout has uncommitted changes",
+                    )
+                    return head_sha, False
+                self.add(
+                    label,
+                    "UNKNOWN",
+                    f"current production checkout is clean at {head_sha}; "
+                    "v2.0.0 pin is not provisioned",
+                )
+                return head_sha, False
             ref = self._git(path, "rev-parse", f"refs/heads/{BRANCH}")
-            status = self._git(path, "status", "--porcelain", "--untracked-files=all")
-            if any(item.returncode for item in (root, branch, head, ref, status)):
+            if any(item.returncode for item in (root, branch, head, ref)):
                 raise ValueError
             head_sha = head.stdout.strip()
-            clean = not status.stdout
-            expected = self.pin["release_sha"] if self.pin else None
-            branch_ref_matches = ref.stdout.strip() == head_sha
-            okay = (
+            identity_matches = (
                 Path(root.stdout.strip()) == path
                 and branch.stdout.strip() == BRANCH
                 and re.fullmatch(r"[0-9a-f]{40}", head_sha) is not None
-                and clean
-                and branch_ref_matches
-                and (expected is None or head_sha == expected)
+                and ref.stdout.strip() == head_sha
             )
+            expected = (
+                self.expected_candidate_sha
+                if candidate
+                else self.pin["release_sha"]
+                if self.pin
+                else None
+            )
+            if candidate:
+                identity_matches = identity_matches and head_sha == expected
+            elif expected is not None:
+                identity_matches = identity_matches and head_sha == expected
+            if not identity_matches:
+                self.add(
+                    label,
+                    "FAIL",
+                    "checkout branch or commit does not match its approved identity",
+                )
+                return head_sha, False
+            if not self._git_config_is_safe(path):
+                self.add(
+                    label,
+                    "FAIL",
+                    "checkout Git config contains an external filter or include",
+                )
+                return head_sha, False
             if candidate:
                 project = tomllib.loads(
                     (path / "pyproject.toml").read_text(encoding="utf-8")
                 )
-                okay = okay and project["project"]["version"] == "2.0.0"
-                cand_head = self._git(self.candidate, "rev-parse", "HEAD")
-                okay = (
-                    okay
-                    and cand_head.returncode == 0
-                    and head_sha == cand_head.stdout.strip()
+                if project["project"]["version"] != "2.0.0":
+                    self.add(
+                        label,
+                        "FAIL",
+                        "candidate package metadata is not version 2.0.0",
+                    )
+                    return head_sha, False
+            worktree_status = self._git(
+                path, "status", "--porcelain", "--untracked-files=all"
+            )
+            if worktree_status.returncode != 0:
+                raise ValueError
+            clean = not worktree_status.stdout
+            okay = clean
+            if not candidate and self.pin is None:
+                self.add(
+                    label,
+                    "FAIL" if not clean else "UNKNOWN",
+                    "production checkout has uncommitted changes"
+                    if not clean
+                    else "production v2.0.0 checkout/pin is not provisioned yet",
                 )
+                return head_sha, False
             self.add(
                 label,
                 "PASS" if okay else "FAIL",
@@ -380,46 +629,54 @@ class Preflight:
             )
 
     def release_pointer(self) -> None:
-        if not self.pin:
-            self.add(
-                "current_release",
-                "UNKNOWN",
-                "cannot compare current release without a valid pin",
-            )
-            return
-        previous = self.pin["previous_sha"]
+        previous = self.pin["previous_sha"] if self.pin else None
         current = BASE / "current"
         try:
             link = current.lstat()
             if not stat.S_ISLNK(link.st_mode):
                 raise ValueError
             target = current.resolve(strict=True)
-            expected = BASE / "releases" / previous
+            expected = BASE / "releases" / previous if previous else None
             marker = target / ".installation-complete"
             self._metadata(marker, owner=0, mode=0o444)
             value = marker.read_text(encoding="ascii").strip()
-            okay = target == expected and value == previous
+            if previous is None:
+                okay = (
+                    target.parent == BASE / "releases"
+                    and target.name == value
+                    and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+                )
+                detail = (
+                    "current release and marker are internally consistent; "
+                    "v2 previous SHA is not provisioned"
+                )
+            else:
+                okay = target == expected and value == previous
+                detail = (
+                    "current points to the pinned previous release"
+                    if okay
+                    else "current or its completion marker differs from the "
+                    "pinned previous release"
+                )
             self.add(
                 "current_release",
                 "PASS" if okay else "FAIL",
-                "current points to the pinned previous release"
-                if okay
-                else "current or its completion marker differs from the "
-                "pinned previous release",
+                detail,
             )
             if self.service_uid is None or self.service_gid is None:
                 raise ValueError
             safe_tree = True
-            for directory, children, files in os.walk(target, followlinks=False):
+            for directory, children, files in os.walk(
+                target, followlinks=False, onerror=self._walk_error
+            ):
                 for item in [
                     Path(directory),
                     *(Path(directory) / name for name in children),
                 ]:
-                    if item.is_symlink():
-                        continue
                     info = item.stat()
                     if (
-                        info.st_uid != 0
+                        not stat.S_ISDIR(info.st_mode)
+                        or info.st_uid != 0
                         or info.st_mode & 0o022
                         or not self._permits(
                             info, self.service_uid, self.service_gid, 0o1
@@ -428,11 +685,10 @@ class Preflight:
                         safe_tree = False
                 for name in files:
                     item = Path(directory) / name
-                    if item.is_symlink():
-                        continue
                     info = item.stat()
                     if (
-                        info.st_uid != 0
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != 0
                         or info.st_mode & 0o022
                         or not self._permits(
                             info, self.service_uid, self.service_gid, 0o4
@@ -635,6 +891,8 @@ class Preflight:
         )
 
     def database(self, path: Path, check_name: str) -> tuple[str, str]:
+        if check_name not in {"production_database", "latest_backup"}:
+            return "UNKNOWN", "database check identifier is not recognized"
         if self.service_uid is None or self.service_gid is None:
             return "UNKNOWN", "service account metadata is unavailable"
         if not self.unit_states_checked:
@@ -646,47 +904,85 @@ class Preflight:
                 "database has an active writer; preflight will not inspect a "
                 "changing SQLite file",
             )
+        descriptor: int | None = None
         try:
-            info = self._metadata(
-                path, owner=self.service_uid, group=self.service_gid, mode=0o600
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
             )
-            sidecars = [
-                Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")
-            ]
-            if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != self.service_uid
+                or before.st_gid != self.service_gid
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                return "FAIL", "database has unsafe type, owner, group, or permissions"
+            if self._sqlite_sidecars_exist(path):
                 return (
                     "UNKNOWN",
                     "SQLite sidecars exist; immutable read-only validation cannot "
                     "safely include them",
                 )
-            uri = path.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
-            with sqlite3.connect(uri, uri=True, timeout=2) as connection:
-                connection.execute("PRAGMA query_only=ON")
-                integrity = connection.execute("PRAGMA integrity_check").fetchone()
-                tables = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                }
-            after = path.stat()
-            signature_before = (
-                info.st_dev,
-                info.st_ino,
-                info.st_size,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
-            signature_after = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            if signature_before != signature_after:
+            if os.geteuid() == 0:
+                result = subprocess.run(
+                    [
+                        SYSTEM_PYTHON,
+                        "-I",
+                        "-B",
+                        "-c",
+                        SQLITE_READONLY_CHECK,
+                        str(descriptor),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="ascii",
+                    errors="ignore",
+                    env=CHILD_ENV,
+                    cwd="/",
+                    timeout=30,
+                    check=False,
+                    pass_fds=(descriptor,),
+                    user=self.service_uid,
+                    group=self.service_gid,
+                    extra_groups=(),
+                )
+            elif os.geteuid() == self.service_uid and os.getegid() == self.service_gid:
+                uri = f"file:/proc/self/fd/{descriptor}?mode=ro&immutable=1"
+                with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+                    connection.execute("PRAGMA query_only=ON")
+                    integrity = connection.execute("PRAGMA integrity_check").fetchone()
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                result = subprocess.CompletedProcess(
+                    ["sqlite-readonly-check"],
+                    0,
+                    "PASS"
+                    if integrity == ("ok",) and REQUIRED_TABLES <= tables
+                    else "FAIL",
+                    "",
+                )
+            else:
+                return (
+                    "UNKNOWN",
+                    "SQLite check cannot safely drop to the service account",
+                )
+            after = os.fstat(descriptor)
+            if self._file_signature(before) != self._file_signature(after):
                 return "UNKNOWN", "database changed while it was being inspected"
-            okay = integrity == ("ok",) and REQUIRED_TABLES <= tables
+            if self._sqlite_sidecars_exist(path):
+                return "UNKNOWN", "SQLite sidecars appeared during the read-only check"
+            if result.returncode != 0 or result.stdout.strip() not in {"PASS", "FAIL"}:
+                return "UNKNOWN", "read-only SQLite checker could not complete safely"
+            okay = result.stdout.strip() == "PASS"
             return (
                 (
                     "PASS",
@@ -701,6 +997,34 @@ class Preflight:
                 "database is missing, has unsafe permissions, or failed a "
                 "read-only integrity check",
             )
+        except subprocess.TimeoutExpired:
+            return "UNKNOWN", "read-only SQLite check timed out"
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _file_signature(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _sqlite_sidecars_exist(database: Path) -> bool:
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(database) + suffix)
+            try:
+                sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            return True
+        return False
 
     def database_checks(self) -> None:
         status, detail = self.database(
@@ -732,7 +1056,7 @@ class Preflight:
                 )
                 return
             latest = max(candidates, key=lambda item: item.stat().st_mtime_ns)
-            status, detail = self.database(latest)
+            status, detail = self.database(latest, "latest_backup")
             if status == "PASS":
                 journal = AUDIT / "deployment-state.json"
                 if journal.exists():
@@ -833,6 +1157,44 @@ class Preflight:
             )
 
     def run(self) -> dict[str, Result]:
+        if not self._trusted_execution_source():
+            status = "FAIL" if os.geteuid() == 0 else "UNKNOWN"
+            self.add(
+                "preflight_execution_source",
+                status,
+                "run only from a reviewed root-owned, non-group/world-writable "
+                "copy; developer-owned paths are refused",
+            )
+            for name in (
+                "candidate_git",
+                "python_and_architecture",
+                "service_account_and_group",
+                "deployment_pin",
+                "production_checkout",
+                "candidate_checkout",
+                "systemd_states",
+                "current_release",
+                "installed_release_permissions",
+                "protected_files",
+                "installed_helper_hashes",
+                "v2_target_release",
+                "production_database",
+                "latest_backup",
+                "deployment_recovery_ack",
+                "failed_v1_1_4_manifest",
+            ):
+                self.add(
+                    name,
+                    "UNKNOWN",
+                    "not inspected because execution source is not trusted",
+                )
+            return self.checks
+
+        self.add(
+            "preflight_execution_source",
+            "PASS",
+            "executing from a reviewed root-owned, non-group/world-writable copy",
+        )
         self.candidate_git()
         self.runtime()
         self.deployment_pin()
@@ -852,18 +1214,30 @@ def main() -> int:
     parser.add_argument(
         "--candidate",
         type=Path,
-        default=Path(__file__).resolve().parents[1],
-        help="candidate checkout containing this script (default: script's repository)",
+        required=True,
+        help="root-owned, read-only candidate checkout to inspect",
+    )
+    parser.add_argument(
+        "--expected-candidate-sha",
+        required=True,
+        help="reviewed full 40-character SHA expected for the v2.0.0 candidate",
     )
     args = parser.parse_args()
-    checks = Preflight(args.candidate.resolve()).run()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.expected_candidate_sha):
+        parser.error("--expected-candidate-sha must be a full lowercase SHA-1")
+    checks = Preflight(args.candidate.absolute(), args.expected_candidate_sha).run()
+    grouped: dict[str, list[tuple[str, Result]]] = {}
     for name, result in checks.items():
-        print(f"{result.status:7} {name}: {result.detail}")
+        grouped.setdefault(result.group, []).append((name, result))
+    for group, results in grouped.items():
+        print(f"\n{group}")
+        for name, result in results:
+            print(f"{result.status:7} {name}: {result.detail}")
     counts = {
         status: sum(result.status == status for result in checks.values())
         for status in ("PASS", "FAIL", "UNKNOWN")
     }
-    print("Summary: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+    print("\nSummary: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
     return 1 if counts["FAIL"] else 2 if counts["UNKNOWN"] else 0
 
 
