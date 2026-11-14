@@ -632,10 +632,26 @@ class Preflight:
         previous = self.pin["previous_sha"] if self.pin else None
         current = BASE / "current"
         try:
+            if not self._trusted_directory_chain(BASE / "releases"):
+                raise ValueError("untrusted release path")
             link = current.lstat()
-            if not stat.S_ISLNK(link.st_mode):
+            if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
                 raise ValueError
-            target = current.resolve(strict=True)
+            raw_target = Path(os.readlink(current))
+            if (
+                raw_target.is_absolute()
+                or len(raw_target.parts) != 2
+                or raw_target.parts[0] != "releases"
+                or re.fullmatch(r"[0-9a-f]{40}", raw_target.parts[1]) is None
+            ):
+                raise ValueError("unsafe current symlink target")
+            release_path = BASE / raw_target
+            release_info = release_path.lstat()
+            if not stat.S_ISDIR(release_info.st_mode) or release_info.st_uid != 0:
+                raise ValueError("release target is not a root-owned directory")
+            target = release_path.resolve(strict=True)
+            if target != release_path:
+                raise ValueError("release target contains a symbolic link")
             expected = BASE / "releases" / previous if previous else None
             marker = target / ".installation-complete"
             self._metadata(marker, owner=0, mode=0o444)
@@ -665,42 +681,9 @@ class Preflight:
             )
             if self.service_uid is None or self.service_gid is None:
                 raise ValueError
-            safe_tree = True
-            for directory, children, files in os.walk(
-                target, followlinks=False, onerror=self._walk_error
-            ):
-                for item in [
-                    Path(directory),
-                    *(Path(directory) / name for name in children),
-                ]:
-                    info = item.stat()
-                    if (
-                        not stat.S_ISDIR(info.st_mode)
-                        or info.st_uid != 0
-                        or info.st_mode & 0o022
-                        or not self._permits(
-                            info, self.service_uid, self.service_gid, 0o1
-                        )
-                    ):
-                        safe_tree = False
-                for name in files:
-                    item = Path(directory) / name
-                    info = item.stat()
-                    if (
-                        not stat.S_ISREG(info.st_mode)
-                        or info.st_uid != 0
-                        or info.st_mode & 0o022
-                        or not self._permits(
-                            info, self.service_uid, self.service_gid, 0o4
-                        )
-                        or (
-                            info.st_mode & 0o111
-                            and not self._permits(
-                                info, self.service_uid, self.service_gid, 0o1
-                            )
-                        )
-                    ):
-                        safe_tree = False
+            safe_tree = self._release_tree_is_safe(
+                target, self.service_uid, self.service_gid
+            )
             interpreter = target / ".venv/bin/python"
             info = interpreter.stat()
             safe_python = (
@@ -739,6 +722,91 @@ class Preflight:
         if gid == info.st_gid:
             return bool(mode & (bit << 3))
         return bool(mode & bit)
+
+    @staticmethod
+    def _trusted_directory_chain(path: Path, *, owner: int = 0) -> bool:
+        try:
+            for item in reversed((path, *path.parents)):
+                info = item.lstat()
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != owner
+                    or info.st_mode & 0o022
+                ):
+                    return False
+            return True
+        except OSError:
+            return False
+
+    @classmethod
+    def _release_tree_is_safe(
+        cls, release: Path, uid: int, gid: int, *, owner: int = 0
+    ) -> bool:
+        """Check release paths without following untrusted symbolic links.
+
+        A venv interpreter may resolve to the configured system Python. All
+        other links must resolve within this release directory.
+        """
+        try:
+            root = release.resolve(strict=True)
+            if root != release:
+                return False
+            root_info = root.lstat()
+            if (
+                not stat.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid != owner
+                or root_info.st_mode & 0o022
+                or not cls._permits(root_info, uid, gid, 0o1)
+            ):
+                return False
+            system_python = Path(SYSTEM_PYTHON).resolve(strict=True)
+            if not cls._trusted_directory_chain(system_python.parent, owner=owner):
+                return False
+            for directory, children, files in os.walk(
+                root, followlinks=False, onerror=cls._walk_error
+            ):
+                parent = Path(directory)
+                for name in children + files:
+                    item = parent / name
+                    entry = item.lstat()
+                    if entry.st_uid != owner:
+                        return False
+                    if stat.S_ISLNK(entry.st_mode):
+                        resolved = item.resolve(strict=True)
+                        try:
+                            resolved.relative_to(root)
+                            internal = True
+                        except ValueError:
+                            internal = False
+                        safe_interpreter_link = (
+                            not internal
+                            and resolved == system_python
+                            and item.parent == root / ".venv/bin"
+                            and item.name in {"python", "python3", "python3.14"}
+                        )
+                        if not internal and not safe_interpreter_link:
+                            return False
+                        info = resolved.stat()
+                    else:
+                        info = entry
+                    if info.st_uid != owner or info.st_mode & 0o022:
+                        return False
+                    if stat.S_ISDIR(info.st_mode):
+                        if not cls._permits(info, uid, gid, 0o1):
+                            return False
+                    elif stat.S_ISREG(info.st_mode):
+                        if not cls._permits(info, uid, gid, 0o4):
+                            return False
+                        if info.st_mode & 0o111 and not cls._permits(
+                            info, uid, gid, 0o1
+                        ):
+                            return False
+                    else:
+                        return False
+            return True
+        except OSError, RuntimeError, ValueError:
+            return False
 
     def files_and_hashes(self) -> None:
         if self.service_uid is None or self.service_gid is None:
@@ -920,6 +988,8 @@ class Preflight:
                 or stat.S_IMODE(before.st_mode) != 0o600
             ):
                 return "FAIL", "database has unsafe type, owner, group, or permissions"
+            if not self._database_path_matches(path, before):
+                return "UNKNOWN", "database path changed while it was being opened"
             if self._sqlite_sidecars_exist(path):
                 return (
                     "UNKNOWN",
@@ -978,6 +1048,21 @@ class Preflight:
             after = os.fstat(descriptor)
             if self._file_signature(before) != self._file_signature(after):
                 return "UNKNOWN", "database changed while it was being inspected"
+            if not self._database_path_matches(path, after):
+                return "UNKNOWN", "database path changed while it was being inspected"
+            if os.geteuid() == 0:
+                writer_state = self._run(
+                    ["/usr/bin/systemctl", "is-active", active_unit]
+                )
+                if (
+                    writer_state.returncode != 3
+                    or writer_state.stdout.strip() != "inactive"
+                ):
+                    return (
+                        "UNKNOWN",
+                        "writer state changed or could not be rechecked during "
+                        "SQLite inspection",
+                    )
             if self._sqlite_sidecars_exist(path):
                 return "UNKNOWN", "SQLite sidecars appeared during the read-only check"
             if result.returncode != 0 or result.stdout.strip() not in {"PASS", "FAIL"}:
@@ -1012,6 +1097,28 @@ class Preflight:
             info.st_mtime_ns,
             info.st_ctime_ns,
         )
+
+    @staticmethod
+    def _database_path_matches(path: Path, expected: os.stat_result) -> bool:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            current = os.fstat(descriptor)
+            return (
+                stat.S_ISREG(current.st_mode)
+                and current.st_dev == expected.st_dev
+                and current.st_ino == expected.st_ino
+            )
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @staticmethod
     def _sqlite_sidecars_exist(database: Path) -> bool:

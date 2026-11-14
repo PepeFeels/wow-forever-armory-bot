@@ -17,6 +17,81 @@ EXPECTED_SHA = "d" * 40
 
 
 class ProductionPreflightTests(unittest.TestCase):
+    def _release_tree(self, root: Path, system_python: Path) -> Path:
+        release = root / "release"
+        bin_dir = release / ".venv/bin"
+        bin_dir.mkdir(parents=True)
+        (release / "app.py").write_text("pass\n", encoding="ascii")
+        (release / "app.py").chmod(0o644)
+        system_python.write_text("#!/bin/sh\n", encoding="ascii")
+        system_python.chmod(0o755)
+        (bin_dir / "python").symlink_to(system_python)
+        return release
+
+    def _release_is_safe(self, release: Path, system_python: Path) -> bool:
+        with (
+            patch.object(production_preflight, "SYSTEM_PYTHON", str(system_python)),
+            patch.object(
+                production_preflight.Preflight,
+                "_trusted_directory_chain",
+                return_value=True,
+            ),
+        ):
+            return production_preflight.Preflight._release_tree_is_safe(
+                release,
+                os.getuid(),
+                os.getgid(),
+                owner=os.getuid(),
+            )
+
+    def test_release_accepts_venv_interpreter_link_to_system_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            self.assertTrue(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_symlink_escaping_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            outside = root / "outside-data"
+            outside.write_text("private\n", encoding="ascii")
+            outside.chmod(0o644)
+            (release / "unexpected-link").symlink_to(outside)
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_broken_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "broken-link").symlink_to(root / "missing")
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_unexpected_file_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            self.assertFalse(
+                production_preflight.Preflight._release_tree_is_safe(
+                    release,
+                    os.getuid(),
+                    os.getgid(),
+                    owner=os.getuid() + 1,
+                )
+            )
+
+    def test_release_rejects_unsafe_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "app.py").chmod(0o666)
+            self.assertFalse(self._release_is_safe(release, system_python))
+
     def _database(self, path: Path) -> None:
         with sqlite3.connect(path) as connection:
             for table in ("guilds", "members", "characters", "flows"):
@@ -125,6 +200,11 @@ class ProductionPreflightTests(unittest.TestCase):
                     "run",
                     return_value=process_result,
                 ) as run,
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 3, "inactive", ""),
+                ),
             ):
                 status, _detail = checker.database(database, "production_database")
             self.assertEqual(status, "PASS")
@@ -134,6 +214,69 @@ class ProductionPreflightTests(unittest.TestCase):
             self.assertEqual(kwargs["extra_groups"], ())
             self.assertTrue(kwargs["pass_fds"])
             self.assertIn("immutable=1", run.call_args.args[0][4])
+
+    def test_root_sqlite_check_rejects_database_path_replacement_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "database.sqlite3"
+            self._database(database)
+            checker = production_preflight.Preflight(root, EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            old_database = root / "replaced.sqlite3"
+
+            def replace_path(
+                *_args: object, **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                database.rename(old_database)
+                self._database(database)
+                return subprocess.CompletedProcess([], 0, "PASS", "")
+
+            with (
+                patch.object(os, "geteuid", return_value=0),
+                patch.object(subprocess, "run", side_effect=replace_path),
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 3, "inactive", ""),
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("changed", detail)
+
+    def test_root_sqlite_check_rechecks_writer_state_after_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "database.sqlite3"
+            self._database(database)
+            checker = production_preflight.Preflight(root, EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            with (
+                patch.object(os, "geteuid", return_value=0),
+                patch.object(
+                    subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "PASS", ""),
+                ),
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 0, "active", ""),
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("writer state changed", detail)
 
     def test_complete_backup_check_path_validates_backup_without_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

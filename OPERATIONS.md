@@ -172,7 +172,7 @@ separately approved administrator procedure; this documentation does not
 authorize changing production paths.
 
 For this reviewed candidate, the script SHA-256 is
-`612d6ec2c3915aec344395640839b5be6374e5dc44188febf1b6009c06a5d92c`. Compare
+`eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65`. Compare
 the staged copy's hash with this value before the root-controlled run.
 
 ```bash
@@ -195,6 +195,76 @@ Each check reports `PASS`, `FAIL`, or `UNKNOWN`. Exit code 0 means no failures
 or unknowns; 1 means at least one failure; 2 means there is at least one
 unknown and no failure. Any nonzero result is diagnostic only: the script
 never repairs a problem. Do not treat a report as deployment authorization.
+
+#### Administrator-controlled staging procedure (documentation only)
+
+This procedure has **not** been run. It is for a separately approved staging
+operation. Replace `FINAL_REVIEWED_COMMIT` and `FINAL_SCRIPT_SHA256` with the
+exact values in the final review report. Run the commands from a trusted
+administrator terminal. They create a new, root-owned staging directory under
+`/var/lib/armory-preflight-staging`; they do not write below `/opt`, the bot's
+state or backup directory, or the deployment audit directory. The developer
+checkout is only read as a Git object source.
+
+Continue only if the first `stat` output confirms `/var/lib` is root-owned and
+not group/world-writable. The staging parent and commit-specific directory
+must both be absent; the `test` and `mkdir` commands enforce this. If a
+commit-specific path exists, stop instead of reusing it.
+
+The commit-specific destination is exclusive: `mkdir` must fail if it already
+exists. If any command fails, stop and have an administrator inspect that
+staging path; do not remove or reuse it automatically.
+
+```bash
+set -eu
+RELEASE_SHA='FINAL_REVIEWED_COMMIT'
+SCRIPT_SHA='FINAL_SCRIPT_SHA256'
+STAGE="/var/lib/armory-preflight-staging/${RELEASE_SHA}"
+SOURCE='/home/codex-dev/projects/wow-forever-armory-bot-v2-candidate'
+
+sudo /usr/bin/stat -c '%U:%G %a %n' /var/lib
+sudo /usr/bin/test ! -e "$STAGE"
+sudo /usr/bin/test ! -L "$STAGE"
+sudo /usr/bin/test ! -e /var/lib/armory-preflight-staging
+sudo /usr/bin/test ! -L /var/lib/armory-preflight-staging
+sudo /usr/bin/mkdir -m 0700 /var/lib/armory-preflight-staging
+sudo /usr/bin/mkdir -m 0700 "$STAGE"
+sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  /usr/bin/git clone --no-local --no-checkout "$SOURCE" "$STAGE/candidate"
+sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  /usr/bin/git -C "$STAGE/candidate" switch --detach "$RELEASE_SHA"
+if sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    /usr/bin/git -C "$STAGE/candidate" show-ref --verify --quiet \
+    refs/heads/release/v2.0.0; then
+  sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    /usr/bin/git -C "$STAGE/candidate" switch release/v2.0.0
+else
+  sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    /usr/bin/git -C "$STAGE/candidate" switch -c release/v2.0.0 "$RELEASE_SHA"
+fi
+sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  /usr/bin/git -C "$STAGE/candidate" remote set-url origin \
+  https://github.com/PepeFeels/wow-forever-armory-bot.git
+sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" rev-parse HEAD)" = "$RELEASE_SHA"
+sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" rev-parse refs/heads/release/v2.0.0)" = "$RELEASE_SHA"
+sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" status --porcelain)" = ''
+sudo /usr/bin/chmod -R a-w "$STAGE/candidate"
+
+sudo /usr/bin/test ! -e "$STAGE/production_preflight.py" && \
+  sudo /usr/bin/install -o root -g root -m 0444 \
+    "$STAGE/candidate/deploy/production_preflight.py" \
+    "$STAGE/production_preflight.py"
+sudo /usr/bin/test "$(sudo /usr/bin/sha256sum "$STAGE/production_preflight.py" | /usr/bin/cut -d ' ' -f 1)" = "$SCRIPT_SHA"
+sudo /usr/bin/stat -c '%U:%G %a %n' "$STAGE" "$STAGE/candidate" "$STAGE/production_preflight.py"
+sudo /usr/bin/sha256sum "$STAGE/production_preflight.py"
+```
+
+The root-owned checkout is separate from the active release and production
+deployment checkout. Root ownership and read-only mode bits prevent the
+developer account from changing the staged Git tree or script after staging.
+Before running a preflight later, an administrator must independently compare
+the displayed commit and script hash with the reviewed values. Executing the
+preflight is a separate action and is not part of staging.
 
 The script checks candidate and protected production checkout Git identity,
 Python 3.14 and x86_64, the `wow-armory` account, pinned release identity,
