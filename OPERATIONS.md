@@ -198,73 +198,156 @@ never repairs a problem. Do not treat a report as deployment authorization.
 
 #### Administrator-controlled staging procedure (documentation only)
 
-This procedure has **not** been run. It is for a separately approved staging
-operation. Replace `FINAL_REVIEWED_COMMIT` and `FINAL_SCRIPT_SHA256` with the
-exact values in the final review report. Run the commands from a trusted
-administrator terminal. They create a new, root-owned staging directory under
-`/var/lib/armory-preflight-staging`; they do not write below `/opt`, the bot's
-state or backup directory, or the deployment audit directory. The developer
-checkout is only read as a Git object source.
+This procedure has **not** been run. It separates developer-side Git work
+from administrator staging: the developer creates a Git bundle without
+elevated privileges, then root copies and verifies that data file. Root never
+runs Git in, or against, the developer-owned repository. The commands below
+are documentation only; they do not authorize staging or preflight execution.
 
-Continue only if the first `stat` output confirms `/var/lib` is root-owned and
-not group/world-writable. The staging parent and commit-specific directory
-must both be absent; the `test` and `mkdir` commands enforce this. If a
-commit-specific path exists, stop instead of reusing it.
-
-The commit-specific destination is exclusive: `mkdir` must fail if it already
-exists. If any command fails, stop and have an administrator inspect that
-staging path; do not remove or reuse it automatically.
+First, as `codex-dev`, create a bundle only from the reviewed, clean branch.
+Use the expected commit shown in the review report. The commands disable Git
+hooks and filesystem monitoring for these checks. If the output file already
+exists, stop and choose a separately reviewed unused filename; do not replace
+it.
 
 ```bash
 set -eu
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+export GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0
+REPO='/home/codex-dev/projects/wow-forever-armory-bot-v2-candidate'
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
-SCRIPT_SHA='FINAL_SCRIPT_SHA256'
-STAGE="/var/lib/armory-preflight-staging/${RELEASE_SHA}"
-SOURCE='/home/codex-dev/projects/wow-forever-armory-bot-v2-candidate'
+BRANCH='release/v2.0.0'
+BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
+GIT='/usr/bin/git'
 
-sudo /usr/bin/stat -c '%U:%G %a %n' /var/lib
-sudo /usr/bin/test ! -e "$STAGE"
-sudo /usr/bin/test ! -L "$STAGE"
-sudo /usr/bin/test ! -e /var/lib/armory-preflight-staging
-sudo /usr/bin/test ! -L /var/lib/armory-preflight-staging
-sudo /usr/bin/mkdir -m 0700 /var/lib/armory-preflight-staging
-sudo /usr/bin/mkdir -m 0700 "$STAGE"
-sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-  /usr/bin/git clone --no-local --no-checkout "$SOURCE" "$STAGE/candidate"
-sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-  /usr/bin/git -C "$STAGE/candidate" switch --detach "$RELEASE_SHA"
-if sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    /usr/bin/git -C "$STAGE/candidate" show-ref --verify --quiet \
-    refs/heads/release/v2.0.0; then
-  sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    /usr/bin/git -C "$STAGE/candidate" switch release/v2.0.0
-else
-  sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    /usr/bin/git -C "$STAGE/candidate" switch -c release/v2.0.0 "$RELEASE_SHA"
-fi
-sudo /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-  /usr/bin/git -C "$STAGE/candidate" remote set-url origin \
-  https://github.com/PepeFeels/wow-forever-armory-bot.git
-sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" rev-parse HEAD)" = "$RELEASE_SHA"
-sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" rev-parse refs/heads/release/v2.0.0)" = "$RELEASE_SHA"
-sudo /usr/bin/test "$(sudo /usr/bin/git -C "$STAGE/candidate" status --porcelain)" = ''
-sudo /usr/bin/chmod -R a-w "$STAGE/candidate"
-
-sudo /usr/bin/test ! -e "$STAGE/production_preflight.py" && \
-  sudo /usr/bin/install -o root -g root -m 0444 \
-    "$STAGE/candidate/deploy/production_preflight.py" \
-    "$STAGE/production_preflight.py"
-sudo /usr/bin/test "$(sudo /usr/bin/sha256sum "$STAGE/production_preflight.py" | /usr/bin/cut -d ' ' -f 1)" = "$SCRIPT_SHA"
-sudo /usr/bin/stat -c '%U:%G %a %n' "$STAGE" "$STAGE/candidate" "$STAGE/production_preflight.py"
-sudo /usr/bin/sha256sum "$STAGE/production_preflight.py"
+test ! -e "$BUNDLE"
+test ! -L "$BUNDLE"
+test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" branch --show-current)" = "$BRANCH"
+test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" rev-parse HEAD)" = "$RELEASE_SHA"
+test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" rev-parse "refs/heads/$BRANCH")" = "$RELEASE_SHA"
+WORKTREE_STATUS="$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" status --porcelain --untracked-files=all)"
+test -z "$WORKTREE_STATUS"
+"$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" bundle create "$BUNDLE" "refs/heads/$BRANCH"
+"$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" bundle verify "$BUNDLE"
+test "$("$GIT" bundle list-heads "$BUNDLE" "refs/heads/$BRANCH")" = "$RELEASE_SHA refs/heads/$BRANCH"
+WORKTREE_STATUS="$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" status --porcelain --untracked-files=all)"
+test -z "$WORKTREE_STATUS"
+/usr/bin/sha256sum "$BUNDLE"
 ```
 
-The root-owned checkout is separate from the active release and production
-deployment checkout. Root ownership and read-only mode bits prevent the
-developer account from changing the staged Git tree or script after staging.
-Before running a preflight later, an administrator must independently compare
-the displayed commit and script hash with the reviewed values. Executing the
-preflight is a separate action and is not part of staging.
+Record the bundle SHA-256 from this output and provide it to the administrator
+through the approved review channel. The administrator must compare it with
+that independently recorded value before allowing the copied bundle into Git.
+
+Then, from a trusted administrator terminal, set `BUNDLE_SHA256` to the
+recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
+hash (`eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65`).
+If a command fails, stop. Do not remove or reuse the partial staging directory;
+have an administrator inspect it and choose a new unused staging root.
+
+```bash
+set -euo pipefail
+RELEASE_SHA='FINAL_REVIEWED_COMMIT'
+BRANCH='release/v2.0.0'
+BUNDLE_SHA256='RECORDED_BUNDLE_SHA256'
+SCRIPT_SHA256='eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65'
+SOURCE_BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
+STAGE_ROOT='/var/lib/armory-preflight-staging'
+STAGE="$STAGE_ROOT/$RELEASE_SHA"
+
+[[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(sudo /usr/bin/stat -c %U /var/lib)" = root ]]
+sudo /usr/bin/test -d /var/lib
+sudo /usr/bin/test ! -L /var/lib
+LIB_MODE="$(sudo /usr/bin/stat -c %a /var/lib)"
+(( (8#$LIB_MODE & 022) == 0 ))
+sudo /usr/bin/test -d /var
+sudo /usr/bin/test ! -L /var
+[[ "$(sudo /usr/bin/stat -c %U /var)" = root ]]
+VAR_MODE="$(sudo /usr/bin/stat -c %a /var)"
+(( (8#$VAR_MODE & 022) == 0 ))
+
+if sudo /usr/bin/test -e "$STAGE_ROOT"; then
+  sudo /usr/bin/test -d "$STAGE_ROOT"
+  sudo /usr/bin/test ! -L "$STAGE_ROOT"
+  [[ "$(sudo /usr/bin/stat -c %U "$STAGE_ROOT")" = root ]]
+  STAGE_MODE="$(sudo /usr/bin/stat -c %a "$STAGE_ROOT")"
+  (( (8#$STAGE_MODE & 022) == 0 ))
+else
+  sudo /usr/bin/mkdir -m 0700 "$STAGE_ROOT"
+fi
+sudo /usr/bin/test ! -e "$STAGE"
+sudo /usr/bin/test ! -L "$STAGE"
+sudo /usr/bin/mkdir -m 0700 "$STAGE"
+
+sudo /usr/bin/test -f "$SOURCE_BUNDLE"
+sudo /usr/bin/test ! -L "$SOURCE_BUNDLE"
+[[ "$(sudo /usr/bin/stat -c %U "$SOURCE_BUNDLE")" = codex-dev ]]
+BUNDLE_MODE="$(sudo /usr/bin/stat -c %a "$SOURCE_BUNDLE")"
+(( (8#$BUNDLE_MODE & 022) == 0 ))
+sudo /usr/bin/test ! -e "$STAGE/source.bundle"
+sudo /usr/bin/install -o root -g root -m 0400 "$SOURCE_BUNDLE" "$STAGE/source.bundle"
+COPIED_BUNDLE_SHA256="$(sudo /usr/bin/sha256sum "$STAGE/source.bundle" | /usr/bin/cut -d ' ' -f 1)"
+[[ "$COPIED_BUNDLE_SHA256" = "$BUNDLE_SHA256" ]]
+
+root_git() {
+  sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+    /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c protocol.file.allow=always "$@"
+}
+
+root_git init --initial-branch="$BRANCH" "$STAGE/candidate"
+root_git -C "$STAGE/candidate" bundle verify "$STAGE/source.bundle"
+root_git -C "$STAGE/candidate" fetch "$STAGE/source.bundle" \
+  "refs/heads/$BRANCH:refs/heads/$BRANCH"
+root_git -C "$STAGE/candidate" switch "$BRANCH"
+root_git -C "$STAGE/candidate" remote add origin \
+  https://github.com/PepeFeels/wow-forever-armory-bot.git
+STAGED_HEAD="$(root_git -C "$STAGE/candidate" rev-parse HEAD)"
+STAGED_BRANCH_HEAD="$(root_git -C "$STAGE/candidate" rev-parse "refs/heads/$BRANCH")"
+STAGED_BRANCH="$(root_git -C "$STAGE/candidate" branch --show-current)"
+STAGED_STATUS="$(root_git -C "$STAGE/candidate" status --porcelain --untracked-files=all)"
+[[ "$STAGED_HEAD" = "$RELEASE_SHA" ]]
+[[ "$STAGED_BRANCH_HEAD" = "$RELEASE_SHA" ]]
+[[ "$STAGED_BRANCH" = "$BRANCH" ]]
+[[ -z "$STAGED_STATUS" ]]
+[[ "$(root_git -C "$STAGE/candidate" remote get-url origin)" = \
+  'https://github.com/PepeFeels/wow-forever-armory-bot.git' ]]
+
+SYMLINK_FOUND="$(sudo /usr/bin/find "$STAGE/candidate" -xdev -type l -print -quit)"
+sudo /usr/bin/test -z "$SYMLINK_FOUND"
+NONROOT_OWNER_FOUND="$(sudo /usr/bin/find "$STAGE/candidate" -xdev ! -user root -print -quit)"
+sudo /usr/bin/test -z "$NONROOT_OWNER_FOUND"
+sudo /usr/bin/chmod -R a-w "$STAGE/candidate"
+WRITABLE_MODE_FOUND="$(sudo /usr/bin/find "$STAGE/candidate" -xdev -perm /022 -print -quit)"
+sudo /usr/bin/test -z "$WRITABLE_MODE_FOUND"
+
+sudo /usr/bin/test ! -e "$STAGE/production_preflight.py"
+sudo /usr/bin/install -o root -g root -m 0444 \
+  "$STAGE/candidate/deploy/production_preflight.py" \
+  "$STAGE/production_preflight.py"
+COPIED_SCRIPT_SHA256="$(sudo /usr/bin/sha256sum "$STAGE/production_preflight.py" | /usr/bin/cut -d ' ' -f 1)"
+[[ "$COPIED_SCRIPT_SHA256" = "$SCRIPT_SHA256" ]]
+sudo /usr/bin/stat -c '%U:%G %a %n' "$STAGE" "$STAGE/source.bundle" \
+  "$STAGE/candidate" "$STAGE/production_preflight.py"
+```
+
+All root-run Git commands above operate only in the new root-owned checkout or
+on the root-owned copied bundle. The bundle is hash-checked before Git reads
+it; Git runs with an empty environment, system/global configuration disabled,
+hooks disabled, and filesystem monitoring disabled. No command runs Git in
+the developer repository. The developer's Git configuration, hooks, filters,
+and external helpers therefore cannot run with root privileges.
+
+The new staging directory is separate from the active release, production
+checkout, database, backups, and audit journal. The procedure never deletes or
+reuses an existing commit-specific staging directory. The checkout and script
+are root-owned and write-protected against `codex-dev`. Preflight execution is
+a separate action and is not part of staging.
 
 The script checks candidate and protected production checkout Git identity,
 Python 3.14 and x86_64, the `wow-armory` account, pinned release identity,
