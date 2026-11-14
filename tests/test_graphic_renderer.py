@@ -255,9 +255,7 @@ class GraphicRendererTests(unittest.TestCase):
         self.assertEqual(normal_title, "Ryn Oakfall")
         self.assertEqual(normal_font.size, 26)
 
-        long_name = _character(
-            "Aeltherion", "Warrior", surname="Whispering-Wind"
-        )
+        long_name = _character("Aeltherion", "Warrior", surname="Whispering-Wind")
         fitted_title, fitted_font = _fit_character_title(
             draw, long_name, 409, base_size=26
         )
