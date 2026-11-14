@@ -134,7 +134,7 @@ def _fixture_requests() -> dict[str, ArmoryGraphicRequest]:
 class GraphicRendererTests(unittest.TestCase):
     def test_dimensions_and_golden_snapshots_for_all_modes(self) -> None:
         requests = _fixture_requests()
-        expected_sizes = {"one": (800, 520), "two": (1200, 520), "three": (1800, 520)}
+        expected_sizes = {"one": (800, 380), "two": (1200, 380), "three": (1800, 380)}
         expected_hashes = json.loads(GOLDEN.read_text()) if GOLDEN.exists() else {}
         observed: dict[str, str] = {}
         PREVIEWS.mkdir(parents=True, exist_ok=True)
@@ -169,7 +169,7 @@ class GraphicRendererTests(unittest.TestCase):
     def test_compact_panel_layout_removes_statistics_section(
         self,
     ) -> None:
-        self.assertEqual(_panel_section_layout(), (158, 174, 207, 48))
+        self.assertEqual(_panel_section_layout(), (130, 144, 168, 29))
         self.assertNotIn("CHARACTER OVERVIEW", UI_LABELS)
         self.assertNotIn("CHARACTER STATS", UI_LABELS)
 
@@ -237,7 +237,7 @@ class GraphicRendererTests(unittest.TestCase):
             "Member", (_character("Hero", "Druid", professions=(profession,)),)
         )
         image = Image.open(BytesIO(render_armory_overview(request)))
-        self.assertEqual(image.size, (800, 520))
+        self.assertEqual(image.size, (800, 380))
         self.assertEqual(
             _character_title(
                 _character("Aelwyn Woodsong", "Druid", surname="Woodsong")
