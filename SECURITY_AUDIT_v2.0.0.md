@@ -1,6 +1,6 @@
 # v2.0.0 dependency audit
 
-Audit date: 2026-11-14  
+Audit date: 2026-11-14
 Tool: `pip-audit 2.10.1`, installed in an isolated virtual environment under
 `/tmp`; the project runtime dependencies were not installed or modified by the
 tool setup. The runtime and build hash locks were audited separately.
