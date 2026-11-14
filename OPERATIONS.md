@@ -208,7 +208,8 @@ First, as `codex-dev`, create a bundle only from the reviewed, clean branch.
 Use the expected commit shown in the review report. The commands disable Git
 hooks and filesystem monitoring for these checks. If the output file already
 exists, stop and choose a separately reviewed unused filename; do not replace
-it.
+it. If you choose another filename, set `SOURCE_BUNDLE` to that same path in
+the administrator commands below.
 
 ```bash
 set -eu
@@ -244,6 +245,9 @@ recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
 hash (`eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65`).
 If a command fails, stop. Do not remove or reuse the partial staging directory;
 have an administrator inspect it and choose a new unused staging root.
+The new repository starts on a separate `staging-import` branch. The bundle
+ref is fetched under `refs/remotes/staging/` and only then used to create the
+release branch, so the fetch never writes into a checked-out branch.
 
 ```bash
 set -euo pipefail
@@ -281,6 +285,7 @@ fi
 sudo /usr/bin/test ! -e "$STAGE"
 sudo /usr/bin/test ! -L "$STAGE"
 sudo /usr/bin/mkdir -m 0700 "$STAGE"
+sudo /usr/bin/mkdir -m 0700 "$STAGE/tmp"
 
 sudo /usr/bin/test -f "$SOURCE_BUNDLE"
 sudo /usr/bin/test ! -L "$SOURCE_BUNDLE"
@@ -293,20 +298,68 @@ COPIED_BUNDLE_SHA256="$(sudo /usr/bin/sha256sum "$STAGE/source.bundle" | /usr/bi
 [[ "$COPIED_BUNDLE_SHA256" = "$BUNDLE_SHA256" ]]
 
 root_git() {
-  sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root \
+  sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root TMPDIR="$STAGE/tmp" \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
     /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-    -c protocol.file.allow=always "$@"
+    -c credential.helper= "$@"
 }
 
-root_git init --initial-branch="$BRANCH" "$STAGE/candidate"
+root_git_file_only() {
+  sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root TMPDIR="$STAGE/tmp" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_ALLOW_PROTOCOL=file \
+    /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c credential.helper= "$@"
+}
+
+root_git init --initial-branch=staging-import "$STAGE/candidate"
+root_git -C "$STAGE/candidate" config --local core.hooksPath /dev/null
+root_git -C "$STAGE/candidate" config --local core.fsmonitor false
+root_git -C "$STAGE/candidate" config --local core.symlinks false
+root_git -C "$STAGE/candidate" config --local credential.helper ''
 root_git -C "$STAGE/candidate" bundle verify "$STAGE/source.bundle"
-root_git -C "$STAGE/candidate" fetch "$STAGE/source.bundle" \
-  "refs/heads/$BRANCH:refs/heads/$BRANCH"
-root_git -C "$STAGE/candidate" switch "$BRANCH"
+root_git_file_only -C "$STAGE/candidate" fetch "$STAGE/source.bundle" \
+  "refs/heads/$BRANCH:refs/remotes/staging/$BRANCH"
+root_git -C "$STAGE/candidate" ls-tree -rz --full-tree -r "$RELEASE_SHA" |
+  /usr/bin/python3 -I -B -c '
+import sys
+
+for record in sys.stdin.buffer.read().split(b"\0"):
+    if not record:
+        continue
+    metadata, path = record.split(b"\t", 1)
+    mode, kind, _object_id = metadata.split(b" ", 2)
+    parts = path.split(b"/")
+    if (
+        path.startswith(b"/")
+        or any(part in {b"", b".", b".."} for part in parts)
+        or any(part.lower() == b".git" for part in parts)
+    ):
+        raise SystemExit("unsafe path in Git tree")
+    if kind != b"blob" or mode not in {b"100644", b"100755"}:
+        raise SystemExit("symlink or special file in Git tree")
+'
+root_git -C "$STAGE/candidate" switch --create "$BRANCH" \
+  "refs/remotes/staging/$BRANCH"
 root_git -C "$STAGE/candidate" remote add origin \
   https://github.com/PepeFeels/wow-forever-armory-bot.git
+LOCAL_CONFIG_KEYS="$(root_git -C "$STAGE/candidate" config --local --name-only --list)"
+while IFS= read -r key; do
+  case "$key" in
+    core.repositoryformatversion|core.filemode|core.bare|core.logallrefupdates|\
+    core.hookspath|core.fsmonitor|core.symlinks|credential.helper|\
+    remote.origin.url|remote.origin.fetch|\
+    branch.release/v2.0.0.remote|branch.release/v2.0.0.merge)
+      ;;
+    *) printf 'Unexpected local Git setting: %s\n' "$key" >&2; exit 1 ;;
+  esac
+done <<< "$LOCAL_CONFIG_KEYS"
+[[ "$(root_git -C "$STAGE/candidate" config --local --get core.hooksPath)" = /dev/null ]]
+[[ "$(root_git -C "$STAGE/candidate" config --local --get core.fsmonitor)" = false ]]
+[[ "$(root_git -C "$STAGE/candidate" config --local --get core.symlinks)" = false ]]
+[[ -z "$(root_git -C "$STAGE/candidate" config --local --get-all credential.helper)" ]]
 STAGED_HEAD="$(root_git -C "$STAGE/candidate" rev-parse HEAD)"
 STAGED_BRANCH_HEAD="$(root_git -C "$STAGE/candidate" rev-parse "refs/heads/$BRANCH")"
 STAGED_BRANCH="$(root_git -C "$STAGE/candidate" branch --show-current)"
@@ -332,22 +385,59 @@ sudo /usr/bin/install -o root -g root -m 0444 \
   "$STAGE/production_preflight.py"
 COPIED_SCRIPT_SHA256="$(sudo /usr/bin/sha256sum "$STAGE/production_preflight.py" | /usr/bin/cut -d ' ' -f 1)"
 [[ "$COPIED_SCRIPT_SHA256" = "$SCRIPT_SHA256" ]]
+[[ "$(sudo /usr/bin/stat -c %u:%g:%a "$STAGE")" = 0:0:700 ]]
+[[ "$(sudo /usr/bin/stat -c %u:%g:%a "$STAGE/tmp")" = 0:0:700 ]]
+[[ "$(sudo /usr/bin/stat -c %u:%g:%a "$STAGE/source.bundle")" = 0:0:400 ]]
+[[ "$(sudo /usr/bin/stat -c %u:%g:%a "$STAGE/production_preflight.py")" = 0:0:444 ]]
 sudo /usr/bin/stat -c '%U:%G %a %n' "$STAGE" "$STAGE/source.bundle" \
-  "$STAGE/candidate" "$STAGE/production_preflight.py"
+  "$STAGE/tmp" "$STAGE/candidate" "$STAGE/production_preflight.py"
 ```
 
 All root-run Git commands above operate only in the new root-owned checkout or
 on the root-owned copied bundle. The bundle is hash-checked before Git reads
-it; Git runs with an empty environment, system/global configuration disabled,
-hooks disabled, and filesystem monitoring disabled. No command runs Git in
-the developer repository. The developer's Git configuration, hooks, filters,
-and external helpers therefore cannot run with root privileges.
+it. Only the single bundle-fetch command receives `GIT_ALLOW_PROTOCOL=file`;
+no `protocol.file.allow=always` setting is used and network/helper protocols
+are not allowed for that fetch. Git runs with an empty environment,
+system/global configuration disabled, hooks disabled, filesystem monitoring
+disabled, and credential helpers cleared. Git temporary files are directed to
+the new staging directory's private `tmp` subdirectory. The fresh repository's
+local config keys are checked against a short allowlist, so it cannot contain
+external filters or other developer-provided commands. No root command runs
+Git in the developer repository.
+
+Before checkout, a system Python command reads the Git tree listing and rejects
+absolute or traversal paths, symlinks, submodules, and non-regular files. Git
+also has `core.symlinks=false`, and the resulting checkout is scanned for
+symlinks, non-root ownership, and group/world write permission. These checks
+reject `.git` path components and confine Git checkout writes to the new
+staging tree. Staging stops on any unexpected object or path.
 
 The new staging directory is separate from the active release, production
 checkout, database, backups, and audit journal. The procedure never deletes or
 reuses an existing commit-specific staging directory. The checkout and script
 are root-owned and write-protected against `codex-dev`. Preflight execution is
 a separate action and is not part of staging.
+
+The staging-flow checks are reproducible without elevated privileges:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /home/codex-dev/projects/wow-forever-armory-bot/.venv/bin/python -m pytest -p no:cacheprovider -q tests/test_staging_procedure.py
+```
+
+The tests create all repositories, bundles, and staging paths inside temporary
+directories. They verify clean import into a new repository, branch and commit
+identity, origin URL, allowed Git configuration, and no execution of
+developer-defined hooks, smudge filters, or credential helpers. They also
+verify that a repeated target, bundle-hash mismatch, symlink object, and
+hand-crafted `../` tree path are rejected without changing an existing staged
+copy or writing outside the temporary directory. The root behavior is
+simulated as an ordinary unprivileged user; the tests never invoke `sudo` or
+write production paths.
+
+Recorded result for the reviewed change: **5 passed**. Bash syntax validation
+also passed for both staging procedure command blocks and the test command.
+No privileged staging or
+production execution was performed.
 
 The script checks candidate and protected production checkout Git identity,
 Python 3.14 and x86_64, the `wow-armory` account, pinned release identity,
