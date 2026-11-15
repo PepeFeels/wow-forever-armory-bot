@@ -172,7 +172,7 @@ separately approved administrator procedure; this documentation does not
 authorize changing production paths.
 
 For the reviewed source in this checkout, the standalone preflight SHA-256 is
-`a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817`. Compare
+`c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93`. Compare
 the staged copy's hash with this value before the root-controlled run.
 
 ```bash
@@ -254,7 +254,7 @@ that independently recorded value before allowing the copied bundle into Git.
 
 Then, from a trusted administrator terminal, set `BUNDLE_SHA256` to the
 recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
-hash (`a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817`).
+hash (`c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93`).
 If a command fails, stop. Do not remove or reuse the partial staging directory;
 have an administrator inspect it and choose a new unused staging root.
 The new repository starts on a separate `staging-import` branch. The bundle
@@ -266,7 +266,7 @@ set -euo pipefail
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
 BRANCH='release/v2.0.0'
 BUNDLE_SHA256='RECORDED_BUNDLE_SHA256'
-SCRIPT_SHA256='a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817'
+SCRIPT_SHA256='c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93'
 SOURCE_BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
 STAGE_ROOT='/var/lib/armory-preflight-staging'
 STAGE="$STAGE_ROOT/$RELEASE_SHA"
@@ -609,7 +609,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "39a136e23fad3896bf38db1a44d30bd720ecf6d0ed8bc8aa2ded98205976332d"
+ADMIN_SHA256 = "2de1ba7238ab563a065d40d9b8046dcc0bac93782a1d7292b017ac0e2410aea7"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -946,9 +946,11 @@ The checked review names are `release_pointer`, `installation_marker`,
 `backup_metadata`, `backup_sha256`, `backup_integrity`, `manifest`,
 `saved_preflight_sha256`, `bot_unit_state`, `backup_timer_state`, and
 `backup_service_state`. Any `FAIL`, `UNKNOWN`, missing field, mismatched hash,
-active unit, changed journal, symlink in either release tree, unsafe
-owner/mode, hardlink, special file, or conflicting archive/acknowledgment
-causes refusal. The tool accepts only two safe journal states: an active
+active unit, changed journal, unapproved symlink in either release tree,
+unsafe owner/mode, hardlink, special file, or conflicting
+archive/acknowledgment causes refusal. The only accepted release-tree symlinks
+are the exact Python 3.14 venv links documented below; application-code links
+and any other link target are rejected. The tool accepts only two safe journal states: an active
 journal alone, or an active journal and an archive that have identical bytes
 and the same inode, or the verified archive alone after a prior interruption.
 It rehashes the journal and manifest, rereads the administrative review,
@@ -1341,7 +1343,7 @@ through the wrapper's inherited descriptor. Preserve the old binary and diff
 as evidence; do not treat either old hash as approved for v2.0.0.
 
 The current v2.0.0 checkout source for `deploy/production_install.py` has
-SHA-256 `49963032f4ab377d27835d8e1cca7ca4188ef7a97a3ddd1f6fe23df78125a255`.
+SHA-256 `12c782429bb9c66896a021a81c1debfb0a565fd31e9ae64e11b9fba835772585`.
 Provision the v2 helper only by copying the reviewed source bytes into the
 root-owned helper path and verifying that exact hash afterward. The pin's
 `installer_sha256` must equal both the reviewed source hash and installed
@@ -1384,6 +1386,29 @@ the interpreter and platform before creating a release, then installs only
 hash-verified dependencies and builds the package without an unpinned isolated
 build environment. Do not widen the supported Python/platform target without
 generating and reviewing matching artifact hashes.
+
+### Release tree and Python venv symlinks
+
+The release tree verifier checks `.venv` as part of the release; it does not
+skip the environment. It permits only these exact link texts:
+
+| Link path | Required link text | Resolved target |
+| --- | --- | --- |
+| `.venv/lib64` | `lib` | `.venv/lib` inside the same release |
+| `.venv/bin/python` | `python3.14` | `/usr/bin/python3.14` |
+| `.venv/bin/python3` | `python3.14` | `/usr/bin/python3.14` |
+| `.venv/bin/𝜋thon` | `python3.14` | `/usr/bin/python3.14` |
+| `.venv/bin/python3.14` | `/usr/bin/python3.14` | The trusted system interpreter |
+
+The verifier checks raw link text, resolved target, ownership, permissions,
+and that the links do not change during inspection. The system interpreter
+must be a root-owned regular file in a trusted directory chain and readable
+and executable by the service account. All other symlinks, including links
+inside application code, are rejected. Python 3.14's standard `venv` module
+creates the `𝜋thon` alias when the filesystem encoding is UTF-8; its unusual
+Unicode name is expected only at that exact path and with that exact target.
+This explains the observed shape but is not independent proof of how the
+production links were created.
 
 The installer validates Python sources by parsing them with `-I -B`; it must
 not use `compileall` in an immutable release because that command writes

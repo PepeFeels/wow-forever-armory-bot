@@ -44,12 +44,19 @@ class ProductionAdminTests(unittest.TestCase):
         interpreter.chmod(0o555)
         return root
 
-    def _verify_release(self, root: Path, *, owner_uid: int | None = None) -> None:
+    def _verify_release(
+        self,
+        root: Path,
+        *,
+        owner_uid: int | None = None,
+        system_python: Path = admin.SYSTEM_PYTHON,
+    ) -> None:
         admin._verify_release_tree(
             root,
             service_uid=self.owner,
             service_gid=self.group,
             owner_uid=self.owner if owner_uid is None else owner_uid,
+            system_python=system_python,
         )
 
     def test_admin_tool_has_no_local_runtime_imports(self) -> None:
@@ -114,6 +121,49 @@ class ProductionAdminTests(unittest.TestCase):
         (root / "module.py").write_text("code")
         (root / "module.py").chmod(0o444)
         self._verify_release(root)
+
+    def test_release_tree_accepts_exact_python_314_venv_links(self) -> None:
+        root = self._make_release(self.root / "release")
+        interpreter = root / ".venv/bin/python"
+        interpreter.unlink()
+        lib = root / ".venv/lib"
+        lib.mkdir()
+        (root / ".venv/lib64").symlink_to("lib", target_is_directory=True)
+
+        system_python = self.root / "system-python"
+        system_python.write_bytes(b"trusted python fixture")
+        system_python.chmod(0o755)
+        bin_dir = root / ".venv/bin"
+        (bin_dir / "python3.14").symlink_to(system_python)
+        for name in ("python", "python3", "𝜋thon"):
+            (bin_dir / name).symlink_to("python3.14")
+
+        with patch.object(admin, "_trusted_directory_chain", return_value=True):
+            self._verify_release(root, system_python=system_python)
+
+    def test_release_tree_rejects_unlisted_internal_symlink(self) -> None:
+        root = self._make_release(self.root / "release")
+        payload = root / "module.py"
+        payload.write_text("code", encoding="ascii")
+        payload.chmod(0o444)
+        (root / "module-alias.py").symlink_to("module.py")
+        with self.assertRaisesRegex(admin.AdminError, "unapproved symbolic link"):
+            self._verify_release(root)
+
+    def test_release_tree_rejects_wrong_python_314_alias_target(self) -> None:
+        root = self._make_release(self.root / "release")
+        (root / ".venv/bin/python").unlink()
+        system_python = self.root / "system-python"
+        system_python.write_bytes(b"trusted python fixture")
+        system_python.chmod(0o755)
+        bin_dir = root / ".venv/bin"
+        (bin_dir / "python3.14").symlink_to(system_python)
+        (bin_dir / "𝜋thon").symlink_to(system_python)
+        with patch.object(admin, "_trusted_directory_chain", return_value=True):
+            with self.assertRaisesRegex(
+                admin.AdminError, "unapproved symbolic link"
+            ):
+                self._verify_release(root, system_python=system_python)
 
     def test_pin_is_created_once_with_exact_private_metadata(self) -> None:
         path = self.root / "deployment-pin.json"

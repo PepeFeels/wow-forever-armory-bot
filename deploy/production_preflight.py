@@ -45,6 +45,13 @@ BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
 SYSTEM_PYTHON = "/usr/bin/python3.14"
+VENV_SYMLINK_TARGETS = {
+    ".venv/lib64": "lib",
+    ".venv/bin/python": "python3.14",
+    ".venv/bin/python3": "python3.14",
+    ".venv/bin/python3.14": SYSTEM_PYTHON,
+    ".venv/bin/𝜋thon": "python3.14",
+}
 SQLITE_READONLY_CHECK = r"""
 import sqlite3, sys
 uri = f"file:/proc/self/fd/{sys.argv[1]}?mode=ro&immutable=1"
@@ -839,6 +846,7 @@ class Preflight:
             system_python = Path(SYSTEM_PYTHON).resolve(strict=True)
             if not cls._trusted_directory_chain(system_python.parent, owner=owner):
                 return False
+            symlink_snapshots: dict[Path, tuple[tuple[int, ...], str, Path]] = {}
             for directory, children, files in os.walk(
                 root, followlinks=False, onerror=cls._walk_error
             ):
@@ -849,21 +857,40 @@ class Preflight:
                     if entry.st_uid != owner:
                         return False
                     if stat.S_ISLNK(entry.st_mode):
+                        relative_name = item.relative_to(root).as_posix()
+                        expected_target = VENV_SYMLINK_TARGETS.get(relative_name)
+                        if relative_name == ".venv/bin/python3.14":
+                            expected_target = SYSTEM_PYTHON
+                        target_text = os.readlink(item)
+                        if (
+                            expected_target is None
+                            or target_text != expected_target
+                        ):
+                            return False
                         resolved = item.resolve(strict=True)
-                        try:
-                            resolved.relative_to(root)
-                            internal = True
-                        except ValueError:
-                            internal = False
-                        safe_interpreter_link = (
-                            not internal
-                            and resolved == system_python
-                            and item.parent == root / ".venv/bin"
-                            and item.name in {"python", "python3", "python3.14"}
+                        expected_resolved = (
+                            root / ".venv/lib"
+                            if relative_name == ".venv/lib64"
+                            else system_python
                         )
-                        if not internal and not safe_interpreter_link:
+                        if resolved != expected_resolved:
                             return False
                         info = resolved.stat()
+                        symlink_snapshots[item] = (
+                            (
+                                entry.st_dev,
+                                entry.st_ino,
+                                entry.st_mode,
+                                entry.st_uid,
+                                entry.st_gid,
+                                entry.st_nlink,
+                                entry.st_size,
+                                entry.st_mtime_ns,
+                                entry.st_ctime_ns,
+                            ),
+                            target_text,
+                            resolved,
+                        )
                     else:
                         info = entry
                     if info.st_uid != owner or info.st_mode & 0o022:
@@ -880,6 +907,26 @@ class Preflight:
                             return False
                     else:
                         return False
+            for item, (expected, target_text, resolved) in symlink_snapshots.items():
+                current = item.lstat()
+                current_signature = (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mode,
+                    current.st_uid,
+                    current.st_gid,
+                    current.st_nlink,
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_ctime_ns,
+                )
+                if (
+                    not stat.S_ISLNK(current.st_mode)
+                    or current_signature != expected
+                    or os.readlink(item) != target_text
+                    or item.resolve(strict=True) != resolved
+                ):
+                    return False
             return True
         except OSError, RuntimeError, ValueError:
             return False

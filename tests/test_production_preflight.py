@@ -229,11 +229,17 @@ class ProductionPreflightTests(unittest.TestCase):
         release = root / "release"
         bin_dir = release / ".venv/bin"
         bin_dir.mkdir(parents=True)
+        (release / ".venv/lib").mkdir()
+        (release / ".venv/lib64").symlink_to(
+            "lib", target_is_directory=True
+        )
         (release / "app.py").write_text("pass\n", encoding="ascii")
         (release / "app.py").chmod(0o644)
         system_python.write_text("#!/bin/sh\n", encoding="ascii")
         system_python.chmod(0o755)
-        (bin_dir / "python").symlink_to(system_python)
+        (bin_dir / "python3.14").symlink_to(system_python)
+        for name in ("python", "python3", "𝜋thon"):
+            (bin_dir / name).symlink_to("python3.14")
         return release
 
     def _release_is_safe(self, release: Path, system_python: Path) -> bool:
@@ -258,6 +264,24 @@ class ProductionPreflightTests(unittest.TestCase):
             system_python = root / "system-python"
             release = self._release_tree(root, system_python)
             self.assertTrue(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_unlisted_internal_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "app-alias.py").symlink_to("app.py")
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_wrong_python314_venv_link_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            pi_link = release / ".venv/bin/𝜋thon"
+            pi_link.unlink()
+            pi_link.symlink_to(system_python)
+            self.assertFalse(self._release_is_safe(release, system_python))
 
     def test_release_rejects_symlink_escaping_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -93,7 +93,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_preflight_documented_hash_matches_committed_source(self) -> None:
         root = Path(__file__).parents[1]
         operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
-        expected = "a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817"
+        expected = "c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93"
         actual = hashlib.sha256(
             (root / "deploy/production_preflight.py").read_bytes()
         ).hexdigest()
@@ -136,6 +136,22 @@ class ReleaseMetadataTests(unittest.TestCase):
         ):
             self.assertIn(required, operations)
         self.assertNotIn("from deploy.production_admin import", operations)
+
+    def test_operations_documents_exact_python_314_venv_symlink_allowlist(
+        self,
+    ) -> None:
+        root = Path(__file__).parents[1]
+        operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
+        for required in (
+            "`.venv/lib64`",
+            "`.venv/bin/python`",
+            "`.venv/bin/python3`",
+            "`.venv/bin/python3.14`",
+            "`.venv/bin/𝜋thon`",
+            "All other symlinks, including links",
+            "standard `venv` module",
+        ):
+            self.assertIn(required, operations)
 
 
 if __name__ == "__main__":

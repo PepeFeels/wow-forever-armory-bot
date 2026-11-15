@@ -32,6 +32,14 @@ PIN_PATH = Path("/etc/wow-forever-armory-bot/deployment-pin.json")
 AUDIT_DIR = Path("/var/lib/armory-deployment-audit")
 MAX_JSON_BYTES = 65_536
 MAX_SOURCE_BYTES = 1_048_576
+SYSTEM_PYTHON = Path("/usr/bin/python3.14")
+VENV_SYMLINK_TARGETS = {
+    ".venv/lib64": "lib",
+    ".venv/bin/python": "python3.14",
+    ".venv/bin/python3": "python3.14",
+    ".venv/bin/python3.14": "/usr/bin/python3.14",
+    ".venv/bin/𝜋thon": "python3.14",
+}
 PIN_KEYS = frozenset({"release_sha", "previous_sha", "installer_sha256"})
 RECOVERY_CHECKS = frozenset(
     {
@@ -853,12 +861,53 @@ def _service_has(
     return bool(mode & bit)
 
 
+def _trusted_directory_chain(path: Path, *, owner_uid: int) -> bool:
+    try:
+        for directory in reversed((path, *path.parents)):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _trusted_system_python(
+    path: Path, *, owner_uid: int, service_uid: int, service_gid: int
+) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.lstat()
+    except OSError as exc:
+        raise AdminError("trusted system Python is unavailable") from exc
+    if (
+        not path.is_absolute()
+        or not _trusted_directory_chain(resolved.parent, owner_uid=owner_uid)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != owner_uid
+        or info.st_mode & 0o022
+        or not _service_has(
+            info.st_mode, info.st_uid, info.st_gid, service_uid, service_gid, 0o4
+        )
+        or not _service_has(
+            info.st_mode, info.st_uid, info.st_gid, service_uid, service_gid, 0o1
+        )
+    ):
+        raise AdminError("trusted system Python permissions are unsafe")
+    return resolved
+
+
 def _verify_release_tree(
     path: Path,
     *,
     service_uid: int,
     service_gid: int,
     owner_uid: int = 0,
+    system_python: Path = SYSTEM_PYTHON,
 ) -> None:
     try:
         root_info = path.lstat()
@@ -873,6 +922,8 @@ def _verify_release_tree(
 
     root_identity = (root_info.st_dev, root_info.st_ino)
     snapshots: dict[Path, tuple[int, ...]] = {path: _signature(root_info)}
+    symlink_snapshots: dict[Path, tuple[tuple[int, ...], str, Path]] = {}
+    resolved_system_python: Path | None = None
 
     def walk_error(_error: OSError) -> None:
         raise AdminError("recovery release tree could not be fully inspected")
@@ -902,7 +953,90 @@ def _verify_release_tree(
             for name in (*directories, *files):
                 entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
                 if stat.S_ISLNK(entry.st_mode):
-                    raise AdminError("recovery release tree contains a symbolic link")
+                    item = directory_path / name
+                    relative_name = item.relative_to(path).as_posix()
+                    expected_target = VENV_SYMLINK_TARGETS.get(relative_name)
+                    if relative_name == ".venv/bin/python3.14":
+                        expected_target = str(system_python)
+                    try:
+                        target_text = os.readlink(name, dir_fd=dir_fd)
+                    except OSError as exc:
+                        raise AdminError(
+                            "recovery release symbolic link could not be read"
+                        ) from exc
+                    if expected_target is None or target_text != expected_target:
+                        raise AdminError(
+                            "recovery release tree contains an unapproved symbolic link"
+                        )
+                    try:
+                        resolved_target = item.resolve(strict=True)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        raise AdminError(
+                            "recovery release symbolic link target is unavailable"
+                        ) from exc
+                    if relative_name == ".venv/lib64":
+                        expected_resolved = path / ".venv/lib"
+                        target_info = resolved_target.stat()
+                        if (
+                            resolved_target != expected_resolved
+                            or not stat.S_ISDIR(target_info.st_mode)
+                            or target_info.st_uid != owner_uid
+                            or target_info.st_mode & 0o022
+                            or not _service_has(
+                                target_info.st_mode,
+                                target_info.st_uid,
+                                target_info.st_gid,
+                                service_uid,
+                                service_gid,
+                                0o1,
+                            )
+                        ):
+                            raise AdminError(
+                                "venv lib64 link does not target its verified "
+                                "lib directory"
+                            )
+                    else:
+                        if resolved_system_python is None:
+                            resolved_system_python = _trusted_system_python(
+                                system_python,
+                                owner_uid=owner_uid,
+                                service_uid=service_uid,
+                                service_gid=service_gid,
+                            )
+                        if resolved_target != resolved_system_python:
+                            raise AdminError(
+                                "venv interpreter link does not target trusted "
+                                "system Python"
+                            )
+                        target_info = resolved_target.stat()
+                        if (
+                            not stat.S_ISREG(target_info.st_mode)
+                            or target_info.st_uid != owner_uid
+                            or target_info.st_mode & 0o022
+                            or not _service_has(
+                                target_info.st_mode,
+                                target_info.st_uid,
+                                target_info.st_gid,
+                                service_uid,
+                                service_gid,
+                                0o4,
+                            )
+                            or not _service_has(
+                                target_info.st_mode,
+                                target_info.st_uid,
+                                target_info.st_gid,
+                                service_uid,
+                                service_gid,
+                                0o1,
+                            )
+                        ):
+                            raise AdminError(
+                                "venv system interpreter permissions are unsafe"
+                            )
+                    symlink_snapshots[item] = (
+                        _signature(entry), target_text, resolved_target
+                    )
+                    continue
                 if name in directories:
                     if (
                         not stat.S_ISDIR(entry.st_mode)
@@ -972,10 +1106,23 @@ def _verify_release_tree(
             current = item.lstat()
             if stat.S_ISLNK(current.st_mode) or _signature(current) != expected:
                 raise AdminError("recovery release tree changed during inspection")
+        for item, (expected, target_text, resolved_target) in symlink_snapshots.items():
+            current = item.lstat()
+            if (
+                not stat.S_ISLNK(current.st_mode)
+                or _signature(current) != expected
+                or os.readlink(item) != target_text
+                or item.resolve(strict=True) != resolved_target
+            ):
+                raise AdminError(
+                    "recovery release symbolic link changed during inspection"
+                )
         final_info = path.lstat()
         if (final_info.st_dev, final_info.st_ino) != root_identity:
             raise AdminError("recovery release directory changed during inspection")
-    except OSError as exc:
+    except AdminError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
         raise AdminError("recovery release tree changed during inspection") from exc
     interpreter = path / ".venv/bin/python"
     try:

@@ -24,6 +24,14 @@ from pathlib import Path
 
 APPROVED_REPO = Path("/opt/wow-forever-armory-bot/deployment-checkout")
 INSTALLED_HELPER = Path("/opt/wow-forever-armory-bot/bin/production_install.py")
+SYSTEM_PYTHON = Path("/usr/bin/python3.14")
+VENV_SYMLINK_TARGETS = {
+    ".venv/lib64": "lib",
+    ".venv/bin/python": "python3.14",
+    ".venv/bin/python3": "python3.14",
+    ".venv/bin/python3.14": "/usr/bin/python3.14",
+    ".venv/bin/𝜋thon": "python3.14",
+}
 
 # Importing the snapshot helper must not dirty the trusted source checkout.
 sys.dont_write_bytecode = True
@@ -404,21 +412,132 @@ def _permits(info: os.stat_result, uid: int, gid: int, bit: int) -> bool:
     return bool(mode & bit)
 
 
-def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
+def _trusted_directory_chain(path: Path, *, owner_uid: int) -> bool:
+    try:
+        for directory in reversed((path, *path.parents)):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _verify_release_symlink(
+    release: Path,
+    path: Path,
+    uid: int,
+    gid: int,
+    *,
+    owner_uid: int = 0,
+    system_python: Path = SYSTEM_PYTHON,
+) -> None:
+    relative_name = path.relative_to(release).as_posix()
+    expected_target = VENV_SYMLINK_TARGETS.get(relative_name)
+    if relative_name == ".venv/bin/python3.14":
+        expected_target = str(system_python)
+    try:
+        info = path.lstat()
+        target_text = os.readlink(path)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallError(
+            "release symbolic link is unavailable",
+            category="release_symlink_rejected",
+        ) from exc
+    if (
+        not stat.S_ISLNK(info.st_mode)
+        or info.st_uid != owner_uid
+        or expected_target is None
+        or target_text != expected_target
+    ):
+        raise InstallError(
+            "release contains an unapproved symbolic link",
+            category="release_symlink_rejected",
+        )
+
+    if relative_name == ".venv/lib64":
+        expected_resolved = release / ".venv/lib"
+        target_info = resolved.stat()
+        valid_target = stat.S_ISDIR(target_info.st_mode)
+    else:
+        try:
+            expected_resolved = system_python.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InstallError(
+                "trusted system Python is unavailable",
+                category="release_symlink_rejected",
+            ) from exc
+        target_info = resolved.stat()
+        valid_target = (
+            _trusted_directory_chain(
+                expected_resolved.parent, owner_uid=owner_uid
+            )
+            and stat.S_ISREG(target_info.st_mode)
+        )
+
+    required_bit = 0o1 if stat.S_ISDIR(target_info.st_mode) else 0o4
+    if (
+        resolved != expected_resolved
+        or not valid_target
+        or target_info.st_uid != owner_uid
+        or target_info.st_mode & 0o022
+        or not _permits(target_info, uid, gid, required_bit)
+        or stat.S_ISREG(target_info.st_mode)
+        and not _permits(target_info, uid, gid, 0o1)
+    ):
+        raise InstallError(
+            "release symbolic link target is not a verified venv target",
+            category="release_symlink_rejected",
+        )
+
+
+def _verify_release_readable(
+    release: Path,
+    uid: int,
+    gid: int,
+    *,
+    owner_uid: int = 0,
+    system_python: Path = SYSTEM_PYTHON,
+) -> None:
     if release.is_symlink():
         raise InstallError(
             "release path must not be a symbolic link",
             category="release_marker_rejected",
         )
-    for directory, child_directories, files in os.walk(release, followlinks=False):
+    def walk_error(_error: OSError) -> None:
+        raise InstallError(
+            "release tree could not be fully inspected",
+            category="release_permissions_rejected",
+        )
+
+    for directory, child_directories, files in os.walk(
+        release, followlinks=False, onerror=walk_error
+    ):
         for path in (
             Path(directory),
             *(Path(directory) / name for name in child_directories),
         ):
             if path.is_symlink():
+                _verify_release_symlink(
+                    release,
+                    path,
+                    uid,
+                    gid,
+                    owner_uid=owner_uid,
+                    system_python=system_python,
+                )
                 continue
             info = path.stat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
                 raise InstallError(
                     "release directory ownership or mode is unsafe",
                     category="release_permissions_rejected",
@@ -430,8 +549,22 @@ def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
                 )
         for name in files:
             path = Path(directory) / name
+            if path.is_symlink():
+                _verify_release_symlink(
+                    release,
+                    path,
+                    uid,
+                    gid,
+                    owner_uid=owner_uid,
+                    system_python=system_python,
+                )
+                continue
             info = path.stat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
                 raise InstallError(
                     "release file ownership or mode is unsafe",
                     category="release_permissions_rejected",
@@ -460,7 +593,7 @@ def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
         ) from exc
     if (
         not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
+        or info.st_uid != owner_uid
         or info.st_mode & 0o022
         or not _permits(info, uid, gid, 0o4)
         or not _permits(info, uid, gid, 0o1)
