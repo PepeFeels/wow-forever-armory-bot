@@ -80,8 +80,10 @@ class ProductionInstallTests(unittest.TestCase):
                 source.size = len(source_data)
                 archive.addfile(source, io.BytesIO(source_data))
             archive_bytes = bundle.getvalue()
+            commands = []
 
             def fake_run(command, **kwargs):
+                commands.append(command)
                 if command[0] == "git":
                     return subprocess.CompletedProcess(command, 0, stdout=archive_bytes)
                 if "-m" in command and "venv" in command:
@@ -91,12 +93,6 @@ class ProductionInstallTests(unittest.TestCase):
                     interpreter = binary_dir / "python"
                     descriptor = os.open(interpreter, os.O_CREAT | os.O_WRONLY, 0o777)
                     os.close(descriptor)
-                if "compileall" in command:
-                    cache = root / "release/src/pkg/__pycache__"
-                    cache.mkdir(parents=True, mode=0o777)
-                    os.close(
-                        os.open(cache / "module.pyc", os.O_CREAT | os.O_WRONLY, 0o666)
-                    )
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             release = root / "release"
@@ -129,12 +125,13 @@ class ProductionInstallTests(unittest.TestCase):
                     stat.S_IMODE((release / ".venv/bin/python").stat().st_mode),
                     0o755,
                 )
-                self.assertEqual(
-                    stat.S_IMODE(
-                        (release / "src/pkg/__pycache__/module.pyc").stat().st_mode
-                    ),
-                    0o644,
+                syntax_check = next(
+                    command
+                    for command in commands
+                    if any("ast.parse" in part for part in command)
                 )
+                self.assertIn("-B", syntax_check)
+                self.assertFalse((release / "src/pkg/__pycache__").exists())
             finally:
                 os.umask(previous_umask)
 
@@ -429,6 +426,9 @@ class ProductionInstallTests(unittest.TestCase):
                     new_release, upgrade_existing=True, repo=Path(temporary)
                 )
             self.assertEqual((root / "current").resolve(), new_release)
+            self.assertEqual(
+                os.readlink(root / "current"), f"releases/{new_release.name}"
+            )
             self.assertTrue(old_release.is_dir())
             run.assert_called_once()
 
@@ -446,6 +446,26 @@ class ProductionInstallTests(unittest.TestCase):
                 with self.assertRaisesRegex(InstallError, "refusing to replace"):
                     _install_current_link(new_release)
             self.assertEqual((root / "current").resolve(), old_release)
+
+    def test_upgrade_rejects_noncanonical_current_symlink_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            old_sha = "a" * 40
+            new_sha = "b" * 40
+            old_release = releases / old_sha
+            new_release = releases / new_sha
+            old_release.mkdir(parents=True)
+            new_release.mkdir()
+            (old_release / ".installation-complete").write_text(old_sha)
+            current = root / "current"
+            current.symlink_to(f"releases//{old_sha}")
+            with patch("deploy.production_install.BASE", root):
+                with self.assertRaisesRegex(InstallError, "non-canonical"):
+                    _install_current_link(
+                        new_release, upgrade_existing=True, repo=Path(temporary)
+                    )
+            self.assertEqual(os.readlink(current), f"releases//{old_sha}")
 
     def test_installer_requires_exact_clean_release_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

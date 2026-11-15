@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -17,6 +19,212 @@ EXPECTED_SHA = "d" * 40
 
 
 class ProductionPreflightTests(unittest.TestCase):
+    def test_secure_json_hash_matches_same_validated_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            raw = b'{"decision":"verified"}\n'
+            record.write_bytes(raw)
+            record.chmod(0o600)
+            value, digest = production_preflight.Preflight._secure_json_with_hash(
+                record, owner=os.getuid(), mode=0o600
+            )
+            self.assertEqual(value, {"decision": "verified"})
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+
+    def test_secure_json_rejects_symlink_hardlink_and_unsafe_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="ascii")
+            target.chmod(0o600)
+            alias = root / "record.json"
+            alias.symlink_to(target)
+            with self.assertRaises(OSError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    alias, owner=os.getuid(), mode=0o600
+                )
+            alias.unlink()
+            os.link(target, alias)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid(), mode=0o600
+                )
+            target.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid() + 1, mode=0o600
+                )
+            target.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid() + 1, mode=0o600
+                )
+            alias.unlink()
+            target.chmod(0o640)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid(), mode=0o600
+                )
+
+    def test_secure_json_rejects_path_swap_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            replacement = Path(temporary) / "replacement.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            replacement.write_text('{"value":"new"}\n', encoding="ascii")
+            replacement.chmod(0o600)
+            real_read = os.read
+            swapped = False
+
+            def swap_after_read(fd, size):
+                nonlocal swapped
+                block = real_read(fd, size)
+                if not swapped:
+                    swapped = True
+                    os.replace(replacement, record)
+                return block
+
+            with patch.object(os, "read", side_effect=swap_after_read):
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    def test_secure_json_rejects_in_place_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            real_read = os.read
+            changed = False
+
+            def change_after_read(fd, size):
+                nonlocal changed
+                block = real_read(fd, size)
+                if not changed:
+                    changed = True
+                    record.write_text('{"value":"new"}\n', encoding="ascii")
+                    record.chmod(0o600)
+                return block
+
+            with patch.object(os, "read", side_effect=change_after_read):
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    def test_secure_json_rejects_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text("{}\n", encoding="ascii")
+            record.chmod(0o600)
+            with patch.object(os, "read", side_effect=PermissionError):
+                with self.assertRaises(OSError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    @staticmethod
+    def _recovery_fixture(audit: Path, *, ack_changes=None, fail_closed=True):
+        release_sha = "a" * 40
+        previous_sha = "b" * 40
+        manifest_path = audit / f"deployment-{release_sha}.json"
+        manifest = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "database_backup": "/backup/test.sqlite3",
+            "database_backup_sha256": "c" * 64,
+            "shared_preflight_backup": "/audit/preflight.py",
+            "shared_preflight_sha256": "d" * 64,
+            "created_at_utc": "2026-11-15T12:00:00+00:00",
+        }
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode() + b"\n"
+        manifest_path.write_bytes(manifest_bytes)
+        manifest_path.chmod(0o600)
+        journal = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "phase": "manual_recovery_required",
+            "fail_closed_verified": fail_closed,
+            "fail_closed_error": None,
+            "database_backup": manifest["database_backup"],
+            "database_backup_sha256": manifest["database_backup_sha256"],
+            "shared_preflight_backup": manifest["shared_preflight_backup"],
+            "shared_preflight_sha256": manifest["shared_preflight_sha256"],
+            "manifest": str(manifest_path),
+        }
+        journal_bytes = json.dumps(journal, sort_keys=True).encode() + b"\n"
+        journal_sha = hashlib.sha256(journal_bytes).hexdigest()
+        archive = audit / f"deployment-state-{journal_sha}.json"
+        archive.write_bytes(journal_bytes)
+        archive.chmod(0o600)
+        ack = {
+            "schema_version": 1,
+            "journal_sha256": journal_sha,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "decision": "manual_recovery_verified",
+            "approved_by": "admin-example",
+            "approval_reference": "CHANGE-185",
+            "approved_at_utc": "2026-11-15T12:30:00+00:00",
+        }
+        ack.update(ack_changes or {})
+        ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+        ack_path.write_text(json.dumps(ack, sort_keys=True) + "\n", encoding="ascii")
+        ack_path.chmod(0o600)
+        return archive, manifest_path, ack_path
+
+    def test_current_link_accepts_canonical_absolute_and_relative_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            release_sha = "a" * 40
+            release = base / "releases" / release_sha
+            release.mkdir(parents=True)
+            current = base / "current"
+            with patch.object(production_preflight, "BASE", base):
+                current.symlink_to(release)
+                self.assertEqual(
+                    production_preflight.Preflight._managed_release_target(current),
+                    release,
+                )
+                current.unlink()
+                current.symlink_to(Path("releases") / release_sha)
+                self.assertEqual(
+                    production_preflight.Preflight._managed_release_target(current),
+                    release,
+                )
+                current.unlink()
+                rejected = (
+                    f"releases//{release_sha}",
+                    f"releases/./{release_sha}",
+                    f"releases/../releases/{release_sha}",
+                    f"{base}/releases//{release_sha}",
+                    f"{base}/releases/./{release_sha}",
+                    f"{base}/releases/../releases/{release_sha}",
+                    str(base / "outside" / release_sha),
+                )
+                for raw_target in rejected:
+                    with self.subTest(raw_target=raw_target):
+                        current.symlink_to(raw_target)
+                        with self.assertRaises(ValueError):
+                            production_preflight.Preflight._managed_release_target(
+                                current
+                            )
+                        current.unlink()
+
+    def test_checkout_tree_rejects_python_bytecode_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            cache = checkout / "deploy/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "module.cpython-314.pyc").write_bytes(b"cache")
+            self.assertTrue(
+                production_preflight.Preflight._has_python_bytecode_cache(checkout)
+            )
+
     def _release_tree(self, root: Path, system_python: Path) -> Path:
         release = root / "release"
         bin_dir = release / ".venv/bin"
@@ -605,6 +813,82 @@ class ProductionPreflightTests(unittest.TestCase):
                 checker.incident_journal()
             self.assertEqual(checker.checks["deployment_recovery_ack"].status, "FAIL")
             self.assertEqual(journal.read_text(encoding="ascii"), "preserved evidence")
+
+    def test_missing_audit_directory_is_not_treated_as_resolved_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "missing-audit"
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            with patch.object(production_preflight, "AUDIT", audit):
+                checker.incident_journal()
+            self.assertEqual(checker.checks["deployment_recovery_ack"].status, "FAIL")
+
+    def test_empty_audit_directory_is_allowed_for_initial_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            self.assertEqual(
+                checker._verify_archived_deployments(audit, owner=os.getuid()), 0
+            )
+
+    def test_preflight_rejects_manifest_without_prior_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            orphan = audit / f"deployment-{'a' * 40}.json"
+            orphan.write_text("{}\n", encoding="ascii")
+            orphan.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+
+    def test_preflight_requires_archive_manifest_and_admin_ack_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, manifest, ack = self._recovery_fixture(audit)
+            self.assertEqual(
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                ),
+                1,
+            )
+
+            ack.unlink()
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+            self._recovery_fixture(audit, ack_changes={"manifest_sha256": "0" * 64})
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+            manifest.write_text("{}\n", encoding="ascii")
+            manifest.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+            self.assertTrue(archive.exists())
+
+    def test_preflight_rejects_unverified_fail_closed_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            self._recovery_fixture(audit, fail_closed=False)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+
+    def test_preflight_rejects_changed_archived_journal_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, _, _ = self._recovery_fixture(audit)
+            archive.write_text("tampered\n", encoding="ascii")
+            archive.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
 
     def test_systemd_check_only_uses_observation_commands(self) -> None:
         checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)

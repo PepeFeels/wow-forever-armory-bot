@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import signal
 import subprocess
@@ -43,6 +44,307 @@ class MemoryJournal:
 
 
 class InstallerDiagnosticTests(unittest.TestCase):
+    def test_audit_json_hash_matches_the_same_validated_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            raw = b'{"decision":"verified"}\n'
+            record.write_bytes(raw)
+            record.chmod(0o600)
+            value, digest = wrapper._read_audit_json(
+                record, owner_uid=os.getuid()
+            )
+            self.assertEqual(value, {"decision": "verified"})
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+
+    def test_audit_json_rejects_symlink_hardlink_and_unsafe_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="ascii")
+            target.chmod(0o600)
+            alias = root / "record.json"
+            alias.symlink_to(target)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._read_audit_json(alias, owner_uid=os.getuid())
+            alias.unlink()
+            os.link(target, alias)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._read_audit_json(target, owner_uid=os.getuid())
+            alias.unlink()
+            target.chmod(0o640)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._read_audit_json(target, owner_uid=os.getuid())
+            target.chmod(0o600)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._read_audit_json(target, owner_uid=os.getuid() + 1)
+
+    def test_audit_json_rejects_path_swap_during_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            replacement = Path(temporary) / "replacement.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            replacement.write_text('{"value":"new"}\n', encoding="ascii")
+            replacement.chmod(0o600)
+            real_read = os.read
+            swapped = False
+
+            def swap_after_read(fd, size):
+                nonlocal swapped
+                block = real_read(fd, size)
+                if not swapped:
+                    swapped = True
+                    os.replace(replacement, record)
+                return block
+
+            with patch.object(wrapper.os, "read", side_effect=swap_after_read):
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._read_audit_json(record, owner_uid=os.getuid())
+
+    def test_audit_json_rejects_in_place_change_during_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            real_read = os.read
+            changed = False
+
+            def change_after_read(fd, size):
+                nonlocal changed
+                block = real_read(fd, size)
+                if not changed:
+                    changed = True
+                    record.write_text('{"value":"new"}\n', encoding="ascii")
+                    record.chmod(0o600)
+                return block
+
+            with patch.object(wrapper.os, "read", side_effect=change_after_read):
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._read_audit_json(record, owner_uid=os.getuid())
+
+    def test_audit_json_rejects_read_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text("{}\n", encoding="ascii")
+            record.chmod(0o600)
+            with patch.object(os, "read", side_effect=PermissionError):
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._read_audit_json(record, owner_uid=os.getuid())
+
+    @staticmethod
+    def _archive_fixture(directory: Path, *, ack_changes=None, fail_closed=True):
+        release_sha = "a" * 40
+        previous_sha = "b" * 40
+        manifest_path = directory / f"deployment-{release_sha}.json"
+        manifest = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "database_backup": "/backup/test.sqlite3",
+            "database_backup_sha256": "c" * 64,
+            "shared_preflight_backup": "/audit/preflight.py",
+            "shared_preflight_sha256": "d" * 64,
+            "created_at_utc": "2026-11-15T12:00:00+00:00",
+        }
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode() + b"\n"
+        manifest_path.write_bytes(manifest_bytes)
+        manifest_path.chmod(0o600)
+        journal = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "phase": "manual_recovery_required",
+            "fail_closed_verified": fail_closed,
+            "fail_closed_error": None,
+            "database_backup": manifest["database_backup"],
+            "database_backup_sha256": manifest["database_backup_sha256"],
+            "shared_preflight_backup": manifest["shared_preflight_backup"],
+            "shared_preflight_sha256": manifest["shared_preflight_sha256"],
+            "manifest": str(manifest_path),
+        }
+        journal_bytes = json.dumps(journal, sort_keys=True).encode() + b"\n"
+        journal_sha = hashlib.sha256(journal_bytes).hexdigest()
+        archive = directory / f"deployment-state-{journal_sha}.json"
+        archive.write_bytes(journal_bytes)
+        archive.chmod(0o600)
+        ack = {
+            "schema_version": 1,
+            "journal_sha256": journal_sha,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "decision": "manual_recovery_verified",
+            "approved_by": "admin-example",
+            "approval_reference": "CHANGE-185",
+            "approved_at_utc": "2026-11-15T12:30:00+00:00",
+        }
+        ack.update(ack_changes or {})
+        ack_path = directory / f"deployment-recovery-ack-{journal_sha}.json"
+        ack_path.write_text(json.dumps(ack, sort_keys=True) + "\n", encoding="ascii")
+        ack_path.chmod(0o600)
+        return archive, manifest_path, ack_path
+
+    def test_deployment_journal_allows_empty_first_install_history_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            wrapper.DeploymentJournal(audit, owner_uid=os.getuid()).assert_no_pending()
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.DeploymentJournal(
+                    audit / "missing", owner_uid=os.getuid()
+                ).assert_no_pending()
+
+    def test_deployment_journal_rejects_archive_without_hash_bound_ack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, _, ack = self._archive_fixture(audit)
+            ack.unlink()
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
+            self.assertTrue(archive.is_file())
+
+    def test_deployment_journal_rejects_manifest_after_active_journal_disappears(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            orphan = audit / f"deployment-{'a' * 40}.json"
+            orphan.write_text("{}\n", encoding="ascii")
+            orphan.chmod(0o600)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
+
+    def test_deployment_journal_accepts_hash_bound_admin_ack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            self._archive_fixture(audit)
+            wrapper.DeploymentJournal(audit, owner_uid=os.getuid()).assert_no_pending()
+
+    def test_deployment_journal_rejects_tampered_hashes_and_missing_approval(self):
+        for changes in (
+            {"journal_sha256": "0" * 64},
+            {"manifest_sha256": "0" * 64},
+            {"approved_by": ""},
+            {"approval_reference": ""},
+        ):
+            with (
+                self.subTest(changes=changes),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                audit = Path(temporary)
+                self._archive_fixture(audit, ack_changes=changes)
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper.DeploymentJournal(
+                        audit, owner_uid=os.getuid()
+                    ).assert_no_pending()
+
+    def test_deployment_journal_rejects_changed_archived_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, _, _ = self._archive_fixture(audit)
+            archive.write_text("tampered\n", encoding="ascii")
+            archive.chmod(0o600)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
+
+    def test_deployment_journal_rejects_archive_without_verified_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            self._archive_fixture(audit, fail_closed=False)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
+
+    def test_wrapper_current_pointer_requires_exact_canonical_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            release_sha = "a" * 40
+            release = base / "releases" / release_sha
+            release.mkdir(parents=True)
+            current = base / "current"
+            with patch.object(wrapper, "BASE", base):
+                for target in (str(release), f"releases/{release_sha}"):
+                    current.symlink_to(target)
+                    self.assertEqual(
+                        wrapper._managed_current_target(
+                            current, owner_uid=os.getuid()
+                        ),
+                        release,
+                    )
+                    current.unlink()
+                for target in (
+                    f"releases//{release_sha}",
+                    f"releases/./{release_sha}",
+                    f"releases/../releases/{release_sha}",
+                    f"{base}/releases//{release_sha}",
+                    str(base / "outside" / release_sha),
+                ):
+                    with self.subTest(target=target):
+                        current.symlink_to(target)
+                        with self.assertRaises(wrapper.Refusal):
+                            wrapper._managed_current_target(
+                                current, owner_uid=os.getuid()
+                            )
+                        current.unlink()
+
+    def test_protected_checkout_requires_read_only_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            source = checkout / "README.md"
+            source.write_text("fixture\n", encoding="ascii")
+            source.chmod(0o444)
+            (checkout / ".git").chmod(0o555)
+            checkout.chmod(0o555)
+            try:
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+                source.chmod(0o644)
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._assert_root_owned_tree(
+                        checkout, owner_uid=os.getuid(), check_parents=False
+                    )
+            finally:
+                checkout.chmod(0o755)
+
+    def test_protected_checkout_rejects_python_bytecode_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            cache = checkout / "deploy/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "production_install.cpython-314.pyc").write_bytes(b"cache")
+            self.assertTrue(wrapper._has_python_bytecode_cache(checkout))
+
+    def test_protected_checkout_cache_scan_rejects_unreadable_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            hidden = checkout / "unreadable"
+            hidden.mkdir()
+            hidden.chmod(0)
+            try:
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._has_python_bytecode_cache(checkout)
+            finally:
+                hidden.chmod(0o700)
+
+    def test_protected_checkout_rejects_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "module.pyc").write_bytes(b"cache")
+            (checkout / "linked").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+
     def test_deployment_pin_is_private_and_contains_only_hashes(self):
         with tempfile.TemporaryDirectory() as temporary:
             pin = Path(temporary) / "deployment-pin.json"

@@ -345,6 +345,24 @@ def validate_current_release(target: Path, marker_text: str) -> None:
         raise Refusal("the installed release is not the approved previous release")
 
 
+def _managed_current_target(link: Path, *, owner_uid: int = 0) -> Path:
+    info = link.lstat()
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != owner_uid:
+        raise Refusal("the current release pointer has unsafe metadata")
+    raw_target = os.readlink(link)
+    relative = re.fullmatch(r"releases/([0-9a-f]{40})", raw_target)
+    absolute = re.fullmatch(
+        re.escape(str(BASE / "releases")) + r"/([0-9a-f]{40})", raw_target
+    )
+    match = relative or absolute
+    if match is None:
+        raise Refusal("the current release pointer is not canonical")
+    expected = BASE / "releases" / match.group(1)
+    if link.resolve(strict=True) != expected:
+        raise Refusal("the current release pointer resolves unexpectedly")
+    return expected
+
+
 def backup_retention(existing_count: int) -> int:
     if existing_count < 0:
         raise Refusal("backup inventory is invalid")
@@ -447,11 +465,270 @@ def _checked_unit_state() -> dict[str, tuple[str, str]]:
     return states
 
 
+def _has_python_bytecode_cache(path: Path) -> bool:
+    def onerror(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, names, files in os.walk(
+            path, followlinks=False, onerror=onerror
+        ):
+            if Path(directory).name == "__pycache__":
+                return True
+            if any(name == "__pycache__" for name in names) or any(
+                Path(name).suffix in {".pyc", ".pyo"} for name in files
+            ):
+                return True
+        return False
+    except OSError as exc:
+        raise Refusal("the trusted checkout could not be fully inspected") from exc
+
+
+def _read_audit_json(path: Path, *, owner_uid: int) -> tuple[dict[str, Any], str]:
+    try:
+        fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise Refusal("an audit record is unavailable") from exc
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != owner_uid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size > 65536
+        ):
+            raise Refusal("an audit record has unsafe metadata")
+        content = bytearray()
+        while len(content) <= 65536:
+            block = os.read(fd, min(65537 - len(content), 8192))
+            if not block:
+                break
+            content.extend(block)
+        after = os.fstat(fd)
+        before_signature = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_signature = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_gid,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        entry = os.stat(path, follow_symlinks=False)
+        entry_signature = (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_mode,
+            entry.st_uid,
+            entry.st_gid,
+            entry.st_nlink,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+        )
+        if (
+            len(content) != before.st_size
+            or before_signature != after_signature
+            or entry_signature != after_signature
+            or not stat.S_ISREG(entry.st_mode)
+        ):
+            raise Refusal("an audit record changed while it was being read")
+        raw = bytes(content)
+    except OSError as exc:
+        raise Refusal("an audit record could not be read safely") from exc
+    finally:
+        os.close(fd)
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+    except (UnicodeError, ValueError) as exc:
+        raise Refusal("an audit record is malformed") from exc
+    if not isinstance(value, dict):
+        raise Refusal("an audit record is malformed")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _verify_archived_deployments(directory: Path, *, owner_uid: int) -> None:
+    """Fail closed unless every retained journal and manifest is acknowledged."""
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError as exc:
+        raise Refusal("deployment audit history could not be listed") from exc
+
+    archives: dict[str, Path] = {}
+    acknowledgments: dict[str, Path] = {}
+    manifests: dict[str, Path] = {}
+    for entry in entries:
+        if entry.name.startswith("deployment-state-"):
+            match = re.fullmatch(r"deployment-state-([0-9a-f]{64})\.json", entry.name)
+            if match is None or match.group(1) in archives:
+                raise Refusal("an archived deployment journal has an invalid name")
+            archives[match.group(1)] = entry
+        elif entry.name.startswith("deployment-recovery-ack-"):
+            match = re.fullmatch(
+                r"deployment-recovery-ack-([0-9a-f]{64})\.json", entry.name
+            )
+            if match is None or match.group(1) in acknowledgments:
+                raise Refusal("a recovery acknowledgment has an invalid name")
+            acknowledgments[match.group(1)] = entry
+        else:
+            match = re.fullmatch(r"deployment-([0-9a-f]{40})\.json", entry.name)
+            if match is not None:
+                manifests[match.group(1)] = entry
+            elif entry.name.startswith("deployment-") and entry.name.endswith(
+                ".json"
+            ):
+                raise Refusal("a deployment manifest has an invalid name")
+
+    if set(archives) != set(acknowledgments):
+        raise Refusal("archived deployments are missing matching acknowledgments")
+
+    bound_manifests: set[str] = set()
+    for journal_sha, journal_path in archives.items():
+        journal, actual_journal_sha = _read_audit_json(
+            journal_path, owner_uid=owner_uid
+        )
+        if actual_journal_sha != journal_sha:
+            raise Refusal("an archived deployment journal hash does not match")
+        phase = journal.get("phase")
+        if phase == "manual_recovery_required":
+            if (
+                journal.get("fail_closed_verified") is not True
+                or journal.get("fail_closed_error") is not None
+            ):
+                raise Refusal("the archived incident was not verified fail-closed")
+        elif phase != "complete":
+            raise Refusal("the archived deployment is not in a resolved phase")
+
+        release_sha = journal.get("approved_release_sha")
+        previous_sha = journal.get("previous_release_sha")
+        if (
+            not isinstance(release_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", release_sha) is None
+            or not isinstance(previous_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", previous_sha) is None
+            or release_sha in bound_manifests
+        ):
+            raise Refusal("the archived deployment identity is invalid")
+        manifest_path = directory / f"deployment-{release_sha}.json"
+        if (
+            journal.get("manifest") != str(manifest_path)
+            or release_sha not in manifests
+            or manifests[release_sha] != manifest_path
+        ):
+            raise Refusal("the archived deployment manifest is missing or mismatched")
+        manifest, manifest_sha = _read_audit_json(
+            manifest_path, owner_uid=owner_uid
+        )
+        required_manifest_keys = {
+            "approved_release_sha",
+            "previous_release_sha",
+            "database_backup",
+            "database_backup_sha256",
+            "shared_preflight_backup",
+            "shared_preflight_sha256",
+            "created_at_utc",
+        }
+        if (
+            set(manifest) != required_manifest_keys
+            or manifest.get("approved_release_sha") != release_sha
+            or manifest.get("previous_release_sha") != previous_sha
+            or journal.get("database_backup") != manifest.get("database_backup")
+            or journal.get("database_backup_sha256")
+            != manifest.get("database_backup_sha256")
+            or journal.get("shared_preflight_backup")
+            != manifest.get("shared_preflight_backup")
+            or journal.get("shared_preflight_sha256")
+            != manifest.get("shared_preflight_sha256")
+        ):
+            raise Refusal("the archived deployment manifest contents do not match")
+
+        ack, _ = _read_audit_json(
+            acknowledgments[journal_sha], owner_uid=owner_uid
+        )
+        required_ack_keys = {
+            "schema_version",
+            "journal_sha256",
+            "manifest_sha256",
+            "approved_release_sha",
+            "previous_release_sha",
+            "decision",
+            "approved_by",
+            "approval_reference",
+            "approved_at_utc",
+        }
+        phase_decision = {
+            "manual_recovery_required": "manual_recovery_verified",
+            "complete": "deployment_completion_verified",
+        }[phase]
+        if (
+            set(ack) != required_ack_keys
+            or type(ack.get("schema_version")) is not int
+            or ack.get("schema_version") != 1
+            or ack.get("journal_sha256") != journal_sha
+            or ack.get("manifest_sha256") != manifest_sha
+            or ack.get("approved_release_sha") != release_sha
+            or ack.get("previous_release_sha") != previous_sha
+            or ack.get("decision") != phase_decision
+            or not isinstance(ack.get("approved_by"), str)
+            or not ack["approved_by"].strip()
+            or len(ack["approved_by"]) > 128
+            or not isinstance(ack.get("approval_reference"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", ack["approval_reference"]
+            )
+            is None
+            or not isinstance(ack.get("approved_at_utc"), str)
+        ):
+            raise Refusal("the recovery acknowledgment is invalid")
+        try:
+            approved_at = datetime.fromisoformat(ack["approved_at_utc"])
+        except ValueError as exc:
+            raise Refusal("the recovery acknowledgment time is invalid") from exc
+        if approved_at.tzinfo is None or approved_at.utcoffset() != UTC.utcoffset(
+            approved_at
+        ):
+            raise Refusal("the recovery acknowledgment time is not UTC")
+        bound_manifests.add(release_sha)
+
+    if set(manifests) != bound_manifests:
+        raise Refusal("a deployment manifest has no verified journal acknowledgment")
+
+
 def _assert_root_owned_tree(
     path: Path, *, owner_uid: int = 0, check_parents: bool = True
 ) -> None:
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise Refusal("the trusted checkout path is not canonical")
+    if _has_python_bytecode_cache(path):
+        raise Refusal("the trusted checkout contains Python bytecode caches")
     for parent in path.parents if check_parents else ():
         info = parent.lstat()
         if (
@@ -462,24 +739,34 @@ def _assert_root_owned_tree(
             raise Refusal(
                 "a trusted checkout parent is writable by an untrusted account"
             )
-    for current, directories, files in os.walk(path, followlinks=False):
-        current_path = Path(current)
-        for item in (
-            current_path,
-            *(current_path / name for name in directories),
-            *(current_path / name for name in files),
+    def onerror(error: OSError) -> None:
+        raise error
+
+    try:
+        for current, directories, files in os.walk(
+            path, followlinks=False, onerror=onerror
         ):
-            info = item.lstat()
-            if (
-                stat.S_ISLNK(info.st_mode)
-                or info.st_uid != owner_uid
-                or info.st_mode & 0o222
+            current_path = Path(current)
+            for item in (
+                current_path,
+                *(current_path / name for name in directories),
+                *(current_path / name for name in files),
             ):
-                raise Refusal(
-                    "the trusted checkout is not root-owned and write-protected"
-                )
-            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-                raise Refusal("the trusted checkout contains a special file")
+                info = item.lstat()
+                if item.is_symlink():
+                    raise Refusal("the trusted checkout contains a symbolic link")
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != owner_uid
+                    or info.st_mode & 0o222
+                ):
+                    raise Refusal(
+                        "the trusted checkout is not root-owned and write-protected"
+                    )
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise Refusal("the trusted checkout contains a special file")
+    except OSError as exc:
+        raise Refusal("the trusted checkout could not be fully inspected") from exc
     if not (path / ".git").is_dir() or (path / ".git").is_symlink():
         raise Refusal("the trusted checkout must be a full Git clone")
 
@@ -609,7 +896,7 @@ def _check_paths_and_current() -> tuple[int, int]:
     _assert_directory(BASE / "bin", owner=0, mode=0o755)
     _assert_directory(CONFIG.parent, owner=0, group=service_group.gr_gid, mode=0o750)
     _assert_directory(Path("/etc/systemd/system"), owner=0)
-    current_target = CURRENT.resolve(strict=True)
+    current_target = _managed_current_target(CURRENT)
     marker = current_target / ".installation-complete"
     _assert_managed_file(marker, owner=0)
     validate_current_release(current_target, marker.read_text(encoding="ascii"))
@@ -1087,8 +1374,12 @@ class DeploymentJournal:
         self.owner_uid = owner_uid
 
     def assert_no_pending(self) -> None:
-        if not self.directory.exists():
-            return
+        try:
+            self.directory.lstat()
+        except FileNotFoundError as exc:
+            raise Refusal("deployment audit directory is missing") from exc
+        except OSError as exc:
+            raise Refusal("deployment audit history is unavailable") from exc
         _assert_directory(self.directory, owner=self.owner_uid, mode=0o700)
         if (
             self.path.exists()
@@ -1099,6 +1390,7 @@ class DeploymentJournal:
             raise Refusal(
                 "an interrupted deployment journal requires administrator recovery"
             )
+        _verify_archived_deployments(self.directory, owner_uid=self.owner_uid)
 
     def _write_fd(self, fd: int, record: Mapping[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as output:
@@ -1338,9 +1630,9 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
     _check_checkout()
     uid, gid = _check_paths_and_current()
     states = _checked_unit_state()
-    _ensure_audit_dir()
     journal = journal or DeploymentJournal()
     journal.assert_no_pending()
+    _ensure_audit_dir()
 
     # The database check occurs before the timer or bot is interrupted.
     def check_database() -> None:
@@ -1390,7 +1682,7 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
         preflight_hash: str,
         stopped_db_signature: tuple[int, ...],
     ) -> None:
-        current_target = CURRENT.resolve(strict=True)
+        current_target = _managed_current_target(CURRENT)
         marker = current_target / ".installation-complete"
         _assert_managed_file(marker, owner=0)
         if (
@@ -1471,9 +1763,7 @@ def main(
         apply_deployment_pin(read_deployment_pin())
         journal = DeploymentJournal()
         # A pending journal is never automatically resumed or cleared.
-        if AUDIT_DIR.exists():
-            _assert_directory(AUDIT_DIR, owner=0, mode=0o700)
-            journal.assert_no_pending()
+        journal.assert_no_pending()
         old_handlers: dict[signal.Signals, Any] = {}
 
         def interrupted(signum: int, frame: Any) -> None:

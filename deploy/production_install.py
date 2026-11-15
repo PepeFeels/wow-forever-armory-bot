@@ -596,7 +596,19 @@ def _install_release_impl(
         ]
     )
     _run([str(python), "-m", "pip", "check"])
-    _run([str(python), "-m", "compileall", "-q", str(release / "src")])
+    # Parse each source file without creating __pycache__ in the immutable release.
+    _run(
+        [
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            "import ast, pathlib, sys; root = pathlib.Path(sys.argv[1]); "
+            "[ast.parse(path.read_text(encoding='utf-8'), filename=str(path)) "
+            "for path in root.rglob('*.py')]",
+            str(release / "src"),
+        ]
+    )
     for directory, subdirectories, files in os.walk(release, followlinks=False):
         os.chown(directory, 0, 0)
         for name in subdirectories:
@@ -634,7 +646,23 @@ def _install_current_link(
 ) -> None:
     current = BASE / "current"
     if current.is_symlink():
-        previous = current.resolve()
+        raw_target = os.readlink(current)
+        relative = re.fullmatch(r"releases/([0-9a-f]{40})", raw_target)
+        absolute = re.fullmatch(
+            re.escape(str(BASE / "releases")) + r"/([0-9a-f]{40})", raw_target
+        )
+        match = relative or absolute
+        if match is None:
+            raise InstallError(
+                "current has a non-canonical release link",
+                category="current_pointer_rejected",
+            )
+        previous = BASE / "releases" / match.group(1)
+        if current.resolve() != previous:
+            raise InstallError(
+                "current release link does not resolve to its declared target",
+                category="current_pointer_rejected",
+            )
         if previous == release.resolve():
             return
         if not upgrade_existing or repo is None:
@@ -689,7 +717,7 @@ def _install_current_link(
         raise InstallError(
             "temporary current symlink already exists; inspect it manually"
         )
-    temporary.symlink_to(release)
+    temporary.symlink_to(Path("releases") / release.name)
     os.replace(temporary, current)
 
 

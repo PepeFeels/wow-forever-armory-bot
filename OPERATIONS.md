@@ -645,6 +645,50 @@ service inactive. These `systemctl` commands only query state. If any check
 fails, do not change `current`, restore a database, clear the journal, or delete
 evidence; keep the system stopped and investigate the mismatch.
 
+For the recorded installer rejection, also verify the journal says
+`phase=manual_recovery_required`, `interrupted_phase=installer_started`,
+`failure_class=InstallerExecutionFailure`, and an installer failure with
+`category=installer_rejected`, `exit_code=1`, and
+`outcome=installer_rejected`. Require `fail_closed_verified` to be exactly
+`true` and `fail_closed_error` to be absent or null. These fields explain the
+recorded failure; they do not replace checking the units' live states.
+
+#### Recovery verification record
+
+Complete the checks in this order and record each as `PASS`, `FAIL`, or
+`UNKNOWN`; do not issue an acknowledgment if any result is not `PASS`:
+
+1. Record the pinned previous and approved release SHAs. Confirm `current`
+   resolves to one of those exact release directories, its installation marker
+   contains that directory's SHA, and the release tree and interpreter have the
+   required owner and permissions.
+2. Compare the live database's device, inode, size, modification/change times,
+   owner, group, and mode with the journal signature. Verify database
+   structure/integrity and confirm the backup's owner, mode, recorded SHA-256,
+   and SQLite integrity. Confirm the manifest repeats the release identities,
+   backup path/hash, and saved-preflight path/hash from the journal. Verify the
+   saved preflight file's SHA-256.
+3. Record exact queried unit states. For manual recovery, the bot and backup
+   timer must be `inactive/disabled`; the backup service must be `inactive`
+   (`static` or `disabled` enablement). Do not infer state from
+   `fail_closed_verified` alone.
+4. Preserve a result record with the journal and manifest hashes, observed
+   release target and marker, database signature and integrity result, backup
+   hash and integrity result, preflight hash, each unit's active/enabled state,
+   UTC completion time, administrator identity, approval reference, and final
+   decision. The `approval_reference` in the acknowledgment must point to this
+   separately approved record.
+
+The metadata comparison and `systemctl is-active`/`is-enabled` queries are
+read-only, but require a separately authorized administrator review session.
+SQLite integrity checks against the live database require the bot and backup
+service stopped, the backup timer disabled, and no SQLite sidecar files; those
+state changes are production changes and need separate explicit approval.
+Creating the archived journal and acknowledgment modifies audit files and
+requires a separate recovery approval. Switching `current`, restoring a
+database, or starting/enabling services each requires its own production
+approval. This task performed none of these actions.
+
 If every check passes and a separate recovery approval is given, preserve the
 journal, manifest, backup, both release directories, and the compatible shared
 preflight. If `current` still points to v2.0.0, an administrator may atomically
@@ -653,18 +697,57 @@ same-filesystem rename. After separately approved authorization, and only after
 confirming the temporary name is unused:
 
 ```bash
-sudo ln -s /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA> \
+sudo ln -s releases/<PREVIOUS_SHA> \
   /opt/wow-forever-armory-bot/.current.recovery
 sudo mv -T /opt/wow-forever-armory-bot/.current.recovery \
   /opt/wow-forever-armory-bot/current
 sudo readlink -e /opt/wow-forever-armory-bot/current
 ```
 
+For new pointers, use a relative target (`releases/<PREVIOUS_SHA>`) so the
+release tree can be relocated as one unit. The read-only preflight accepts
+both this canonical relative form and the exact canonical absolute form used
+by the existing installation. It rejects traversal, other paths, and
+non-release names. Existing pointers are not rewritten by preflight.
+
 If `current` already points to the previous release, do not switch it again.
 Do not replace the database with the backup for a code-only failure. Keep
 services stopped until a separate activation decision.
-The pending journal is evidence and continues to block another deployment;
-archive or resolve it only under a separately reviewed recovery procedure.
+The pending journal is evidence and continues to block another deployment.
+Never edit its JSON contents. After a separate recovery approval and all
+checks above, preserve the journal byte-for-byte. Compute its SHA-256 and move
+it to the unused name
+`deployment-state-<journal-sha256>.json` in the audit directory. Verify its
+hash after the move. Keep the manifest, backup, release directories, and
+preflight copy.
+
+Create a separate root-owned `0600` file named
+`deployment-recovery-ack-<journal-sha256>.json`. Its JSON object must contain
+exactly these fields: `schema_version` (integer `1`), `journal_sha256`,
+`manifest_sha256`, `approved_release_sha`, `previous_release_sha`, `decision`,
+`approved_by`, `approval_reference`, and `approved_at_utc`. For a manual
+recovery, `decision` is `manual_recovery_verified`; for a completed deployment,
+it is `deployment_completion_verified`. Bind the hashes to the archived
+journal and its manifest. `approved_by` must identify the approving
+administrator, `approval_reference` must identify the separately approved
+record, and `approved_at_utc` must be an ISO-8601 UTC time. This root-owned
+record is an administrative attestation, not a digital signature.
+
+Preflight and the deployment wrapper now verify every archived journal,
+matching manifest, and acknowledgment. An orphan manifest, archive, or
+acknowledgment blocks deployment. A first installation may proceed through
+this check only when the protected audit directory exists and contains no
+deployment records. A missing audit directory fails closed because previous
+history cannot be established. Never remove or overwrite prior artifacts. If
+any check or hash comparison fails, leave the active journal in place and keep
+the services stopped. No acknowledgment is created by this review.
+
+Both verifiers open each audit JSON with symlink following disabled, require a
+single-link regular file with the expected owner and exact private mode, and
+read a bounded byte sequence through that descriptor. They compare descriptor
+metadata before and after reading with the current directory entry, then parse
+JSON and calculate SHA-256 from that same byte sequence. Read errors, short
+reads, metadata changes, and path replacement stop verification.
 
 To deactivate in an approved rollback, stop and disable both units while
 retaining the database and backups:
@@ -995,6 +1078,15 @@ the interpreter and platform before creating a release, then installs only
 hash-verified dependencies and builds the package without an unpinned isolated
 build environment. Do not widen the supported Python/platform target without
 generating and reviewing matching artifact hashes.
+
+The installer validates Python sources by parsing them with `-I -B`; it must
+not use `compileall` in an immutable release because that command writes
+bytecode caches. The bot and backup unit set
+`PYTHONDONTWRITEBYTECODE=1`. The protected deployment checkout must contain no
+`__pycache__`, `.pyc`, or `.pyo` files; both preflight and the deployment
+wrapper reject such files even when Git ignores them. Run Python commands that read or import checkout modules
+with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so a diagnostic command cannot
+dirty the protected checkout.
 
 The official logo is optional and separately provisioned. If its rights are
 confirmed, install it at

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -185,9 +186,24 @@ class Preflight:
         raise error
 
     @staticmethod
+    def _has_python_bytecode_cache(path: Path) -> bool:
+        for directory, names, files in os.walk(
+            path, followlinks=False, onerror=Preflight._walk_error
+        ):
+            if Path(directory).name == "__pycache__":
+                return True
+            if any(name == "__pycache__" for name in names) or any(
+                Path(name).suffix in {".pyc", ".pyo"} for name in files
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _trusted_checkout_tree(path: Path) -> bool:
         try:
             if not path.is_absolute() or path.resolve(strict=True) != path:
+                return False
+            if Preflight._has_python_bytecode_cache(path):
                 return False
             for parent in path.parents:
                 parent_info = parent.lstat()
@@ -247,24 +263,76 @@ class Preflight:
         return True
 
     @staticmethod
-    def _secure_json(path: Path, *, owner: int, mode: int) -> dict[str, Any]:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    def _secure_json_with_hash(
+        path: Path, *, owner: int, mode: int
+    ) -> tuple[dict[str, Any], str]:
+        fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
         try:
-            info = os.fstat(fd)
+            before = os.fstat(fd)
             if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != owner
-                or stat.S_IMODE(info.st_mode) != mode
-                or info.st_size > 65536
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != owner
+                or stat.S_IMODE(before.st_mode) != mode
+                or before.st_nlink != 1
+                or before.st_size > 65536
             ):
                 raise ValueError("unsafe metadata")
-            raw = os.read(fd, 65537)
-            if len(raw) != info.st_size:
-                raise ValueError("short read")
+            content = bytearray()
+            while len(content) <= 65536:
+                block = os.read(fd, min(65537 - len(content), 8192))
+                if not block:
+                    break
+                content.extend(block)
+            after = os.fstat(fd)
+            before_signature = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_signature = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            entry = os.stat(path, follow_symlinks=False)
+            entry_signature = (
+                entry.st_dev,
+                entry.st_ino,
+                entry.st_mode,
+                entry.st_uid,
+                entry.st_gid,
+                entry.st_nlink,
+                entry.st_size,
+                entry.st_mtime_ns,
+                entry.st_ctime_ns,
+            )
+            if (
+                len(content) != before.st_size
+                or before_signature != after_signature
+                or entry_signature != after_signature
+                or not stat.S_ISREG(entry.st_mode)
+            ):
+                raise ValueError("file changed or short read")
+            raw = bytes(content)
         finally:
             os.close(fd)
-        if len(raw) > 65536:
-            raise ValueError("oversized data")
 
         def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
@@ -277,7 +345,11 @@ class Preflight:
         value = json.loads(raw.decode("ascii"), object_pairs_hook=unique)
         if not isinstance(value, dict):
             raise ValueError("invalid structure")
-        return value
+        return value, hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _secure_json(path: Path, *, owner: int, mode: int) -> dict[str, Any]:
+        return Preflight._secure_json_with_hash(path, owner=owner, mode=mode)[0]
 
     @staticmethod
     def _metadata(
@@ -628,6 +700,18 @@ class Preflight:
                 "systemd_states", "UNKNOWN", "read-only systemd state queries failed"
             )
 
+    @staticmethod
+    def _managed_release_target(current: Path) -> Path:
+        raw_target = os.readlink(current)
+        relative = re.fullmatch(r"releases/([0-9a-f]{40})", raw_target)
+        absolute = re.fullmatch(
+            re.escape(str(BASE / "releases")) + r"/([0-9a-f]{40})", raw_target
+        )
+        match = relative or absolute
+        if match is None:
+            raise ValueError("unsafe current symlink release identity")
+        return BASE / "releases" / match.group(1)
+
     def release_pointer(self) -> None:
         previous = self.pin["previous_sha"] if self.pin else None
         current = BASE / "current"
@@ -637,15 +721,7 @@ class Preflight:
             link = current.lstat()
             if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
                 raise ValueError
-            raw_target = Path(os.readlink(current))
-            if (
-                raw_target.is_absolute()
-                or len(raw_target.parts) != 2
-                or raw_target.parts[0] != "releases"
-                or re.fullmatch(r"[0-9a-f]{40}", raw_target.parts[1]) is None
-            ):
-                raise ValueError("unsafe current symlink target")
-            release_path = BASE / raw_target
+            release_path = self._managed_release_target(current)
             release_info = release_path.lstat()
             if not stat.S_ISDIR(release_info.st_mode) or release_info.st_uid != 0:
                 raise ValueError("release target is not a root-owned directory")
@@ -1197,11 +1273,174 @@ class Preflight:
                 "backup directory or newest backup has unsafe metadata",
             )
 
+    @classmethod
+    def _verify_archived_deployments(cls, audit: Path, *, owner: int) -> int:
+        try:
+            entries = tuple(audit.iterdir())
+        except OSError as exc:
+            raise ValueError("audit history cannot be listed") from exc
+
+        archives: dict[str, Path] = {}
+        acknowledgments: dict[str, Path] = {}
+        manifests: dict[str, Path] = {}
+        for entry in entries:
+            if entry.name.startswith("deployment-state-"):
+                match = re.fullmatch(
+                    r"deployment-state-([0-9a-f]{64})\.json", entry.name
+                )
+                if match is None or match.group(1) in archives:
+                    raise ValueError("archived journal name is invalid")
+                archives[match.group(1)] = entry
+            elif entry.name.startswith("deployment-recovery-ack-"):
+                match = re.fullmatch(
+                    r"deployment-recovery-ack-([0-9a-f]{64})\.json", entry.name
+                )
+                if match is None or match.group(1) in acknowledgments:
+                    raise ValueError("acknowledgment name is invalid")
+                acknowledgments[match.group(1)] = entry
+            else:
+                match = re.fullmatch(r"deployment-([0-9a-f]{40})\.json", entry.name)
+                if match is not None:
+                    manifests[match.group(1)] = entry
+                elif entry.name.startswith("deployment-") and entry.name.endswith(
+                    ".json"
+                ):
+                    raise ValueError("deployment manifest name is invalid")
+
+        if set(archives) != set(acknowledgments):
+            raise ValueError("an archived journal lacks its acknowledgment")
+
+        bound_manifests: set[str] = set()
+        for journal_sha, journal_path in archives.items():
+            journal, actual_journal_sha = cls._secure_json_with_hash(
+                journal_path, owner=owner, mode=0o600
+            )
+            if actual_journal_sha != journal_sha:
+                raise ValueError("archived journal hash mismatch")
+            phase = journal.get("phase")
+            if phase == "manual_recovery_required":
+                if (
+                    journal.get("fail_closed_verified") is not True
+                    or journal.get("fail_closed_error") is not None
+                ):
+                    raise ValueError("archived incident was not verified fail-closed")
+            elif phase != "complete":
+                raise ValueError("archived deployment is unresolved")
+
+            release_sha = journal.get("approved_release_sha")
+            previous_sha = journal.get("previous_release_sha")
+            if (
+                not isinstance(release_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", release_sha) is None
+                or not isinstance(previous_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", previous_sha) is None
+                or release_sha in bound_manifests
+            ):
+                raise ValueError("archived deployment identity is invalid")
+            manifest_path = audit / f"deployment-{release_sha}.json"
+            if (
+                journal.get("manifest") != str(manifest_path)
+                or manifests.get(release_sha) != manifest_path
+            ):
+                raise ValueError("deployment manifest is missing or mismatched")
+            manifest, manifest_sha = cls._secure_json_with_hash(
+                manifest_path, owner=owner, mode=0o600
+            )
+            manifest_keys = {
+                "approved_release_sha",
+                "previous_release_sha",
+                "database_backup",
+                "database_backup_sha256",
+                "shared_preflight_backup",
+                "shared_preflight_sha256",
+                "created_at_utc",
+            }
+            if (
+                set(manifest) != manifest_keys
+                or manifest.get("approved_release_sha") != release_sha
+                or manifest.get("previous_release_sha") != previous_sha
+                or journal.get("database_backup") != manifest.get("database_backup")
+                or journal.get("database_backup_sha256")
+                != manifest.get("database_backup_sha256")
+                or journal.get("shared_preflight_backup")
+                != manifest.get("shared_preflight_backup")
+                or journal.get("shared_preflight_sha256")
+                != manifest.get("shared_preflight_sha256")
+            ):
+                raise ValueError("deployment manifest contents do not match journal")
+
+            ack, _ = cls._secure_json_with_hash(
+                acknowledgments[journal_sha], owner=owner, mode=0o600
+            )
+            ack_keys = {
+                "schema_version",
+                "journal_sha256",
+                "manifest_sha256",
+                "approved_release_sha",
+                "previous_release_sha",
+                "decision",
+                "approved_by",
+                "approval_reference",
+                "approved_at_utc",
+            }
+            expected_decision = {
+                "manual_recovery_required": "manual_recovery_verified",
+                "complete": "deployment_completion_verified",
+            }[phase]
+            if (
+                set(ack) != ack_keys
+                or type(ack.get("schema_version")) is not int
+                or ack.get("schema_version") != 1
+                or ack.get("journal_sha256") != journal_sha
+                or ack.get("manifest_sha256") != manifest_sha
+                or ack.get("approved_release_sha") != release_sha
+                or ack.get("previous_release_sha") != previous_sha
+                or ack.get("decision") != expected_decision
+                or not isinstance(ack.get("approved_by"), str)
+                or not ack["approved_by"].strip()
+                or len(ack["approved_by"]) > 128
+                or not isinstance(ack.get("approval_reference"), str)
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", ack["approval_reference"]
+                )
+                is None
+                or not isinstance(ack.get("approved_at_utc"), str)
+            ):
+                raise ValueError("deployment acknowledgment is invalid")
+            try:
+                approved_at = datetime.fromisoformat(ack["approved_at_utc"])
+            except ValueError as exc:
+                raise ValueError("acknowledgment time is invalid") from exc
+            if approved_at.tzinfo is None or approved_at.utcoffset() != UTC.utcoffset(
+                approved_at
+            ):
+                raise ValueError("acknowledgment time is not UTC")
+            bound_manifests.add(release_sha)
+
+        if set(manifests) != bound_manifests:
+            raise ValueError("a deployment manifest has no acknowledged journal")
+        return len(archives)
+
     def incident_journal(self) -> None:
         active = AUDIT / "deployment-state.json"
         temporary = AUDIT / ".deployment-state.json.tmp"
         incident_manifest = AUDIT / f"deployment-{FAILED_V1_RELEASE}.json"
         try:
+            try:
+                AUDIT.lstat()
+            except FileNotFoundError:
+                self.add(
+                    "deployment_recovery_ack",
+                    "FAIL",
+                    "audit directory is missing; prior incident history "
+                    "cannot be verified",
+                )
+                self.add(
+                    "failed_v1_1_4_manifest",
+                    "UNKNOWN",
+                    "audit directory is missing; prior manifest cannot be checked",
+                )
+                return
             self._metadata(AUDIT, owner=0, mode=0o700, directory=True)
             if (
                 active.exists()
@@ -1227,10 +1466,14 @@ class Preflight:
                     )
                 self.add("deployment_recovery_ack", "FAIL", detail)
             else:
+                archived_count = self._verify_archived_deployments(AUDIT, owner=0)
                 self.add(
                     "deployment_recovery_ack",
                     "PASS",
-                    "no active deployment journal blocks a future wrapper run",
+                    "no previous deployment evidence exists"
+                    if archived_count == 0
+                    else f"{archived_count} archived deployment(s) have "
+                    "valid hash-bound approvals",
                 )
             if incident_manifest.exists() or incident_manifest.is_symlink():
                 self._metadata(incident_manifest, owner=0, mode=0o600)
