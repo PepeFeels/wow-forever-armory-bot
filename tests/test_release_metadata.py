@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import tomllib
 import unittest
@@ -64,21 +65,77 @@ class ReleaseMetadataTests(unittest.TestCase):
         source = match.group(1)
         ast.parse(source)
         for required in (
-            "deployment-pin.json",
             "deployment-state.json",
             "database_signature",
             "database_backup_sha256",
             "shared_preflight_sha256",
+            "ef1bba2bc30f0748cad943040109a1bc0838df07b6430ec5e5a6988577655c51",
+            "57a25089cd62cee224a6c5260fba53874969409132b8ea758716f64b03c233dc",
+            "load_reviewed_python_source",
             "verify_database_snapshot",
             "target in {previous_path, approved_path}",
         ):
             self.assertIn(required, source)
+        self.assertNotIn(
+            "from deploy.production_db_snapshot import verify_database_snapshot",
+            source,
+        )
+        self.assertNotIn(
+            '/opt/wow-forever-armory-bot/deployment-checkout")', source
+        )
         for forbidden in ("os.replace(", ".unlink(", ".write_text(", "restore_backup("):
             self.assertNotIn(forbidden, source)
         self.assertIn("same-filesystem rename", operations)
         self.assertIn("sudo mv -T", operations)
         self.assertIn("only query state", operations)
         self.assertIn("keep the system stopped", operations)
+
+    def test_preflight_documented_hash_matches_committed_source(self) -> None:
+        root = Path(__file__).parents[1]
+        operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
+        expected = "a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817"
+        actual = hashlib.sha256(
+            (root / "deploy/production_preflight.py").read_bytes()
+        ).hexdigest()
+        self.assertEqual(actual, expected)
+        self.assertGreaterEqual(operations.count(expected), 3)
+        self.assertNotIn(
+            "eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65",
+            operations,
+        )
+
+    def test_reviewed_admin_source_hash_matches_root_loader_pin(self) -> None:
+        root = Path(__file__).parents[1]
+        operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
+        match = re.search(r'ADMIN_SHA256 = "([0-9a-f]{64})"', operations)
+        self.assertIsNotNone(match)
+        actual = hashlib.sha256(
+            (root / "deploy/production_admin.py").read_bytes()
+        ).hexdigest()
+        self.assertEqual(match.group(1), actual)
+
+    def test_operations_documents_cache_free_bundle_checkout_and_admin_tool(
+        self,
+    ) -> None:
+        root = Path(__file__).parents[1]
+        operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
+        for required in (
+            "clone --no-local",
+            "deployment-checkout-v1.1.4-a1a6a2ad95302f7e3c4900f18e91691f43631e18",
+            "production_admin.py",
+            "ADMIN_SHA256",
+            "def load_source(path, expected_sha256)",
+            "does not import any candidate module",
+            "provision-pin",
+            "acknowledge-recovery",
+            "idempotent success",
+            "archive alone after a prior interruption",
+            "atomic no-replace",
+            "temporary acknowledgment file",
+            "never replace",
+        ):
+            self.assertIn(required, operations)
+        self.assertNotIn("from deploy.production_admin import", operations)
 
 
 if __name__ == "__main__":

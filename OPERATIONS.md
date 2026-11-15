@@ -171,8 +171,8 @@ settings before checking worktree cleanliness. Stage both copies only under a
 separately approved administrator procedure; this documentation does not
 authorize changing production paths.
 
-For this reviewed candidate, the script SHA-256 is
-`eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65`. Compare
+For the reviewed source in this checkout, the standalone preflight SHA-256 is
+`a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817`. Compare
 the staged copy's hash with this value before the root-controlled run.
 
 ```bash
@@ -211,18 +211,30 @@ exists, stop and choose a separately reviewed unused filename; do not replace
 it. If you choose another filename, set `SOURCE_BUNDLE` to that same path in
 the administrator commands below.
 
+If the shared development checkout contains untracked review artifacts, do
+not delete or move them to satisfy the clean-worktree check. Create a fresh
+clone of the reviewed branch first. A local clone copies committed Git data,
+not untracked files. Keep the clone and bundle until review and staging finish.
+
 ```bash
 set -eu
+umask 077
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0
-REPO='/home/codex-dev/projects/wow-forever-armory-bot-v2-candidate'
+SOURCE_REPO='/home/codex-dev/projects/wow-forever-armory-bot-v2-candidate'
+CLEAN_REPO='/tmp/wow-armory-v2-bundle-source'
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
 BRANCH='release/v2.0.0'
 BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
 GIT='/usr/bin/git'
 
+test ! -e "$CLEAN_REPO"
+test ! -L "$CLEAN_REPO"
 test ! -e "$BUNDLE"
 test ! -L "$BUNDLE"
+"$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+  clone --no-local --single-branch --branch "$BRANCH" "$SOURCE_REPO" "$CLEAN_REPO"
+REPO="$CLEAN_REPO"
 test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" branch --show-current)" = "$BRANCH"
 test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" rev-parse HEAD)" = "$RELEASE_SHA"
 test "$("$GIT" -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$REPO" rev-parse "refs/heads/$BRANCH")" = "$RELEASE_SHA"
@@ -242,7 +254,7 @@ that independently recorded value before allowing the copied bundle into Git.
 
 Then, from a trusted administrator terminal, set `BUNDLE_SHA256` to the
 recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
-hash (`eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65`).
+hash (`a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817`).
 If a command fails, stop. Do not remove or reuse the partial staging directory;
 have an administrator inspect it and choose a new unused staging root.
 The new repository starts on a separate `staging-import` branch. The bundle
@@ -254,7 +266,7 @@ set -euo pipefail
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
 BRANCH='release/v2.0.0'
 BUNDLE_SHA256='RECORDED_BUNDLE_SHA256'
-SCRIPT_SHA256='eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65'
+SCRIPT_SHA256='a3c00ea8f3b7ae6f7d43da7b04bb635ce3a43323d33c03975279454f16b17817'
 SOURCE_BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
 STAGE_ROOT='/var/lib/armory-preflight-staging'
 STAGE="$STAGE_ROOT/$RELEASE_SHA"
@@ -418,6 +430,87 @@ reuses an existing commit-specific staging directory. The checkout and script
 are root-owned and write-protected against `codex-dev`. Preflight execution is
 a separate action and is not part of staging.
 
+#### Install a staged, cache-free deployment checkout
+
+The bundle staging commands above prepare a preflight candidate under
+`/var/lib/armory-preflight-staging`; they do not replace the fixed deployment
+checkout. The v2.0.0 preflight and wrapper require
+`/opt/wow-forever-armory-bot/deployment-checkout` itself to be root-owned,
+write-protected, clean, and free of symlinks and Python bytecode caches. Keep
+the existing v1.1.4 checkout, including its `.pyc` files, as evidence. Do not
+run this replacement until the incident has been reviewed and acknowledged,
+the staged bundle and candidate have passed their checks, and a separate
+administrator change approval is in place. Do not run any wrapper during the
+two-rename interval.
+
+Copy the verified candidate to a temporary directory on the `/opt` filesystem.
+Verify that temporary checkout before moving the existing checkout. The
+versioned archive name must be unused. `mv -n` prevents replacement; every move
+is followed by checks that detect a skipped move. If a command fails, stop and
+preserve both directories for administrator review.
+
+```bash
+set -euo pipefail
+RELEASE_SHA='FINAL_REVIEWED_COMMIT'
+BASE='/opt/wow-forever-armory-bot'
+STAGED="/var/lib/armory-preflight-staging/$RELEASE_SHA/candidate"
+NEW="$BASE/.deployment-checkout-v2-$RELEASE_SHA"
+OLD="$BASE/deployment-checkout"
+ARCHIVE="$BASE/deployment-checkout-v1.1.4-a1a6a2ad95302f7e3c4900f18e91691f43631e18"
+
+sudo /usr/bin/test -d "$STAGED"
+sudo /usr/bin/test ! -L "$STAGED"
+sudo /usr/bin/test ! -e "$NEW"
+sudo /usr/bin/test ! -L "$NEW"
+sudo /usr/bin/test ! -e "$ARCHIVE"
+sudo /usr/bin/test ! -L "$ARCHIVE"
+sudo /usr/bin/test -d "$OLD"
+sudo /usr/bin/test ! -L "$OLD"
+sudo /usr/bin/cp -R --no-preserve=ownership "$STAGED" "$NEW"
+sudo /usr/bin/chown -R root:root "$NEW"
+sudo /usr/bin/chmod -R a-w "$NEW"
+
+root_git() {
+  REPO_PATH="$1"
+  shift
+  sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+    /usr/bin/git -c safe.directory="$REPO_PATH" -c core.fsmonitor=false \
+    -c core.hooksPath=/dev/null -c credential.helper= \
+    -C "$REPO_PATH" "$@"
+}
+
+test -z "$(sudo /usr/bin/find "$NEW" -xdev -type l -print -quit)"
+test -z "$(sudo /usr/bin/find "$NEW" -xdev \
+  \( -type d -name __pycache__ -o \
+     -type f \( -name '*.pyc' -o -name '*.pyo' \) \) -print -quit)"
+test -z "$(sudo /usr/bin/find "$NEW" -xdev ! -user root -print -quit)"
+test -z "$(sudo /usr/bin/find "$NEW" -xdev -perm /022 -print -quit)"
+[[ "$(root_git "$NEW" branch --show-current)" = release/v2.0.0 ]]
+[[ "$(root_git "$NEW" rev-parse HEAD)" = "$RELEASE_SHA" ]]
+test -z "$(root_git "$NEW" status --porcelain --untracked-files=all)"
+[[ "$(root_git "$OLD" branch --show-current)" = release/v1.1.4 ]]
+[[ "$(root_git "$OLD" rev-parse HEAD)" = \
+  a1a6a2ad95302f7e3c4900f18e91691f43631e18 ]]
+
+sudo /usr/bin/mv -T -n -- "$OLD" "$ARCHIVE"
+sudo /usr/bin/test ! -e "$OLD"
+sudo /usr/bin/test -d "$ARCHIVE"
+sudo /usr/bin/mv -T -n -- "$NEW" "$OLD"
+sudo /usr/bin/test ! -e "$NEW"
+sudo /usr/bin/test -d "$OLD"
+[[ "$(root_git "$OLD" rev-parse HEAD)" = "$RELEASE_SHA" ]]
+test -z "$(root_git "$OLD" status --porcelain --untracked-files=all)"
+```
+
+The old checkout is retained byte-for-byte at `ARCHIVE`; its cache files are
+not copied into the v2.0.0 checkout and are not deleted. This replacement
+changes a production path and disables the old wrapper's expected checkout
+identity. It requires root and a distinct provisioning approval. If either
+rename is interrupted, leave services alone and have an administrator restore
+the path arrangement after checking both directories and their Git identities.
+
 The staging-flow checks are reproducible without elevated privileges:
 
 ```bash
@@ -473,18 +566,37 @@ pointer, restore a database, or change service state. The SQLite snapshot check
 uses a temporary private copy under `/tmp` and removes only that temporary
 copy.
 
-Run this read-only metadata check as root. It accepts `current` pointing either
-to the previous release or to v2.0.0, covering a failure after the installer has
-already switched the pointer. It stops on any mismatch:
+Run this metadata check only from a separately reviewed root-owned copy and
+after explicit administrative approval. It accepts `current` pointing either
+to the previous release or to v2.0.0, covering a failure after the installer
+has already switched the pointer. The old incident is bound to the v1.1.4
+wrapper's embedded release identities, not to a future v2.0.0 pin. The check
+therefore verifies the exact old wrapper and installer hashes and uses those
+reviewed identities. Do not create the v2.0.0 pin until the incident is
+resolved and acknowledged.
+
+Replace `<FINAL_REVIEWED_SHA>` below with the commit-specific root-owned
+candidate staging path. The candidate must have passed bundle and tree checks.
+The snapshot module is read as bounded source bytes, checked against its
+reviewed SHA-256, then compiled directly in memory. This avoids importing the
+old checkout's `.pyc` files. The root command first scans the staged candidate
+for symlinks and Python caches. It then reads `production_admin.py` as a
+single-link regular file through a no-follow file descriptor, checks root
+ownership, protected permissions, stable metadata, and its exact SHA-256, and
+compiles those bytes in memory. It does not import any candidate module through
+Python's normal import machinery. `production_admin.py` uses only Python
+standard-library modules; no local project module is imported before the
+snapshot source has also been verified. The snapshot verifier still creates and removes a
+private temporary SQLite copy under `/tmp`; this does not alter the production
+database or backup, but that temporary write must be included in the separate
+administrative approval. The check stops on any mismatch:
 
 ```bash
 sudo /usr/bin/python3.14 -I -B - <<'PY'
-import grp, hashlib, json, os, pwd, re, stat
+import grp, hashlib, json, os, pwd, re, stat, types
 from pathlib import Path
-import sys
 
 root = Path("/var/lib/armory-deployment-audit")
-pin_path = Path("/etc/wow-forever-armory-bot/deployment-pin.json")
 journal_path = root / "deployment-state.json"
 base = Path("/opt/wow-forever-armory-bot")
 releases = base / "releases"
@@ -492,6 +604,77 @@ current = base / "current"
 state = Path("/var/lib/wow-forever-armory-bot")
 database = state / "guild-armory.sqlite3"
 backups = state / "backups"
+legacy_wrapper = Path("/usr/local/sbin/armory-deploy-a1a6a2a")
+legacy_installer = base / "bin/production_install.py"
+reviewed_candidate = Path(
+    "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
+)
+ADMIN_SHA256 = "39a136e23fad3896bf38db1a44d30bd720ecf6d0ed8bc8aa2ded98205976332d"
+
+def load_source(path, expected_sha256):
+    assert path.is_absolute() and path.resolve(strict=True) == path
+    parent = path.parent
+    parent_info = parent.lstat()
+    assert stat.S_ISDIR(parent_info.st_mode) and parent_info.st_uid == 0
+    assert not parent_info.st_mode & 0o222
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened_parent = os.fstat(directory_fd)
+        assert (opened_parent.st_dev, opened_parent.st_ino) == (
+            parent_info.st_dev, parent_info.st_ino
+        )
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        try:
+            before = os.fstat(fd)
+            assert stat.S_ISREG(before.st_mode) and before.st_uid == 0
+            assert not before.st_mode & 0o222 and before.st_nlink == 1
+            assert before.st_size <= 1_048_576
+            chunks = []
+            while True:
+                block = os.read(fd, 65_536)
+                if not block:
+                    break
+                chunks.append(block)
+                assert sum(map(len, chunks)) <= 1_048_576
+            raw = b"".join(chunks)
+            after = os.fstat(fd)
+            entry = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            signature = lambda info: (
+                info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_gid, info.st_nlink, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns,
+            )
+            assert signature(before) == signature(after) == signature(entry)
+            assert len(raw) == after.st_size
+        finally:
+            os.close(fd)
+        assert hashlib.sha256(raw).hexdigest() == expected_sha256
+        assert (os.fstat(directory_fd).st_dev, os.fstat(directory_fd).st_ino) == (
+            parent.lstat().st_dev, parent.lstat().st_ino
+        )
+        module = types.ModuleType("_reviewed_production_admin")
+        module.__file__ = str(path)
+        exec(compile(raw.decode("utf-8"), str(path), "exec", dont_inherit=True), module.__dict__)
+        return module
+    finally:
+        os.close(directory_fd)
+
+candidate_info = reviewed_candidate.lstat()
+assert stat.S_ISDIR(candidate_info.st_mode) and candidate_info.st_uid == 0
+assert not candidate_info.st_mode & 0o222
+for directory, names, files in os.walk(reviewed_candidate, followlinks=False):
+    assert Path(directory).name != "__pycache__"
+    for item in [Path(directory), *(Path(directory) / name for name in names + files)]:
+        info = item.lstat()
+        assert info.st_uid == 0 and not info.st_mode & 0o222
+        assert stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+        assert not stat.S_ISLNK(info.st_mode)
+        if stat.S_ISREG(info.st_mode):
+            assert info.st_nlink == 1
+    assert not any(name.endswith((".pyc", ".pyo")) for name in files)
+admin_module = load_source(
+    reviewed_candidate / "deploy/production_admin.py", ADMIN_SHA256
+)
 
 def read_private_json(path, owner, mode):
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -528,49 +711,21 @@ audit_info = root.lstat()
 assert stat.S_ISDIR(audit_info.st_mode) and audit_info.st_uid == 0
 assert stat.S_IMODE(audit_info.st_mode) == 0o700
 
-def service_has(mode, uid, gid, bit):
-    if uid == service_uid:
-        return bool(mode & (bit << 6))
-    if gid == service_gid:
-        return bool(mode & (bit << 3))
-    return bool(mode & bit)
-
 service_uid = pwd.getpwnam("wow-armory").pw_uid
 service_gid = grp.getgrnam("wow-armory").gr_gid
 
 def verify_release(path):
-    assert path.is_dir() and not path.is_symlink()
-    for directory, children, files in os.walk(path, followlinks=False):
-        for item in [Path(directory), *(Path(directory) / name for name in children)]:
-            if item.is_symlink():
-                continue
-            info = item.stat()
-            assert info.st_uid == 0 and not info.st_mode & 0o022
-            assert service_has(info.st_mode, service_uid, service_gid, 0o1)
-        for name in files:
-            item = Path(directory) / name
-            if item.is_symlink():
-                continue
-            info = item.stat()
-            assert info.st_uid == 0 and not info.st_mode & 0o022
-            assert service_has(info.st_mode, service_uid, service_gid, 0o4)
-            if info.st_mode & 0o111:
-                assert service_has(info.st_mode, service_uid, service_gid, 0o1)
-    interpreter = path / ".venv/bin/python"
-    info = interpreter.stat()
-    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0
-    assert not info.st_mode & 0o022
-    assert service_has(info.st_mode, service_uid, service_gid, 0o4)
-    assert service_has(info.st_mode, service_uid, service_gid, 0o1)
+    admin_module._verify_release_tree(
+        path, service_uid=service_uid, service_gid=service_gid
+    )
 
-pin = read_private_json(pin_path, 0, 0o600)
+regular(legacy_wrapper, 0, 0, 0o755)
+assert digest(legacy_wrapper) == "ef1bba2bc30f0748cad943040109a1bc0838df07b6430ec5e5a6988577655c51"
+regular(legacy_installer, 0, 0, 0o755)
+assert digest(legacy_installer) == "57a25089cd62cee224a6c5260fba53874969409132b8ea758716f64b03c233dc"
 journal = read_private_json(journal_path, 0, 0o600)
-assert set(pin) == {"release_sha", "previous_sha", "installer_sha256"}
-assert re.fullmatch(r"[0-9a-f]{40}", pin["release_sha"])
-assert re.fullmatch(r"[0-9a-f]{40}", pin["previous_sha"])
-assert re.fullmatch(r"[0-9a-f]{64}", pin["installer_sha256"])
-approved = pin["release_sha"]
-previous = pin["previous_sha"]
+approved = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
+previous = "dcceeb85464e09e34b112e41b16a833226c72270"
 assert journal["approved_release_sha"] == approved
 assert journal["previous_release_sha"] == previous
 assert journal["phase"] in {
@@ -618,10 +773,17 @@ assert digest(saved_preflight) == journal["shared_preflight_sha256"]
 assert manifest["shared_preflight_backup"] == str(saved_preflight)
 assert manifest["shared_preflight_sha256"] == journal["shared_preflight_sha256"]
 
-sys.path.insert(0, "/opt/wow-forever-armory-bot/deployment-checkout")
-from deploy.production_db_snapshot import verify_database_snapshot
-verify_database_snapshot(database, expected_owner=service_uid, expected_group=service_gid)
-verify_database_snapshot(backup, expected_owner=service_uid, expected_group=service_gid)
+snapshot_module = admin_module.load_reviewed_python_source(
+    reviewed_candidate / "deploy/production_db_snapshot.py",
+    expected_sha256="f99f098ff369b70a5b543f53795166fb7f9e12dd0af7fbb999c11f64e89d4a4b",
+    owner_uid=0,
+)
+snapshot_module.verify_database_snapshot(
+    database, expected_owner=service_uid, expected_group=service_gid
+)
+snapshot_module.verify_database_snapshot(
+    backup, expected_owner=service_uid, expected_group=service_gid
+)
 print(f"Metadata preflight passed; phase={journal['phase']}; current={target.name}; previous={previous}")
 PY
 ```
@@ -661,7 +823,9 @@ Complete the checks in this order and record each as `PASS`, `FAIL`, or
 1. Record the pinned previous and approved release SHAs. Confirm `current`
    resolves to one of those exact release directories, its installation marker
    contains that directory's SHA, and the release tree and interpreter have the
-   required owner and permissions.
+   required owner and permissions. For the recorded v1.1.4 incident, use the
+   release identities bound by the exact-hash-verified old wrapper; do not
+   create or substitute the future v2.0.0 pin during recovery.
 2. Compare the live database's device, inode, size, modification/change times,
    owner, group, and mode with the journal signature. Verify database
    structure/integrity and confirm the backup's owner, mode, recorded SHA-256,
@@ -714,12 +878,11 @@ If `current` already points to the previous release, do not switch it again.
 Do not replace the database with the backup for a code-only failure. Keep
 services stopped until a separate activation decision.
 The pending journal is evidence and continues to block another deployment.
-Never edit its JSON contents. After a separate recovery approval and all
-checks above, preserve the journal byte-for-byte. Compute its SHA-256 and move
-it to the unused name
-`deployment-state-<journal-sha256>.json` in the audit directory. Verify its
-hash after the move. Keep the manifest, backup, release directories, and
-preflight copy.
+Never edit its JSON contents. The administrative tool preserves the journal's
+exact bytes. It creates the archive with an atomic no-overwrite hard link,
+verifies the archive bytes and hash, and only then removes the active name.
+The archive, manifest, backup, release directories, and preflight copy remain
+as audit evidence.
 
 Create a separate root-owned `0600` file named
 `deployment-recovery-ack-<journal-sha256>.json`. Its JSON object must contain
@@ -732,6 +895,125 @@ journal and its manifest. `approved_by` must identify the approving
 administrator, `approval_reference` must identify the separately approved
 record, and `approved_at_utc` must be an ISO-8601 UTC time. This root-owned
 record is an administrative attestation, not a digital signature.
+
+Use the reviewed `deploy/production_admin.py` tool for these writes; do not
+hand-edit JSON, use `mv` alone, or use `install` to overwrite an existing
+target. Before root execution, copy the exact reviewed file to a root-owned
+non-writable path and verify its SHA-256 against the reviewed commit. For the
+inline recovery check above, use its independent no-follow source loader and
+the exact reviewed `ADMIN_SHA256`; do not import any module from the candidate
+checkout. The admin tool has only standard-library imports. Pin creation and
+acknowledgment use a locked directory descriptor, private exclusive temporary
+files, file and directory `fsync`, read-back checks, and atomic no-replace
+hard-link publication. Existing files and symlinks are never replaced.
+
+Provision a v2.0.0 pin only after the prior incident has been resolved and
+acknowledged, the installed v2.0.0 installer has been independently reviewed,
+and the final release commit has been approved. The exact target is
+`/etc/wow-forever-armory-bot/deployment-pin.json`; the parent must be root-owned
+mode `0750`. The pin must be a regular root-owned `0600` file containing exactly
+`release_sha`, `previous_sha`, and `installer_sha256`. The release and previous
+values are full lowercase 40-character commit SHAs, must differ, and the
+installer value is the exact SHA-256 of the installed helper. If the path
+already exists, stop; this command does not rotate or replace pins.
+
+```bash
+sudo /usr/bin/python3.14 -I -B \
+  <ROOT_OWNED_REVIEWED_COPY>/production_admin.py provision-pin \
+  --release-sha <FINAL_REVIEWED_COMMIT> \
+  --previous-sha <VERIFIED_PREVIOUS_RELEASE_SHA> \
+  --installer-sha256 <VERIFIED_INSTALLED_INSTALLER_SHA256>
+sudo /usr/bin/stat -c '%F %U:%G %a %s %n' \
+  /etc/wow-forever-armory-bot/deployment-pin.json
+sudo /usr/bin/sha256sum \
+  /etc/wow-forever-armory-bot/deployment-pin.json \
+  /opt/wow-forever-armory-bot/bin/production_install.py
+```
+
+For `acknowledge-recovery`, first preserve a root-owned `0600` review record at
+`recovery-review-<journal-sha256>.json` in the audit directory. It must contain
+the journal and manifest hashes, release identities, all of the following
+checks marked `PASS`, observed release target and marker, database signature
+and integrity result, backup path/hash/integrity, saved-preflight path/hash,
+all three live unit states, review completion time, administrator, approval
+reference, and approval time. The tool checks that observations agree with the
+journal and manifest, that every check passed, and that live systemd queries
+still show the required stopped states before archival, before active-journal
+removal, and immediately before acknowledgment publication.
+
+The checked review names are `release_pointer`, `installation_marker`,
+`release_permissions`, `database_signature`, `database_integrity`,
+`backup_metadata`, `backup_sha256`, `backup_integrity`, `manifest`,
+`saved_preflight_sha256`, `bot_unit_state`, `backup_timer_state`, and
+`backup_service_state`. Any `FAIL`, `UNKNOWN`, missing field, mismatched hash,
+active unit, changed journal, symlink in either release tree, unsafe
+owner/mode, hardlink, special file, or conflicting archive/acknowledgment
+causes refusal. The tool accepts only two safe journal states: an active
+journal alone, or an active journal and an archive that have identical bytes
+and the same inode, or the verified archive alone after a prior interruption.
+It rehashes the journal and manifest, rereads the administrative review,
+reruns the filesystem evidence checks, and queries unit states on every retry.
+It then creates or verifies the archive, removes the active name only after
+matching the inode, and publishes the acknowledgment without replacement.
+
+If interrupted at any point, do not edit or remove files. After confirming the
+original separate recovery approval remains valid, rerun the same
+`acknowledge-recovery` command with the same journal hash and review record.
+The retry revalidates all evidence and live unit states; it never treats the
+presence of an archive alone as approval. It can continue from the active
+journal, an identical active-plus-archive pair, or the archive alone. If an
+active journal and any acknowledgment file are both present, the tool refuses
+before changing files; this includes a journal restored after an earlier
+acknowledgment, so an old approval cannot authorize deleting that journal. The
+tool checks for this conflict again immediately before removing an active
+journal. Only an archive without an active journal may use a matching existing
+acknowledgment as an idempotent success, and only after fresh evidence checks.
+A differing acknowledgment or any other contradictory artifact is a hard
+refusal. An interrupted private temporary acknowledgment file is removed only
+after its type, owner, mode, link count, and directory entry are checked, and
+only after the evidence checks pass. Unrecognized or unsafe temporary files
+require manual administrator investigation; never delete them to force a retry.
+An interrupted private temporary acknowledgment file is removed only after
+its type, owner, mode, link count, and directory entry are checked, and only
+after the evidence checks pass. Unrecognized or unsafe temporary files require
+manual administrator investigation; never delete them to force a retry.
+
+The review JSON has exactly these top-level fields: `schema_version` (integer
+`1`), `journal_sha256`, `manifest_sha256`, `approved_release_sha`,
+`previous_release_sha`, `checks`, `observations`, `completed_at_utc`,
+`approved_by`, `approval_reference`, and `approved_at_utc`. `checks` must map
+exactly the 13 names above to `PASS`. `observations` must contain exactly
+`release_target`, `installation_marker`, `database_signature`,
+`database_integrity`, `backup_path`, `backup_sha256`, `backup_integrity`,
+`saved_preflight_path`, `saved_preflight_sha256`, and `systemd_states`.
+Database and backup integrity values must be `ok`; the recorded signature,
+backup path/hash, and saved-preflight path/hash must match the active journal.
+The recorded release target and marker must be one of the two journal-bound
+releases. `systemd_states` records the active and enabled state for the bot,
+backup timer, and backup service. The tool rechecks the live pointer, marker,
+release permissions, database signature, backup hash, preflight hash, and live
+systemd states before archiving. It does not rerun SQLite integrity; that result
+must come from the separately performed, approved recovery check.
+
+```bash
+sudo /usr/bin/python3.14 -I -B \
+  <ROOT_OWNED_REVIEWED_COPY>/production_admin.py acknowledge-recovery \
+  --journal-sha256 <REVIEWED_ACTIVE_JOURNAL_SHA256> \
+  --review-record \
+  /var/lib/armory-deployment-audit/recovery-review-<JOURNAL_SHA256>.json \
+  --approved-by '<APPROVING_ADMINISTRATOR>' \
+  --approval-reference '<SEPARATELY_APPROVED_RECORD>'
+```
+
+The review record is an administrative attestation, not a cryptographic
+signature. The command requires root and a separate recovery approval. It
+queries systemd but never changes service state, database contents, release
+pointer, or backup files. Its filesystem writes are limited to an archive
+hard-link, removal of the active journal name after verification, private
+temporary acknowledgment data, and the final acknowledgment file; it fsyncs
+the relevant files and audit directory. If recovery is not fully verified, it
+stops and leaves existing evidence untouched except for a safely resumable
+archive step already completed.
 
 Preflight and the deployment wrapper now verify every archived journal,
 matching manifest, and acknowledgment. An orphan manifest, archive, or
@@ -1047,6 +1329,30 @@ migrate or write the database, reinstall systemd files, or enable, start, or
 restart services. It refuses to replace an unmanaged or unexpected `current`
 release and fails if the target units are not stopped and disabled.
 
+### Installer provenance and helper pin
+
+The previously installed v1.1.4 helper is a patched standalone artifact, not a
+byte-for-byte copy of the v1.1.4 checkout source. Its recorded SHA-256 is
+`57a25089cd62cee224a6c5260fba53874969409132b8ea758716f64b03c233dc`; the
+checkout source was `79e0b186467a29eb35d9aee5442107e411157728a0e6df057edb45b401bf38aa`.
+The reviewed diff adds a fixed approved-checkout import path, a fixed source
+repository for installation, and a restricted `installer_rejected` diagnostic
+through the wrapper's inherited descriptor. Preserve the old binary and diff
+as evidence; do not treat either old hash as approved for v2.0.0.
+
+The current v2.0.0 checkout source for `deploy/production_install.py` has
+SHA-256 `49963032f4ab377d27835d8e1cca7ca4188ef7a97a3ddd1f6fe23df78125a255`.
+Provision the v2 helper only by copying the reviewed source bytes into the
+root-owned helper path and verifying that exact hash afterward. The pin's
+`installer_sha256` must equal both the reviewed source hash and installed
+helper hash. The new wrapper is a separate root-owned file at
+`/usr/local/sbin/armory-deploy-v2`; record its source and installed hashes in
+the administrative review even though the pin schema has no wrapper-hash
+field. Review sudoers separately and allow only the exact wrapper entry point.
+Replacing the shared helper makes the old wrapper's embedded hash check fail;
+perform this only after incident recovery and separate approval of the new
+helper, pin, wrapper, and sudoers rule.
+
 The version-controlled wrapper source is `deploy/production_wrapper.py`. It
 loads `release_sha`, `previous_sha`, and `installer_sha256` from
 `/etc/wow-forever-armory-bot/deployment-pin.json`, which must be a root-owned
@@ -1084,9 +1390,15 @@ not use `compileall` in an immutable release because that command writes
 bytecode caches. The bot and backup unit set
 `PYTHONDONTWRITEBYTECODE=1`. The protected deployment checkout must contain no
 `__pycache__`, `.pyc`, or `.pyo` files; both preflight and the deployment
-wrapper reject such files even when Git ignores them. Run Python commands that read or import checkout modules
-with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so a diagnostic command cannot
-dirty the protected checkout.
+wrapper reject such files even when Git ignores them. `-B` prevents writing new
+bytecode but does not prevent Python from loading an existing `.pyc`. When a
+privileged recovery check must execute reviewed source from a checkout, use
+`load_reviewed_python_source` from the root-owned staged candidate: it opens a
+single-link regular file without following symlinks, verifies stable metadata
+and the reviewed source hash, and compiles those exact source bytes in memory.
+Do not import a module from the old deployment checkout while its cache files
+remain there. Use `-B` for reviewed Python commands so they do not create new
+cache files.
 
 The official logo is optional and separately provisioned. If its rights are
 confirmed, install it at
