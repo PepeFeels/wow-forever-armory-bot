@@ -14,6 +14,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import signal
 import socket
 import stat
@@ -48,6 +49,10 @@ CREDENTIAL = Path("/etc/wow-forever-armory-bot/discord-token")
 PREFLIGHT = BASE / "bin/armory-db-preflight"
 INSTALLER = BASE / "bin/production_install.py"
 INSTALLER_SHA256 = "0" * 64
+DEPLOYMENT_PIN_SHA256 = "0" * 64
+RECOVERY_AUDIT_SHA256 = (
+    "a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d"
+)
 PYTHON = Path("/usr/bin/python3.14")
 GIT = Path("/usr/bin/git")
 SYSTEMCTL = Path("/usr/bin/systemctl")
@@ -94,6 +99,12 @@ def read_deployment_pin(
     path: Path = DEPLOYMENT_PIN, *, expected_owner: int = 0
 ) -> dict[str, str]:
     """Read release pins from a root-owned, private, non-symlink policy file."""
+    return _read_deployment_pin_with_hash(path, expected_owner=expected_owner)[0]
+
+
+def _read_deployment_pin_with_hash(
+    path: Path = DEPLOYMENT_PIN, *, expected_owner: int = 0
+) -> tuple[dict[str, str], str]:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
@@ -135,16 +146,21 @@ def read_deployment_pin(
         or not re.fullmatch(r"[0-9a-f]{64}", pin["installer_sha256"])
     ):
         raise Refusal("the deployment release pin is invalid")
-    return pin
+    return pin, hashlib.sha256(data).hexdigest()
 
 
-def apply_deployment_pin(pin: Mapping[str, str]) -> None:
+def apply_deployment_pin(
+    pin: Mapping[str, str], *, pin_sha256: str | None = None
+) -> None:
     """Set runtime pins only after the protected policy file is validated."""
     global RELEASE_SHA, PREVIOUS_SHA, INSTALLER_SHA256, MANIFEST_PATH
+    global DEPLOYMENT_PIN_SHA256
     global AUTHORIZED_WRITE_PATHS
     RELEASE_SHA = pin["release_sha"]
     PREVIOUS_SHA = pin["previous_sha"]
     INSTALLER_SHA256 = pin["installer_sha256"]
+    if pin_sha256 is not None:
+        DEPLOYMENT_PIN_SHA256 = pin_sha256
     MANIFEST_PATH = AUDIT_DIR / f"deployment-{RELEASE_SHA}.json"
     AUTHORIZED_WRITE_PATHS = (
         BASE,
@@ -441,12 +457,13 @@ def _systemctl_state(action: str, unit: str) -> str:
 def validate_unit_states(states: Mapping[str, tuple[str, str]]) -> None:
     if set(states) != set(UNITS):
         raise Refusal("the systemd unit inventory is incomplete or unexpected")
-    if states[SERVICE] != ("active", "enabled"):
-        raise Refusal("bot service state differs from the approved deployment baseline")
-    if states[BACKUP_TIMER] != ("active", "enabled"):
-        raise Refusal(
-            "backup timer state differs from the approved deployment baseline"
-        )
+    safe_initial_states = {("active", "enabled"), ("inactive", "disabled")}
+    if states[SERVICE] not in safe_initial_states:
+        raise Refusal("bot service is not in an approved initial state")
+    if states[BACKUP_TIMER] not in safe_initial_states:
+        raise Refusal("backup timer is not in an approved initial state")
+    if states[SERVICE] != states[BACKUP_TIMER]:
+        raise Refusal("bot service and backup timer initial states do not match")
     if states[BACKUP_SERVICE][0] != "inactive":
         raise Refusal("the scheduled backup job is currently running")
     if states[BACKUP_SERVICE][1] not in {"static", "disabled"}:
@@ -488,9 +505,7 @@ def _read_audit_json(path: Path, *, owner_uid: int) -> tuple[dict[str, Any], str
     try:
         fd = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
         )
     except OSError as exc:
         raise Refusal("an audit record is unavailable") from exc
@@ -575,151 +590,66 @@ def _read_audit_json(path: Path, *, owner_uid: int) -> tuple[dict[str, Any], str
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def _verify_archived_deployments(directory: Path, *, owner_uid: int) -> None:
-    """Fail closed unless every retained journal and manifest is acknowledged."""
+def _verify_archived_deployments(
+    directory: Path, *, owner_uid: int, lock_held: bool = False
+) -> None:
+    """Delegate incident validation to the shared reviewed source module."""
+    source = REPO / "deploy/recovery_audit.py"
+    if not source.exists():
+        source = Path(__file__).with_name("recovery_audit.py")
     try:
-        entries = tuple(directory.iterdir())
+        fd = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
     except OSError as exc:
-        raise Refusal("deployment audit history could not be listed") from exc
-
-    archives: dict[str, Path] = {}
-    acknowledgments: dict[str, Path] = {}
-    manifests: dict[str, Path] = {}
-    for entry in entries:
-        if entry.name.startswith("deployment-state-"):
-            match = re.fullmatch(r"deployment-state-([0-9a-f]{64})\.json", entry.name)
-            if match is None or match.group(1) in archives:
-                raise Refusal("an archived deployment journal has an invalid name")
-            archives[match.group(1)] = entry
-        elif entry.name.startswith("deployment-recovery-ack-"):
-            match = re.fullmatch(
-                r"deployment-recovery-ack-([0-9a-f]{64})\.json", entry.name
-            )
-            if match is None or match.group(1) in acknowledgments:
-                raise Refusal("a recovery acknowledgment has an invalid name")
-            acknowledgments[match.group(1)] = entry
-        else:
-            match = re.fullmatch(r"deployment-([0-9a-f]{40})\.json", entry.name)
-            if match is not None:
-                manifests[match.group(1)] = entry
-            elif entry.name.startswith("deployment-") and entry.name.endswith(
-                ".json"
-            ):
-                raise Refusal("a deployment manifest has an invalid name")
-
-    if set(archives) != set(acknowledgments):
-        raise Refusal("archived deployments are missing matching acknowledgments")
-
-    bound_manifests: set[str] = set()
-    for journal_sha, journal_path in archives.items():
-        journal, actual_journal_sha = _read_audit_json(
-            journal_path, owner_uid=owner_uid
+        raise Refusal("shared recovery validator is unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != owner_uid
+            or stat.S_IMODE(info.st_mode) != 0o644
+            or info.st_nlink != 1
+        ):
+            raise Refusal("shared recovery validator metadata is unsafe")
+        chunks = []
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            chunks.append(block)
+        data = b"".join(chunks)
+        if hashlib.sha256(data).hexdigest() != RECOVERY_AUDIT_SHA256:
+            raise Refusal("shared recovery validator hash mismatch")
+        after = os.fstat(fd)
+        if (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise Refusal("shared recovery validator changed while reading")
+    finally:
+        os.close(fd)
+    namespace = {"__file__": str(source), "__name__": "_armory_recovery_audit"}
+    exec(compile(data, str(source), "exec", dont_inherit=True), namespace)
+    try:
+        namespace["verify_audit_directory"](
+            directory,
+            owner=owner_uid,
+            group=os.lstat(directory).st_gid,
+            acquire_lock=not lock_held,
         )
-        if actual_journal_sha != journal_sha:
-            raise Refusal("an archived deployment journal hash does not match")
-        phase = journal.get("phase")
-        if phase == "manual_recovery_required":
-            if (
-                journal.get("fail_closed_verified") is not True
-                or journal.get("fail_closed_error") is not None
-            ):
-                raise Refusal("the archived incident was not verified fail-closed")
-        elif phase != "complete":
-            raise Refusal("the archived deployment is not in a resolved phase")
-
-        release_sha = journal.get("approved_release_sha")
-        previous_sha = journal.get("previous_release_sha")
-        if (
-            not isinstance(release_sha, str)
-            or re.fullmatch(r"[0-9a-f]{40}", release_sha) is None
-            or not isinstance(previous_sha, str)
-            or re.fullmatch(r"[0-9a-f]{40}", previous_sha) is None
-            or release_sha in bound_manifests
-        ):
-            raise Refusal("the archived deployment identity is invalid")
-        manifest_path = directory / f"deployment-{release_sha}.json"
-        if (
-            journal.get("manifest") != str(manifest_path)
-            or release_sha not in manifests
-            or manifests[release_sha] != manifest_path
-        ):
-            raise Refusal("the archived deployment manifest is missing or mismatched")
-        manifest, manifest_sha = _read_audit_json(
-            manifest_path, owner_uid=owner_uid
-        )
-        required_manifest_keys = {
-            "approved_release_sha",
-            "previous_release_sha",
-            "database_backup",
-            "database_backup_sha256",
-            "shared_preflight_backup",
-            "shared_preflight_sha256",
-            "created_at_utc",
-        }
-        if (
-            set(manifest) != required_manifest_keys
-            or manifest.get("approved_release_sha") != release_sha
-            or manifest.get("previous_release_sha") != previous_sha
-            or journal.get("database_backup") != manifest.get("database_backup")
-            or journal.get("database_backup_sha256")
-            != manifest.get("database_backup_sha256")
-            or journal.get("shared_preflight_backup")
-            != manifest.get("shared_preflight_backup")
-            or journal.get("shared_preflight_sha256")
-            != manifest.get("shared_preflight_sha256")
-        ):
-            raise Refusal("the archived deployment manifest contents do not match")
-
-        ack, _ = _read_audit_json(
-            acknowledgments[journal_sha], owner_uid=owner_uid
-        )
-        required_ack_keys = {
-            "schema_version",
-            "journal_sha256",
-            "manifest_sha256",
-            "approved_release_sha",
-            "previous_release_sha",
-            "decision",
-            "approved_by",
-            "approval_reference",
-            "approved_at_utc",
-        }
-        phase_decision = {
-            "manual_recovery_required": "manual_recovery_verified",
-            "complete": "deployment_completion_verified",
-        }[phase]
-        if (
-            set(ack) != required_ack_keys
-            or type(ack.get("schema_version")) is not int
-            or ack.get("schema_version") != 1
-            or ack.get("journal_sha256") != journal_sha
-            or ack.get("manifest_sha256") != manifest_sha
-            or ack.get("approved_release_sha") != release_sha
-            or ack.get("previous_release_sha") != previous_sha
-            or ack.get("decision") != phase_decision
-            or not isinstance(ack.get("approved_by"), str)
-            or not ack["approved_by"].strip()
-            or len(ack["approved_by"]) > 128
-            or not isinstance(ack.get("approval_reference"), str)
-            or re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", ack["approval_reference"]
-            )
-            is None
-            or not isinstance(ack.get("approved_at_utc"), str)
-        ):
-            raise Refusal("the recovery acknowledgment is invalid")
-        try:
-            approved_at = datetime.fromisoformat(ack["approved_at_utc"])
-        except ValueError as exc:
-            raise Refusal("the recovery acknowledgment time is invalid") from exc
-        if approved_at.tzinfo is None or approved_at.utcoffset() != UTC.utcoffset(
-            approved_at
-        ):
-            raise Refusal("the recovery acknowledgment time is not UTC")
-        bound_manifests.add(release_sha)
-
-    if set(manifests) != bound_manifests:
-        raise Refusal("a deployment manifest has no verified journal acknowledgment")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise Refusal("deployment audit history is unsafe or unresolved") from exc
 
 
 def _assert_root_owned_tree(
@@ -739,6 +669,7 @@ def _assert_root_owned_tree(
             raise Refusal(
                 "a trusted checkout parent is writable by an untrusted account"
             )
+
     def onerror(error: OSError) -> None:
         raise error
 
@@ -1336,6 +1267,33 @@ def _observe_unit_states() -> dict[str, tuple[str, str]]:
     }
 
 
+def _armory_process_present(proc_root: Path = Path("/proc")) -> bool:
+    """Fail closed if a bot process remains outside the managed systemd units."""
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            arguments = [
+                value.decode(errors="replace")
+                for value in (entry / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        if (
+            len(arguments) >= 3
+            and arguments[1:3] == ["-m", "wow_forever_armory.discord_bot"]
+        ) or any(Path(argument).name == "discord_bot.py" for argument in arguments):
+            return True
+    return False
+
+
 def _restore_states(states: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
     for unit in (SERVICE, BACKUP_TIMER):
         _set_unit_state(unit, states[unit])
@@ -1361,6 +1319,8 @@ def _fail_closed() -> dict[str, tuple[str, str]]:
         )
     if observed[BACKUP_SERVICE][0] != "inactive":
         raise Refusal("the backup service is active during fail-closed cleanup")
+    if _armory_process_present():
+        raise Refusal("an Armory bot process remains after fail-closed cleanup")
     return observed
 
 
@@ -1372,6 +1332,51 @@ class DeploymentJournal:
         self.path = directory / "deployment-state.json"
         self.temporary = directory / ".deployment-state.json.tmp"
         self.owner_uid = owner_uid
+        self.lock_fd: int | None = None
+
+    def acquire_exclusive_lock(self) -> None:
+        """Coordinate deployment journal changes with startup and recovery checks."""
+        try:
+            before = self.directory.lstat()
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or before.st_uid != self.owner_uid
+                or stat.S_IMODE(before.st_mode) != 0o700
+            ):
+                raise Refusal("deployment audit directory metadata is unsafe")
+            fd = os.open(
+                self.directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as exc:
+            raise Refusal("deployment audit directory cannot be locked") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != self.owner_uid
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise Refusal("deployment audit directory changed while locking")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise Refusal(
+                    "another recovery or deployment operation is active"
+                ) from exc
+            self.lock_fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def release_lock(self) -> None:
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
 
     def assert_no_pending(self) -> None:
         try:
@@ -1390,7 +1395,11 @@ class DeploymentJournal:
             raise Refusal(
                 "an interrupted deployment journal requires administrator recovery"
             )
-        _verify_archived_deployments(self.directory, owner_uid=self.owner_uid)
+        _verify_archived_deployments(
+            self.directory,
+            owner_uid=self.owner_uid,
+            lock_held=self.lock_fd is not None,
+        )
 
     def _write_fd(self, fd: int, record: Mapping[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as output:
@@ -1402,11 +1411,17 @@ class DeploymentJournal:
 
     def start(self, states: Mapping[str, tuple[str, str]]) -> None:
         record = {
+            "deployment_id": secrets.token_hex(16),
             "approved_release_sha": RELEASE_SHA,
             "previous_release_sha": PREVIOUS_SHA,
+            "deployment_pin_installer_sha256": INSTALLER_SHA256,
+            "deployment_pin_sha256": DEPLOYMENT_PIN_SHA256,
             "phase": "prepared",
-            "service_state": list(states[SERVICE]),
-            "backup_timer_state": list(states[BACKUP_TIMER]),
+            # Desired post-approval operating state is fixed by the approved
+            # release policy. Observed initial state is only used for safe
+            # cleanup before shutdown; it never triggers a service start.
+            "service_state": ["active", "enabled"],
+            "backup_timer_state": ["active", "enabled"],
             "started_at_utc": datetime.now(UTC).isoformat(),
         }
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -1417,6 +1432,8 @@ class DeploymentJournal:
                 "an interrupted deployment journal requires administrator recovery"
             ) from exc
         self._write_fd(fd, record)
+        # Keep the exclusive audit lock for the entire deployment. The active
+        # journal also blocks starts after this process exits.
 
     def update(self, phase: str, **details: Any) -> None:
         _assert_managed_file(self.path, owner=self.owner_uid, mode=0o600)
@@ -1430,6 +1447,9 @@ class DeploymentJournal:
             or record.get("previous_release_sha") != PREVIOUS_SHA
         ):
             raise Refusal("the deployment journal release identity is unexpected")
+        allowed = DEPLOYMENT_TRANSITIONS.get(record.get("phase"), frozenset())
+        if phase == "complete" or phase not in allowed:
+            raise Refusal("deployment journal transition is not allowed")
         record["phase"] = phase
         record["updated_at_utc"] = datetime.now(UTC).isoformat()
         record.update(details)
@@ -1443,6 +1463,40 @@ class DeploymentJournal:
         self._write_fd(fd, record)
         os.replace(self.temporary, self.path)
         _fsync_directory(self.directory)
+
+
+DEPLOYMENT_TRANSITIONS = {
+    "prepared": {
+        "timer_pause_started",
+        "aborted_before_service_changes",
+        "manual_recovery_required",
+    },
+    "timer_pause_started": {
+        "timer_paused",
+        "aborted_before_service_changes",
+        "manual_recovery_required",
+    },
+    "timer_paused": {
+        "backup_verified",
+        "aborted_before_service_changes",
+        "manual_recovery_required",
+    },
+    "backup_verified": {
+        "backup_and_preflight_verified",
+        "manual_recovery_required",
+    },
+    "backup_and_preflight_verified": {"shutdown_started", "manual_recovery_required"},
+    "shutdown_started": {"installer_started", "manual_recovery_required"},
+    "installer_started": {"installer_returned", "manual_recovery_required"},
+    "installer_returned": {"release_verified", "manual_recovery_required"},
+    "release_verified": {"installation_verified", "manual_recovery_required"},
+    # This is the logical transition table. DeploymentJournal.update rejects
+    # complete; only production_admin.finalize-deployment can perform it.
+    "installation_verified": {"complete"},
+    "complete": set(),
+    "aborted_before_service_changes": set(),
+    "manual_recovery_required": set(),
+}
 
 
 def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
@@ -1501,14 +1555,25 @@ def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
         journal.update("release_verified")
         phase = "release_verified"
 
-        journal.update("state_restoration_started")
-        phase = "state_restoration_started"
-        restored_states = ops["restore_states"](states)
-        journal.update(
-            "complete",
-            completed_at_utc=datetime.now(UTC).isoformat(),
-            final_unit_states=restored_states,
+        ops["release_backup_locks"](backup_locks)
+        backup_locks = None
+
+        result_name, result_sha256 = ops["write_installation_report"](
+            states,
+            backup,
+            backup_hash,
+            preflight_copy,
+            preflight_hash,
+            manifest,
+            db_signature,
         )
+        journal.update(
+            "installation_verified",
+            installation_result=result_name,
+            installation_result_sha256=result_sha256,
+            verified_at_utc=datetime.now(UTC).isoformat(),
+        )
+        phase = "installation_verified"
     except BaseException as exc:
         failure = type(exc).__name__
         diagnostic = None
@@ -1566,7 +1631,7 @@ def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
                 ops["restore_timer"](states[BACKUP_TIMER])
                 final_states = ops["observe_unit_states"]()
                 journal.update(
-                    "aborted_before_service_stop",
+                    "aborted_before_service_changes",
                     interrupted_phase=phase,
                     failure_class=failure,
                     final_unit_states=final_states,
@@ -1711,6 +1776,72 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
         if _sha256(backup_path) != backup_hash:
             raise Refusal("the verified database backup checksum changed")
 
+    def write_installation_report(
+        original_states: Mapping[str, tuple[str, str]],
+        backup_path: Path,
+        backup_hash: str,
+        preflight_copy: Path,
+        preflight_hash: str,
+        manifest: Path,
+        stopped_db_signature: tuple[int, ...],
+    ) -> tuple[str, str]:
+        observed = _observe_unit_states()
+        expected_stopped = {
+            SERVICE: ("inactive", "disabled"),
+            BACKUP_TIMER: ("inactive", "disabled"),
+        }
+        if any(observed.get(unit) != state for unit, state in expected_stopped.items()):
+            raise Refusal("managed services are not stopped and disabled after install")
+        if observed.get(BACKUP_SERVICE, (None, None))[0] != "inactive":
+            raise Refusal("backup service remains active after installation")
+        if _armory_process_present():
+            raise Refusal("an Armory bot process remains after installation")
+        active, _ = _read_audit_json(JOURNAL_PATH, owner_uid=0)
+        deployment_id = active.get("deployment_id")
+        if (
+            not isinstance(deployment_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
+        ):
+            raise Refusal("deployment identity is missing or invalid")
+        if (
+            active.get("phase") != "release_verified"
+            or active.get("installer_exit_code") != 0
+            or active.get("approved_release_sha") != RELEASE_SHA
+            or active.get("previous_release_sha") != PREVIOUS_SHA
+            or active.get("manifest") != str(manifest)
+            or active.get("database_backup_sha256") != backup_hash
+            or active.get("shared_preflight_backup") != str(preflight_copy)
+            or active.get("shared_preflight_sha256") != preflight_hash
+        ):
+            raise Refusal("installation result does not match the active journal")
+        if _db_signature() != stopped_db_signature:
+            raise Refusal("the production database changed during installation")
+        result = {
+            "schema_version": 1,
+            "deployment_id": deployment_id,
+            "approved_release_sha": RELEASE_SHA,
+            "previous_release_sha": PREVIOUS_SHA,
+            "manifest": str(manifest),
+            "manifest_sha256": _sha256(manifest),
+            "database_backup": str(backup_path),
+            "database_backup_sha256": backup_hash,
+            "shared_preflight_backup": str(preflight_copy),
+            "shared_preflight_sha256": preflight_hash,
+            "installer_sha256": INSTALLER_SHA256,
+            "deployment_pin_sha256": DEPLOYMENT_PIN_SHA256,
+            "database_signature": list(stopped_db_signature),
+            "intended_service_state": ["active", "enabled"],
+            "intended_backup_timer_state": ["active", "enabled"],
+            "observed_service_states": {
+                key: list(value) for key, value in observed.items()
+            },
+            "verified_at_utc": datetime.now(UTC).isoformat(),
+        }
+        name = f"deployment-installation-{deployment_id}.json"
+        path = AUDIT_DIR / name
+        _write_manifest_file(path, result)
+        return name, _sha256(path)
+
     ops: dict[str, Any] = {
         "states": states,
         "check_database": check_database,
@@ -1726,6 +1857,7 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
         "database_signature": _db_signature,
         "install": lambda: _run_installer(installer_command(), timeout=3600),
         "verify_release": verify_release,
+        "write_installation_report": write_installation_report,
         "restore_states": _restore_states,
         "restore_timer": lambda state: _set_unit_state(BACKUP_TIMER, state),
         "fail_closed": _fail_closed,
@@ -1760,22 +1892,27 @@ def main(
         validate_environment(environ)
         validate_host(socket.gethostname())
         os.umask(0o077)
-        apply_deployment_pin(read_deployment_pin())
+        pin, pin_sha256 = _read_deployment_pin_with_hash()
+        apply_deployment_pin(pin, pin_sha256=pin_sha256)
         journal = DeploymentJournal()
-        # A pending journal is never automatically resumed or cleared.
-        journal.assert_no_pending()
-        old_handlers: dict[signal.Signals, Any] = {}
-
-        def interrupted(signum: int, frame: Any) -> None:
-            raise Refusal(f"deployment interrupted by signal {signum}")
-
-        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            old_handlers[signum] = signal.signal(signum, interrupted)
+        journal.acquire_exclusive_lock()
         try:
-            deploy(journal)
+            # A pending journal is never automatically resumed or cleared.
+            journal.assert_no_pending()
+            old_handlers: dict[signal.Signals, Any] = {}
+
+            def interrupted(signum: int, frame: Any) -> None:
+                raise Refusal(f"deployment interrupted by signal {signum}")
+
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                old_handlers[signum] = signal.signal(signum, interrupted)
+            try:
+                deploy(journal)
+            finally:
+                for signum, handler in old_handlers.items():
+                    signal.signal(signum, handler)
         finally:
-            for signum, handler in old_handlers.items():
-                signal.signal(signum, handler)
+            journal.release_lock()
         return 0
     except Refusal as exc:
         print(f"Armory deployment refused: {exc}", file=sys.stderr)

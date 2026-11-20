@@ -80,9 +80,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             "from deploy.production_db_snapshot import verify_database_snapshot",
             source,
         )
-        self.assertNotIn(
-            '/opt/wow-forever-armory-bot/deployment-checkout")', source
-        )
+        self.assertNotIn('/opt/wow-forever-armory-bot/deployment-checkout")', source)
         for forbidden in ("os.replace(", ".unlink(", ".write_text(", "restore_backup("):
             self.assertNotIn(forbidden, source)
         self.assertIn("same-filesystem rename", operations)
@@ -93,14 +91,14 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_preflight_documented_hash_matches_committed_source(self) -> None:
         root = Path(__file__).parents[1]
         operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
-        expected = "c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93"
+        expected = "4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198"
         actual = hashlib.sha256(
             (root / "deploy/production_preflight.py").read_bytes()
         ).hexdigest()
         self.assertEqual(actual, expected)
         self.assertGreaterEqual(operations.count(expected), 3)
         self.assertNotIn(
-            "eb3d30daeae34cdcf627250532cdfcbb6fee37cde040bdade55ad99b06d89e65",
+            "17c7537cf30c2208ff0242978a43d92910992c136cb92840f79180296d738883",
             operations,
         )
 

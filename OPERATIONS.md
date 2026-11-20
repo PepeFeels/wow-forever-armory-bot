@@ -22,8 +22,8 @@ ARMORY_LOG_FORMAT=text
 ARMORY_BACKUP_RETENTION=14
 ```
 
-`ARMORY_ENVIRONMENT=development` and optional `DISCORD_TEST_GUILD_ID` are for
-local development only; omit both from the production EnvironmentFile.
+Do not place Discord command-sync options or approval values in the production
+EnvironmentFile. Normal startup never synchronizes global commands.
 
 Place the token in `/etc/wow-forever-armory-bot/discord-token`, also mode
 `0600` and root-owned. systemd passes it as a credential file. The stable
@@ -134,12 +134,15 @@ sudo /usr/bin/python3.14 deploy/production_install.py \
 
 The release remains stopped and disabled. Before any approved start, verify
 `current`, release marker, systemd units, database integrity, and backup
-availability. Both the startup preflight and isolated installer snapshot
-verification accept a correctly initialized database with zero guild rows,
-members, and characters. They continue to reject an absent, zero-byte,
-uninitialized, corrupt, or restore-gated database, and the snapshot verifier
-retains its source ownership, permissions, WAL/SHM consistency, signature, and
-isolation checks. No migration command is part of this upgrade path.
+availability. The isolated installer snapshot verification accepts a
+correctly initialized database with zero guild rows, members, and characters;
+it rejects an absent, zero-byte, uninitialized, corrupt, or restore-gated
+database and retains its source ownership, permissions, WAL/SHM consistency,
+signature, and isolation checks. The systemd startup gate checks database file
+and sidecar metadata plus the restore marker only; it never opens SQLite or
+reads WAL/SHM contents. Database integrity must be checked by the isolated
+snapshot/recovery procedure before an approved activation. No migration
+command is part of this upgrade path.
 
 For a code rollback, keep both units stopped and disabled, preserve the new
 release and all state/backups, and verify that the previous release supports
@@ -172,7 +175,7 @@ separately approved administrator procedure; this documentation does not
 authorize changing production paths.
 
 For the reviewed source in this checkout, the standalone preflight SHA-256 is
-`c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93`. Compare
+`4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198`. Compare
 the staged copy's hash with this value before the root-controlled run.
 
 ```bash
@@ -254,7 +257,7 @@ that independently recorded value before allowing the copied bundle into Git.
 
 Then, from a trusted administrator terminal, set `BUNDLE_SHA256` to the
 recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
-hash (`c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93`).
+hash (`4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198`).
 If a command fails, stop. Do not remove or reuse the partial staging directory;
 have an administrator inspect it and choose a new unused staging root.
 The new repository starts on a separate `staging-import` branch. The bundle
@@ -266,7 +269,7 @@ set -euo pipefail
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
 BRANCH='release/v2.0.0'
 BUNDLE_SHA256='RECORDED_BUNDLE_SHA256'
-SCRIPT_SHA256='c3cf64739c835abd7c16a6ec66ae32d9237001fb2e1279ac59017b8ae02d5a93'
+SCRIPT_SHA256='4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198'
 SOURCE_BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
 STAGE_ROOT='/var/lib/armory-preflight-staging'
 STAGE="$STAGE_ROOT/$RELEASE_SHA"
@@ -554,6 +557,54 @@ or backup files. Resolve an unknown result with a separately reviewed
 read-only procedure; do not change service or database state as part of this
 preflight.
 
+The deployment wrapper records the database signature after managed services
+have stopped and before the installer starts. If recovery later finds changed
+`mtime_ns` or `ctime_ns`, preserve the original incident signature; do not edit
+the journal. A timestamp difference alone does not identify changed rows. A
+`member_image_updated` log event is emitted after `set_row_message` updates a
+member row, so an event at the database-change time is evidence of a likely
+legitimate application write. It is not a row-level audit or proof that every
+change was legitimate.
+
+When the database and its `-wal`/`-shm` sidecars exist, do not run SQLite
+integrity checks directly against the original files. SQLite may recover or
+update sidecar state. Use the hash-verified `production_db_snapshot.py` reader:
+it opens the originals read-only with `O_NOATIME` and without following
+symlinks, copies the main database and WAL into a private temporary directory,
+validates the WAL, runs SQLite integrity/schema checks on that copy, checks
+that the original sources did not change, then removes only the temporary
+copy. It refuses to run on a platform without `O_NOATIME`. This includes
+committed WAL data without changing source contents or access times. A
+standalone copy of only the main database is not sufficient evidence while a
+WAL exists.
+
+The previously staged and reviewed snapshot source had SHA-256
+`f99f098ff369b70a5b543f53795166fb7f9e12dd0af7fbb999c11f64e89d4a4b`. The
+TASK-198X development hardening adds mandatory `O_NOATIME` and currently has
+SHA-256 `95fe1ba3d9c9aaae3c3aa4459fa5e1185afded05bd6f5f5bacf7a7db287fb538`.
+These are different source versions. Do not execute the new source on a
+production host until its change is independently reviewed and copied to a
+root-owned protected path with that exact hash. The existing reviewed copy
+does not provide the new no-atime guarantee.
+
+If the current snapshot passes integrity, preserve the current database as the
+database of record for a code-only installer failure. Do not restore the older
+incident backup merely to return to pre-deployment rows; that could discard
+legitimate later updates. Compare only aggregate table counts or a separately
+reviewed privacy-preserving difference report. Do not put character names,
+user identifiers, profile data, or row values in the incident report.
+
+The original journal signature remains immutable. Record the new database and
+sidecar signatures and SHA-256 values in a separate root-owned, no-overwrite
+recovery assessment bound to the journal SHA-256. Include snapshot integrity,
+backup hash/integrity, the relevant log event reference, UTC time, administrator,
+and approval reference. An independent administrator must review the addendum
+before recovery. The current acknowledgment implementation requires the live
+database signature to equal the original journal signature; a changed-signature
+incident therefore remains blocked until a separately reviewed implementation
+can validate such an addendum. Never edit the original journal or manifest to
+make their saved signature match the current database.
+
 ### Read-only preflight before manual recovery
 
 The wrapper deliberately does not switch `current` back automatically after a
@@ -609,7 +660,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "2de1ba7238ab563a065d40d9b8046dcc0bac93782a1d7292b017ac0e2410aea7"
+ADMIN_SHA256 = "1d3ee31732df3d6169d5ef7a621d4d426a7f45663c831d26ba061dec26086c3f"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1135,6 +1186,210 @@ and the integrity check before taking action. Discord connection and restored
 guild rows can only be confirmed through the bot's startup/recovery logs and
 the separately approved controlled Discord environment.
 
+The root-run `armory-db-preflight` and the deployment preflight/wrapper use the
+same `deploy/recovery_audit.py` validator. The installer places a root-owned
+copy at `/opt/wow-forever-armory-bot/bin/recovery_audit.py`; each caller checks
+its SHA-256 before compiling those source bytes in memory, so Python bytecode is
+not used. Production preflight also compares the installed helper's hash with
+the protected checkout. The validator checks active and temporary journals,
+archive and acknowledgment pairing, the exact journal/manifest links, backup
+and saved-preflight identities, fail-closed fields, acknowledgment decision,
+approval-reference format, timestamps, hashes, and orphan or contradictory
+manifests. Only `phase=complete` with a matching completion acknowledgment or
+`phase=manual_recovery_required` with verified fail-closed evidence and a
+matching manual-recovery acknowledgment can pass. It never changes audit
+contents. Once this preflight and its matching validator are installed, a
+manual systemd start is blocked by unresolved or incomplete evidence. The old v1.1.4
+production copy does not gain this development change retroactively; keep the
+current bot and backup timer stopped and disabled until the incident is
+reviewed. `fail_closed_verified` records only the wrapper's observation at
+failure time; it is not a permanent lock against a later administrator or
+another process starting the bot.
+
+The audit check opens the protected directory without following a link,
+requires a nonblocking shared `flock`, reads each JSON file through a
+no-follow descriptor, and compares the names and file identities/metadata
+before and after validation. Administrative recovery takes the corresponding
+exclusive directory lock. The deployment wrapper keeps its exclusive lock
+from retained-history validation through installation verification and process
+exit. Its active journal continues to block every service start after the lock
+is released. Administrative completion uses the same exclusive lock; service
+activation holds a shared audit lock so systemd's read-only start gate can also
+obtain a shared lock. The additional activation mutex under `/run/lock`
+serializes activation attempts. A privileged writer that ignores these locks
+is outside the coordination guarantee; protected directory ownership and
+before/after identity checks detect ordinary races and fail closed, but do not
+provide an absolute filesystem snapshot against a hostile privileged process.
+
+### Administrative deployment completion and service activation
+
+The deployment wrapper does not start or re-enable services. A successful
+installer and release verification produces an immutable
+`deployment-installation-<deployment-id>.json` report containing the release,
+pin/installer identity, manifest and backup/preflight hashes, database
+signature, the policy target (`active` and `enabled` for the bot and backup
+timer), observed stopped states, and UTC verification time. It accepts either
+the matching initial pair (`inactive`/`disabled` for both units, as after
+incident recovery, or `active`/`enabled` for both) and rejects mixed states.
+It records the fixed target independently from the initial state, so beginning
+from the stopped state never causes an early start. The wrapper publishes that report with exclusive
+no-overwrite creation and file/directory `fsync`, then changes the active
+journal to `phase=installation_verified`. This phase, like every other active
+journal phase including `complete`, blocks systemd startup. It is not an
+administrative completion or permission to start services. Both units remain
+inactive and disabled until the separate activation stage.
+
+An administrator must independently review the result and provide a specific
+approval reference. The reviewed root-owned `production_admin.py` then runs
+`finalize-deployment`. It takes the exclusive audit lock and rechecks the
+installation result, pin, installer hash, current release symlink and marker,
+release tree, manifest, backup and saved-preflight hashes, database signature
+and SQLite integrity, backup SQLite integrity, and stopped systemd/process
+state. The original journal, manifest, backup, and preflight are not edited.
+
+The finalizer publishes the journal in this order:
+
+1. Atomically replace the active `installation_verified` journal with a
+   `complete` journal containing the administrator and approval reference.
+2. Create a no-overwrite hard link named
+   `deployment-state-<complete-journal-sha256>.json`, sync the directory, and
+   verify the exact archived bytes.
+3. Remove `deployment-state.json` and sync the directory.
+4. Publish `deployment-recovery-ack-<complete-journal-sha256>.json` with
+   no-overwrite semantics and sync it.
+5. Run the shared validator while still holding the exclusive lock.
+
+Until step 4 is complete and the final validator passes, startup remains
+blocked: an active journal blocks directly, and an archive without its
+matching completion acknowledgment fails history validation. Retry with the
+same source-journal SHA, administrator, and approval reference. The operation
+verifies existing archive/ack bytes and never replaces conflicting files.
+An exact completed-journal temporary can be resumed after validation; an
+inconsistent temporary, archive, or acknowledgment requires manual review and
+NO-GO. Historical `manual_recovery_required` incidents cannot be passed to
+`finalize-deployment`; they continue through the separate
+`acknowledge-recovery` flow and recovery evidence.
+
+Only after administrative completion may a separate approval invoke
+`activate-services`, using the final archived journal SHA and a new activation
+approval reference. The tool appends durable, no-overwrite JSON events to the
+audit directory. Every event binds the deployment ID, release SHA, completed
+journal SHA, completion-acknowledgment SHA, manifest SHA, installation-report
+SHA, deployment-pin SHA, approver, approval reference, and saved bot/timer
+states. Events record approval, each planned systemd action, each observed
+result, and a final success or failure. Files are created exclusively and the
+file and directory are synchronized before the operation proceeds.
+The terminal success event is written only after all approved actions and
+state checks pass. Console/journal reporting happens afterward; a broken
+reporting pipe does not roll back services or append a contradictory failure.
+
+The shared validator and systemd startup gate enforce the same event rules.
+They deny startup if the active journal exists, the evidence conflicts, or
+there is no matching completion and activation history. During activation, the
+bot may start during activation only while its exact start action is the
+currently pending durable action and the activation lock is held. Once that
+action has been verified, further starts wait for the final success event. If the activation
+process exits before success, that lock is released and a subsequent start is
+denied until an administrator resumes activation with the same approval
+reference. The backup timer's service may start only after the complete
+activation success event. After success, systemd may perform ordinary future
+restarts for the same completed release. A new active deployment journal
+blocks those starts; a later deployment receives a different deployment ID,
+release, and evidence chain and requires a new approval.
+
+Activation first requires no active journal, a valid completion archive and
+acknowledgment, the matching release pointer and installation marker, a
+passing database readiness check, no unexpected bot process, and both managed
+units stopped and disabled. It restores only the bot and timer states saved by
+the wrapper. Before each systemd action it writes an action-planned event; after
+the action it reads back unit state and verifies the bot process working
+directory when starting the bot, then writes action-verified. It never starts
+the backup job service directly. A failed action records failure when
+possible, then attempts to stop and disable both managed units. If event
+publication or state verification fails, the result is NO-GO and manual review
+is required; an absent terminal success event is never treated as success.
+
+An interrupted attempt can resume only with the same administrator and
+approval reference while it is incomplete. A failed attempt is terminal and
+requires a new approval reference and a new activation ID. A successful retry
+is idempotent only when live unit states and the running release still match
+the saved intent. The append-only history is retained; it is not rewritten by
+retries. `finalize-deployment` never creates activation authorization or
+starts services. Historical `manual_recovery_required` incidents remain on
+the separate recovery path and cannot receive activation authorization.
+
+The reviewed helper uses the pinned shared-validator SHA-256
+`a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` and
+snapshot-module SHA-256
+`564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` in this
+development revision. The administrator must verify the exact reviewed
+`production_admin.py` source hash before root execution; that hash is recorded
+in the TASK-199D review section below. These development hashes are not
+production authorization or permission to copy/install the helpers.
+
+For future separately approved operations, the command forms are:
+
+```bash
+sudo /usr/bin/python3.14 -I -B \
+  <ROOT_OWNED_REVIEWED_COPY>/production_admin.py finalize-deployment \
+  --journal-sha256 <INSTALLATION_VERIFIED_JOURNAL_SHA256> \
+  --approved-by <ADMINISTRATOR_ID> \
+  --approval-reference <COMPLETION_APPROVAL_REFERENCE>
+
+sudo /usr/bin/python3.14 -I -B \
+  <ROOT_OWNED_REVIEWED_COPY>/production_admin.py activate-services \
+  --journal-sha256 <FINAL_COMPLETE_ARCHIVE_SHA256> \
+  --approved-by <ADMINISTRATOR_ID> \
+  --approval-reference <SEPARATE_ACTIVATION_APPROVAL_REFERENCE>
+```
+
+The first command returns the final archive SHA, which is supplied to the
+second command. Do not run either command if any hash, state, backup, marker,
+release, process, or approval check fails. These command forms grant no
+production approval.
+
+The development wrapper now also scans `/proc` after stopping the managed
+units. A remaining manually launched bot process or an unreadable process
+inventory makes `fail_closed_verified` false. This detects a process outside
+systemd that unit-state checks alone would miss; it does not terminate that
+process. The systemd startup gate blocks ordinary service starts while
+recovery evidence is pending. Directly launching the bot executable bypasses
+that unit gate and remains prohibited during recovery.
+
+#### TASK-199D development review hashes
+
+These are the hashes recorded for the TASK-199D development source snapshot.
+They do not authorize copying files to production or running an administrative
+operation. TASK-200C changes are recorded separately below.
+
+| File | SHA-256 |
+| --- | --- |
+| `deploy/production_admin.py` | `ce76868d9310708c27faacaf2c5358118d1423219a0e0e71a9ee1967b54c72f0` |
+| `deploy/production_wrapper.py` | `2cb1b4125bceeca95b883e40b48435f7344f1bcaf25d55d534e0f1679062be86` |
+| `deploy/recovery_audit.py` | `a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` |
+| `deploy/production_preflight.py` | `841dfa37ab55d37cb962afbfd1389fdecec3d49385e37c01581f9544e6c2921b` |
+| `deploy/systemd/armory-db-preflight.py` | `ec03ed66495ed89f5e30b973d6c6aac0f968d1052792c03efb0a09871b64317a` |
+| `deploy/production_db_snapshot.py` | `78c59895f76834dd24d32ca7c744c001cae58b656b208c287da4ee0d27a2b313` |
+
+#### TASK-200C current development review hashes
+
+These hashes identify the locally modified development candidate only. They
+are not release authorization and have not been transferred to production.
+The administrator loader pin above must match `production_admin.py` exactly.
+
+| File | SHA-256 |
+| --- | --- |
+| `deploy/production_admin.py` | `50ccda68ca6da1466e06fc299b1f805db866f8730aa1a5fc47b0434e4f83a27a` |
+| `deploy/production_preflight.py` | `4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198` |
+| `deploy/systemd/armory-db-preflight.py` | `537f81a208278de85b37610b6ed7be2ff35b034d45316a140540fcee2ff4cd65` |
+| `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
+| `deploy/verify_production_backups.py` | `2125b228628cb2a4460a173a27436e4861b89d1d570ca560541a9942e49b9a0d` |
+| `deploy/production_install.py` | `d5ca3bc5d48b2e9562831e1fa16c20c07c944ff85801b5e9ef987df5a329cca0` |
+| `deploy/production_wrapper.py` | `2cb1b4125bceeca95b883e40b48435f7344f1bcaf25d55d534e0f1679062be86` |
+| `deploy/recovery_audit.py` | `a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` |
+| `deploy/systemd/wow-forever-armory-bot.service` | `e0b04e08957af6634cbd06bd5b55d621b1cfaced888723ba8a286cd9c38bd890` |
+| `deploy/systemd/wow-forever-armory-backup.service` | `6b56dbb5bd6d47252bb7221f8dda304863a81c092b6f01d6192d2729588129d1` |
+
 ## Backup and retention
 
 The backup utility uses SQLite's online backup API, so it can take a consistent
@@ -1342,10 +1597,11 @@ repository for installation, and a restricted `installer_rejected` diagnostic
 through the wrapper's inherited descriptor. Preserve the old binary and diff
 as evidence; do not treat either old hash as approved for v2.0.0.
 
-The current v2.0.0 checkout source for `deploy/production_install.py` has
-SHA-256 `12c782429bb9c66896a021a81c1debfb0a565fd31e9ae64e11b9fba835772585`.
-Provision the v2 helper only by copying the reviewed source bytes into the
-root-owned helper path and verifying that exact hash afterward. The pin's
+The TASK 222A draft snapshot of `deploy/production_install.py` has SHA-256
+`d5ca3bc5d48b2e9562831e1fa16c20c07c944ff85801b5e9ef987df5a329cca0`.
+This draft hash is not release authorization. Recompute and independently
+review the hash from the final clean v2.0.0 commit before provisioning the
+root-owned helper or deployment pin. The pin's
 `installer_sha256` must equal both the reviewed source hash and installed
 helper hash. The new wrapper is a separate root-owned file at
 `/usr/local/sbin/armory-deploy-v2`; record its source and installed hashes in
@@ -1364,13 +1620,10 @@ Discord token or other secrets in the pin. The wrapper sets `umask 077` for
 its audit files; the installer temporarily uses `umask 022` only while building
 the release and restores `077` before returning.
 
-The project owner confirmed PROD Guild ID `1549012880215638086` for initial
-deployment verification. The runtime, installer, and systemd preflight are not
-pinned to that guild. Production configuration must omit
-`DISCORD_TEST_GUILD_ID`; production mode globally syncs application commands
-even if a legacy test-guild variable remains in the process environment,
-allowing every authorized guild where the application is installed
-to use them. Global command changes may take time to propagate. The config source must be a
+The runtime, installer, and systemd preflight are not pinned to one guild.
+Production configuration must omit `DISCORD_TEST_GUILD_ID`. Bot startup does
+not synchronize global commands, so it cannot create, change, or remove them.
+Global command changes require the separate reviewed workflow below. The config source must be a
 root-owned private regular file. The credential source must be root-owned mode
 `0600`; the installer copies it without displaying its contents. Do not store
 the token in the EnvironmentFile. The systemd credential is passed through the
@@ -1378,6 +1631,52 @@ stable launcher as `DISCORD_BOT_TOKEN_FILE`; the token value is not copied into
 the bot process environment. A rollback candidate must support this file-based
 credential interface; do not roll back to a launcher/application combination
 that expects only `DISCORD_BOT_TOKEN`.
+
+### Separate global Discord command review and synchronization
+
+Normal bot startup does not call `CommandTree.sync()` and cannot change global
+commands. A one-shot operator must review the exact command diff before asking
+for approval. The tool reads the existing token from the fixed root-owned
+`/etc/wow-forever-armory-bot/discord-token` file; it does not accept a token in
+arguments, environment variables, or output. Run it as root from the reviewed
+release. A dry run authenticates over the REST API and fetches the current
+global command set, but makes no Discord write:
+
+```bash
+sudo /opt/wow-forever-armory-bot/current/.venv/bin/python -I -B -m \
+  wow_forever_armory.command_sync --mode dry-run
+```
+
+Record and independently review the `added`, `changed`, `removed`, and
+`unchanged` entries and the full `diff_sha256`. A separately approved apply
+must name that exact hash and a Product Owner decision reference:
+
+```bash
+sudo /opt/wow-forever-armory-bot/current/.venv/bin/python -I -B -m \
+  wow_forever_armory.command_sync --mode apply \
+  --approve-diff-sha256 '<REVIEWED_DIFF_SHA256>' \
+  --approval-reference '<PO_SYNC_DECISION_REFERENCE>'
+```
+
+If and only if the reviewed diff includes removals, require an additional,
+distinct Product Owner decision specifically approving those removals:
+
+```bash
+sudo /opt/wow-forever-armory-bot/current/.venv/bin/python -I -B -m \
+  wow_forever_armory.command_sync --mode apply \
+  --approve-diff-sha256 '<REVIEWED_DIFF_SHA256>' \
+  --approval-reference '<PO_SYNC_DECISION_REFERENCE>' \
+  --approve-deletions-sha256 '<SAME_REVIEWED_DIFF_SHA256>' \
+  --deletion-approval-reference '<SEPARATE_PO_DELETION_DECISION_REFERENCE>'
+```
+
+Apply fetches the remote set again and refuses a stale diff before its single
+sync request. It then fetches the remote set and compares it to the locally
+registered commands. `APPLIED_AND_VERIFIED` means Discord returned the command
+set matching the local definitions. `APPLY_UNVERIFIED` means the write may have
+occurred but the result could not be verified; stop and inspect Discord's
+current state before any retry. The tool never retries, and normal bot startup
+does not repair a failed sync.
 
 The release locks runtime and build dependencies in
 `deploy/requirements-runtime.lock` and `deploy/requirements-build.lock` with
@@ -1439,7 +1738,11 @@ retry. It never recursively removes incomplete release content.
 
 The unit runs `armory-db-preflight` (installed from
 `deploy/systemd/armory-db-preflight.py`) with systemd's `+` privilege prefix
-before the launcher. This short, root-owned helper needs host process visibility to
+before the launcher. The installer also copies the exact-hash-checked shared
+`deploy/recovery_audit.py` validator to the same protected `bin` directory.
+These files are installed or updated together; a missing, changed, linked, or
+unsafe validator stops both deployment checks and service startup. This short,
+root-owned helper needs host process visibility to
 detect the old manual bot; it prints no environment values. It refuses to
 continue if another Armory module process exists or process inspection fails.
 It opens the configured database read-only and refuses a missing, zero-byte, invalid, uninitialized, or
@@ -1491,7 +1794,7 @@ an installation or startup gate:
 ```bash
 /home/codex-dev/projects/wow-forever-armory-bot/.venv/bin/python \
   /home/codex-dev/projects/wow-forever-armory-bot/deploy/production_migration.py \
-  --inspect-legacy --expected-guild-id 1549012880215638086
+  --inspect-legacy --expected-guild-id REPLACE_WITH_CONFIRMED_PROD_GUILD_ID
 ```
 
 After a separately approved graceful stop, run the migration script as root

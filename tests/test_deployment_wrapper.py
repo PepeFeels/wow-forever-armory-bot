@@ -44,15 +44,40 @@ class MemoryJournal:
 
 
 class InstallerDiagnosticTests(unittest.TestCase):
+    def test_deployment_accepts_stopped_disabled_baseline_without_starting_units(self):
+        stopped = {
+            wrapper.SERVICE: ("inactive", "disabled"),
+            wrapper.BACKUP_TIMER: ("inactive", "disabled"),
+            wrapper.BACKUP_SERVICE: ("inactive", "static"),
+        }
+        wrapper.validate_unit_states(stopped)
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.start(stopped)
+            record = json.loads((audit / "deployment-state.json").read_text())
+            self.assertEqual(record["service_state"], ["active", "enabled"])
+            self.assertEqual(record["backup_timer_state"], ["active", "enabled"])
+            self.assertEqual(stopped[wrapper.SERVICE], ("inactive", "disabled"))
+
+    def test_deployment_rejects_mixed_bot_and_timer_baseline(self):
+        with self.assertRaisesRegex(wrapper.Refusal, "states do not match"):
+            wrapper.validate_unit_states(
+                {
+                    wrapper.SERVICE: ("inactive", "disabled"),
+                    wrapper.BACKUP_TIMER: ("active", "enabled"),
+                    wrapper.BACKUP_SERVICE: ("inactive", "static"),
+                }
+            )
+
     def test_audit_json_hash_matches_the_same_validated_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             record = Path(temporary) / "record.json"
             raw = b'{"decision":"verified"}\n'
             record.write_bytes(raw)
             record.chmod(0o600)
-            value, digest = wrapper._read_audit_json(
-                record, owner_uid=os.getuid()
-            )
+            value, digest = wrapper._read_audit_json(record, owner_uid=os.getuid())
             self.assertEqual(value, {"decision": "verified"})
             self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
 
@@ -192,6 +217,70 @@ class InstallerDiagnosticTests(unittest.TestCase):
                     audit / "missing", owner_uid=os.getuid()
                 ).assert_no_pending()
 
+    def test_deployment_lock_is_held_until_wrapper_exit_after_journal_creation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.acquire_exclusive_lock()
+            reader = os.open(audit, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                with self.assertRaises(BlockingIOError):
+                    wrapper.fcntl.flock(
+                        reader, wrapper.fcntl.LOCK_SH | wrapper.fcntl.LOCK_NB
+                    )
+            finally:
+                os.close(reader)
+            journal.start(
+                {
+                    wrapper.SERVICE: ("active", "enabled"),
+                    wrapper.BACKUP_TIMER: ("active", "enabled"),
+                }
+            )
+            self.assertIsNotNone(journal.lock_fd)
+            self.assertTrue((audit / "deployment-state.json").is_file())
+            reader = os.open(audit, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                with self.assertRaises(BlockingIOError):
+                    wrapper.fcntl.flock(
+                        reader, wrapper.fcntl.LOCK_SH | wrapper.fcntl.LOCK_NB
+                    )
+            finally:
+                os.close(reader)
+            journal.release_lock()
+
+    def test_journal_transition_table_allows_only_ordered_installation_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.start(
+                {
+                    wrapper.SERVICE: ("active", "enabled"),
+                    wrapper.BACKUP_TIMER: ("active", "enabled"),
+                }
+            )
+            for phase in (
+                "timer_pause_started",
+                "timer_paused",
+                "backup_verified",
+                "backup_and_preflight_verified",
+                "shutdown_started",
+                "installer_started",
+                "installer_returned",
+                "release_verified",
+                "installation_verified",
+            ):
+                journal.update(phase)
+            self.assertIn(
+                "complete", wrapper.DEPLOYMENT_TRANSITIONS["installation_verified"]
+            )
+            with self.assertRaisesRegex(wrapper.Refusal, "transition"):
+                journal.update("complete")
+            journal.release_lock()
+
     def test_deployment_journal_rejects_archive_without_hash_bound_ack(self):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary)
@@ -269,9 +358,7 @@ class InstallerDiagnosticTests(unittest.TestCase):
                 for target in (str(release), f"releases/{release_sha}"):
                     current.symlink_to(target)
                     self.assertEqual(
-                        wrapper._managed_current_target(
-                            current, owner_uid=os.getuid()
-                        ),
+                        wrapper._managed_current_target(current, owner_uid=os.getuid()),
                         release,
                     )
                     current.unlink()
@@ -519,6 +606,10 @@ class InstallerDiagnosticTests(unittest.TestCase):
             ),
             "observe_unit_states": lambda: {},
             "verify_release": lambda *args: None,
+            "write_installation_report": lambda *args: (
+                "deployment-installation-test.json",
+                "a" * 64,
+            ),
             "restore_states": lambda original: original,
             "release_backup_locks": lambda _: None,
         }
@@ -530,7 +621,7 @@ class InstallerDiagnosticTests(unittest.TestCase):
         self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
 
-    def test_successful_install_exit_code_is_written_to_journal(self):
+    def test_successful_install_is_verified_without_restoring_services(self):
         with tempfile.TemporaryDirectory() as temporary:
             journal = MemoryJournal()
             fail_closed_calls = []
@@ -541,6 +632,8 @@ class InstallerDiagnosticTests(unittest.TestCase):
                 fail_closed_calls,
             )
             ops["install"] = lambda: 0
+            restored = []
+            ops["restore_states"] = lambda original: restored.append(original)
             wrapper.perform_deployment(ops, journal)
             returned = [
                 details
@@ -548,6 +641,52 @@ class InstallerDiagnosticTests(unittest.TestCase):
                 if phase == "installer_returned"
             ]
         self.assertEqual(returned, [{"installer_exit_code": 0}])
+        self.assertEqual(restored, [])
+        verified = [
+            details
+            for phase, details in journal.records
+            if phase == "installation_verified"
+        ]
+        self.assertEqual(
+            verified,
+            [
+                {
+                    "installation_result": "deployment-installation-test.json",
+                    "installation_result_sha256": "a" * 64,
+                    "verified_at_utc": verified[0]["verified_at_utc"],
+                }
+            ],
+        )
+
+    def test_journal_transition_table_rejects_undefined_transitions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.start(
+                {
+                    wrapper.SERVICE: ("active", "enabled"),
+                    wrapper.BACKUP_TIMER: ("active", "enabled"),
+                }
+            )
+            with self.assertRaisesRegex(wrapper.Refusal, "transition"):
+                journal.update("complete")
+
+    def test_journal_transition_table_allows_installation_verified_only_after_release(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.start(
+                {
+                    wrapper.SERVICE: ("active", "enabled"),
+                    wrapper.BACKUP_TIMER: ("active", "enabled"),
+                }
+            )
+            with self.assertRaisesRegex(wrapper.Refusal, "transition"):
+                journal.update("installation_verified")
 
     def test_nonzero_exit_records_code_and_fixed_category(self):
         result = SimpleNamespace(
@@ -679,10 +818,44 @@ class InstallerDiagnosticTests(unittest.TestCase):
             record = [
                 details
                 for phase, details in journal.records
-                if phase == "aborted_before_service_stop"
+                if phase == "aborted_before_service_changes"
             ][0]
             self.assertNotIn("private detail", repr(record))
             self.assertIsNone(record["installer_failure"])
+
+    def test_real_journal_accepts_safe_abort_before_service_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            journal.acquire_exclusive_lock()
+            states = {
+                wrapper.SERVICE: ("active", "enabled"),
+                wrapper.BACKUP_TIMER: ("active", "enabled"),
+                wrapper.BACKUP_SERVICE: ("inactive", "static"),
+            }
+            ops = {
+                "states": states,
+                "check_database": lambda: None,
+                "pause_timer": lambda: None,
+                "wait_backup_idle": lambda: (_ for _ in ()).throw(
+                    RuntimeError("synthetic wait failure")
+                ),
+                "restore_timer": lambda target: None,
+                "observe_unit_states": lambda: states,
+                "release_backup_locks": lambda _: None,
+            }
+            try:
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper.perform_deployment(ops, journal)
+                record = json.loads((audit / "deployment-state.json").read_text())
+                self.assertEqual(record["phase"], "aborted_before_service_changes")
+                self.assertEqual(
+                    record["final_unit_states"][wrapper.BACKUP_TIMER],
+                    list(states[wrapper.BACKUP_TIMER]),
+                )
+            finally:
+                journal.release_lock()
 
     def test_fail_closed_cleanup_error_is_recorded_without_exception_text(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -706,6 +879,33 @@ class InstallerDiagnosticTests(unittest.TestCase):
             self.assertFalse(record["fail_closed_verified"])
             self.assertEqual(record["fail_closed_error"], "RuntimeError")
             self.assertNotIn("private cleanup detail", repr(record))
+
+    def test_fail_closed_is_not_verified_if_unmanaged_bot_process_remains(self):
+        observed = {
+            wrapper.SERVICE: ("inactive", "disabled"),
+            wrapper.BACKUP_TIMER: ("inactive", "disabled"),
+            wrapper.BACKUP_SERVICE: ("inactive", "static"),
+        }
+        with (
+            patch.object(wrapper, "_service_action"),
+            patch.object(wrapper, "_observe_unit_states", return_value=observed),
+            patch.object(wrapper, "_armory_process_present", return_value=True),
+        ):
+            with self.assertRaisesRegex(wrapper.Refusal, "process remains"):
+                wrapper._fail_closed()
+
+    def test_process_inventory_finds_manual_bot_process_without_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            process = proc / "4321"
+            process.mkdir()
+            (process / "cmdline").write_bytes(
+                b"/usr/bin/python3\0-m\0wow_forever_armory.discord_bot\0"
+            )
+            (process / "environ").write_bytes(
+                b"DISCORD_BOT_TOKEN=synthetic-never-print\0"
+            )
+            self.assertTrue(wrapper._armory_process_present(proc))
 
     def test_startup_failure_is_distinct(self):
         with patch.object(

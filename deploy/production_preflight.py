@@ -24,14 +24,13 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 BRANCH = "release/v2.0.0"
 FAILED_V1_RELEASE = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
 APPROVED_PREFLIGHT_SHA256 = (
-    "c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803"
+    "537f81a208278de85b37610b6ed7be2ff35b034d45316a140540fcee2ff4cd65"
 )
 BASE = Path("/opt/wow-forever-armory-bot")
 REPO = BASE / "deployment-checkout"
@@ -44,6 +43,9 @@ BACKUP_TIMER = "wow-forever-armory-backup.timer"
 BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
+RECOVERY_AUDIT_SHA256 = (
+    "a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d"
+)
 SYSTEM_PYTHON = "/usr/bin/python3.14"
 VENV_SYMLINK_TARGETS = {
     ".venv/lib64": "lib",
@@ -275,9 +277,7 @@ class Preflight:
     ) -> tuple[dict[str, Any], str]:
         fd = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
         )
         try:
             before = os.fstat(fd)
@@ -862,10 +862,7 @@ class Preflight:
                         if relative_name == ".venv/bin/python3.14":
                             expected_target = SYSTEM_PYTHON
                         target_text = os.readlink(item)
-                        if (
-                            expected_target is None
-                            or target_text != expected_target
-                        ):
+                        if expected_target is None or target_text != expected_target:
                             return False
                         resolved = item.resolve(strict=True)
                         expected_resolved = (
@@ -993,6 +990,13 @@ class Preflight:
             )
             self._metadata(preflight, owner=0, mode=0o755)
             preflight_hash = self._sha256(preflight)
+            recovery_audit = BASE / "bin/recovery_audit.py"
+            self._metadata(recovery_audit, owner=0, mode=0o644)
+            recovery_audit_ok = (
+                self._sha256(recovery_audit) == RECOVERY_AUDIT_SHA256
+                and self._sha256(REPO / "deploy/recovery_audit.py")
+                == RECOVERY_AUDIT_SHA256
+            )
             preflight_ok = (
                 preflight_hash == APPROVED_PREFLIGHT_SHA256
                 and preflight_hash
@@ -1016,6 +1020,7 @@ class Preflight:
                 and source_ok
                 and wrapper_ok
                 and preflight_ok
+                and recovery_audit_ok
                 and units_ok
                 and launcher_ok
             )
@@ -1322,151 +1327,32 @@ class Preflight:
 
     @classmethod
     def _verify_archived_deployments(cls, audit: Path, *, owner: int) -> int:
+        source = Path(__file__).with_name("recovery_audit.py")
+        fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            entries = tuple(audit.iterdir())
-        except OSError as exc:
-            raise ValueError("audit history cannot be listed") from exc
-
-        archives: dict[str, Path] = {}
-        acknowledgments: dict[str, Path] = {}
-        manifests: dict[str, Path] = {}
-        for entry in entries:
-            if entry.name.startswith("deployment-state-"):
-                match = re.fullmatch(
-                    r"deployment-state-([0-9a-f]{64})\.json", entry.name
-                )
-                if match is None or match.group(1) in archives:
-                    raise ValueError("archived journal name is invalid")
-                archives[match.group(1)] = entry
-            elif entry.name.startswith("deployment-recovery-ack-"):
-                match = re.fullmatch(
-                    r"deployment-recovery-ack-([0-9a-f]{64})\.json", entry.name
-                )
-                if match is None or match.group(1) in acknowledgments:
-                    raise ValueError("acknowledgment name is invalid")
-                acknowledgments[match.group(1)] = entry
-            else:
-                match = re.fullmatch(r"deployment-([0-9a-f]{40})\.json", entry.name)
-                if match is not None:
-                    manifests[match.group(1)] = entry
-                elif entry.name.startswith("deployment-") and entry.name.endswith(
-                    ".json"
-                ):
-                    raise ValueError("deployment manifest name is invalid")
-
-        if set(archives) != set(acknowledgments):
-            raise ValueError("an archived journal lacks its acknowledgment")
-
-        bound_manifests: set[str] = set()
-        for journal_sha, journal_path in archives.items():
-            journal, actual_journal_sha = cls._secure_json_with_hash(
-                journal_path, owner=owner, mode=0o600
-            )
-            if actual_journal_sha != journal_sha:
-                raise ValueError("archived journal hash mismatch")
-            phase = journal.get("phase")
-            if phase == "manual_recovery_required":
-                if (
-                    journal.get("fail_closed_verified") is not True
-                    or journal.get("fail_closed_error") is not None
-                ):
-                    raise ValueError("archived incident was not verified fail-closed")
-            elif phase != "complete":
-                raise ValueError("archived deployment is unresolved")
-
-            release_sha = journal.get("approved_release_sha")
-            previous_sha = journal.get("previous_release_sha")
-            if (
-                not isinstance(release_sha, str)
-                or re.fullmatch(r"[0-9a-f]{40}", release_sha) is None
-                or not isinstance(previous_sha, str)
-                or re.fullmatch(r"[0-9a-f]{40}", previous_sha) is None
-                or release_sha in bound_manifests
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("shared recovery validator metadata is unsafe")
+            data = b""
+            chunks = []
+            while block := os.read(fd, 65536):
+                chunks.append(block)
+            data = b"".join(chunks)
+            if hashlib.sha256(data).hexdigest() != RECOVERY_AUDIT_SHA256:
+                raise ValueError("shared recovery validator hash mismatch")
+            if (os.fstat(fd).st_dev, os.fstat(fd).st_ino, os.fstat(fd).st_size) != (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
             ):
-                raise ValueError("archived deployment identity is invalid")
-            manifest_path = audit / f"deployment-{release_sha}.json"
-            if (
-                journal.get("manifest") != str(manifest_path)
-                or manifests.get(release_sha) != manifest_path
-            ):
-                raise ValueError("deployment manifest is missing or mismatched")
-            manifest, manifest_sha = cls._secure_json_with_hash(
-                manifest_path, owner=owner, mode=0o600
-            )
-            manifest_keys = {
-                "approved_release_sha",
-                "previous_release_sha",
-                "database_backup",
-                "database_backup_sha256",
-                "shared_preflight_backup",
-                "shared_preflight_sha256",
-                "created_at_utc",
-            }
-            if (
-                set(manifest) != manifest_keys
-                or manifest.get("approved_release_sha") != release_sha
-                or manifest.get("previous_release_sha") != previous_sha
-                or journal.get("database_backup") != manifest.get("database_backup")
-                or journal.get("database_backup_sha256")
-                != manifest.get("database_backup_sha256")
-                or journal.get("shared_preflight_backup")
-                != manifest.get("shared_preflight_backup")
-                or journal.get("shared_preflight_sha256")
-                != manifest.get("shared_preflight_sha256")
-            ):
-                raise ValueError("deployment manifest contents do not match journal")
-
-            ack, _ = cls._secure_json_with_hash(
-                acknowledgments[journal_sha], owner=owner, mode=0o600
-            )
-            ack_keys = {
-                "schema_version",
-                "journal_sha256",
-                "manifest_sha256",
-                "approved_release_sha",
-                "previous_release_sha",
-                "decision",
-                "approved_by",
-                "approval_reference",
-                "approved_at_utc",
-            }
-            expected_decision = {
-                "manual_recovery_required": "manual_recovery_verified",
-                "complete": "deployment_completion_verified",
-            }[phase]
-            if (
-                set(ack) != ack_keys
-                or type(ack.get("schema_version")) is not int
-                or ack.get("schema_version") != 1
-                or ack.get("journal_sha256") != journal_sha
-                or ack.get("manifest_sha256") != manifest_sha
-                or ack.get("approved_release_sha") != release_sha
-                or ack.get("previous_release_sha") != previous_sha
-                or ack.get("decision") != expected_decision
-                or not isinstance(ack.get("approved_by"), str)
-                or not ack["approved_by"].strip()
-                or len(ack["approved_by"]) > 128
-                or not isinstance(ack.get("approval_reference"), str)
-                or re.fullmatch(
-                    r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", ack["approval_reference"]
-                )
-                is None
-                or not isinstance(ack.get("approved_at_utc"), str)
-            ):
-                raise ValueError("deployment acknowledgment is invalid")
-            try:
-                approved_at = datetime.fromisoformat(ack["approved_at_utc"])
-            except ValueError as exc:
-                raise ValueError("acknowledgment time is invalid") from exc
-            if approved_at.tzinfo is None or approved_at.utcoffset() != UTC.utcoffset(
-                approved_at
-            ):
-                raise ValueError("acknowledgment time is not UTC")
-            bound_manifests.add(release_sha)
-
-        if set(manifests) != bound_manifests:
-            raise ValueError("a deployment manifest has no acknowledged journal")
-        return len(archives)
+                raise ValueError("shared recovery validator changed while reading")
+        finally:
+            os.close(fd)
+        namespace = {"__file__": str(source), "__name__": "_armory_recovery_audit"}
+        exec(compile(data, str(source), "exec", dont_inherit=True), namespace)
+        return namespace["verify_audit_directory"](
+            audit, owner=owner, group=os.lstat(audit).st_gid
+        )
 
     def incident_journal(self) -> None:
         active = AUDIT / "deployment-state.json"

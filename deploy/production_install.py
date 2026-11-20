@@ -473,12 +473,9 @@ def _verify_release_symlink(
                 category="release_symlink_rejected",
             ) from exc
         target_info = resolved.stat()
-        valid_target = (
-            _trusted_directory_chain(
-                expected_resolved.parent, owner_uid=owner_uid
-            )
-            and stat.S_ISREG(target_info.st_mode)
-        )
+        valid_target = _trusted_directory_chain(
+            expected_resolved.parent, owner_uid=owner_uid
+        ) and stat.S_ISREG(target_info.st_mode)
 
     required_bit = 0o1 if stat.S_ISDIR(target_info.st_mode) else 0o4
     if (
@@ -509,6 +506,7 @@ def _verify_release_readable(
             "release path must not be a symbolic link",
             category="release_marker_rejected",
         )
+
     def walk_error(_error: OSError) -> None:
         raise InstallError(
             "release tree could not be fully inspected",
@@ -915,10 +913,23 @@ def install(
             deploy / "systemd/armory-db-preflight.py",
             BASE / "bin/armory-db-preflight",
         ),
+        (deploy / "recovery_audit.py", BASE / "bin/recovery_audit.py"),
         *((deploy / "systemd" / name, systemd_directory / name) for name in UNIT_FILES),
     )
     if upgrade_existing:
         for source, destination in runtime_files:
+            if source.name == "recovery_audit.py":
+                try:
+                    destination.lstat()
+                except FileNotFoundError:
+                    continue
+                _read_regular_file(
+                    destination,
+                    expected_owner=0,
+                    maximum_bytes=262144,
+                    exact_mode=0o644,
+                )
+                continue
             if source.name == "armory-db-preflight.py":
                 _read_regular_file(
                     destination,
@@ -955,6 +966,7 @@ def install(
         preflight_source = deploy / "systemd/armory-db-preflight.py"
         preflight_destination = BASE / "bin/armory-db-preflight"
         _copy_unit(preflight_source, preflight_destination, 0o755)
+        _copy_unit(deploy / "recovery_audit.py", BASE / "bin/recovery_audit.py", 0o644)
     _install_current_link(
         release,
         upgrade_existing=upgrade_existing,

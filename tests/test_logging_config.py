@@ -483,7 +483,6 @@ class BotConstructionLoggingTests(unittest.IsolatedAsyncioTestCase):
             bot = ArmoryBot(
                 ArmoryClient(),
                 GuildArmoryStore(Path(temp_dir) / "offline.sqlite3"),
-                123,
             )
             await bot.close()
         self.assertEqual(root.handlers, handlers)

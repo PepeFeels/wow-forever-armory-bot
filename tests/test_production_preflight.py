@@ -19,6 +19,13 @@ EXPECTED_SHA = "d" * 40
 
 
 class ProductionPreflightTests(unittest.TestCase):
+    def test_reviewed_startup_preflight_hash_matches_source(self) -> None:
+        source = Path(__file__).parents[1] / "deploy/systemd/armory-db-preflight.py"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            production_preflight.APPROVED_PREFLIGHT_SHA256,
+        )
+
     def test_secure_json_hash_matches_same_validated_file_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             record = Path(temporary) / "record.json"
@@ -230,9 +237,7 @@ class ProductionPreflightTests(unittest.TestCase):
         bin_dir = release / ".venv/bin"
         bin_dir.mkdir(parents=True)
         (release / ".venv/lib").mkdir()
-        (release / ".venv/lib64").symlink_to(
-            "lib", target_is_directory=True
-        )
+        (release / ".venv/lib64").symlink_to("lib", target_is_directory=True)
         (release / "app.py").write_text("pass\n", encoding="ascii")
         (release / "app.py").chmod(0o644)
         system_python.write_text("#!/bin/sh\n", encoding="ascii")

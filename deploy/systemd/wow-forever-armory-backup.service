@@ -17,6 +17,7 @@ Environment=ARMORY_BACKUP_RETENTION=14
 StateDirectory=wow-forever-armory-bot
 StateDirectoryMode=0700
 UMask=0077
+ExecStartPre=+/opt/wow-forever-armory-bot/bin/armory-db-preflight --unit backup
 ExecStart=/opt/wow-forever-armory-bot/current/.venv/bin/python -m wow_forever_armory.operations backup
 NoNewPrivileges=true
 PrivateTmp=true

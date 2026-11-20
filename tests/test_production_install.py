@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
+import json
 import os
 import sqlite3
 import stat
@@ -62,14 +64,279 @@ def _create_preflight_database(path: Path, *, guild_count: int = 0) -> None:
 
 
 class ProductionInstallTests(unittest.TestCase):
+    def test_startup_gate_blocks_unresolved_deployment_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            self.assertTrue(
+                preflight.deployment_recovery_is_clear(
+                    audit, expected_owner=os.getuid(), expected_group=os.getgid()
+                )
+            )
+
+            for name in (
+                preflight.ACTIVE_JOURNAL,
+                preflight.JOURNAL_TEMPORARY,
+            ):
+                with self.subTest(name=name):
+                    pending = audit / name
+                    pending.write_bytes(b"synthetic pending evidence\n")
+                    self.assertFalse(
+                        preflight.deployment_recovery_is_clear(
+                            audit,
+                            expected_owner=os.getuid(),
+                            expected_group=os.getgid(),
+                        )
+                    )
+                    pending.unlink()
+
+    def test_startup_gate_blocks_symlinked_journal_and_unsafe_audit_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            outside = root / "outside"
+            outside.write_bytes(b"preserved evidence\n")
+            (audit / preflight.ACTIVE_JOURNAL).symlink_to(outside)
+            self.assertFalse(
+                preflight.deployment_recovery_is_clear(
+                    audit, expected_owner=os.getuid(), expected_group=os.getgid()
+                )
+            )
+            self.assertEqual(outside.read_bytes(), b"preserved evidence\n")
+            (audit / preflight.ACTIVE_JOURNAL).unlink()
+            audit.chmod(0o750)
+            self.assertFalse(
+                preflight.deployment_recovery_is_clear(
+                    audit, expected_owner=os.getuid(), expected_group=os.getgid()
+                )
+            )
+            self.assertFalse(
+                preflight.deployment_recovery_is_clear(
+                    root / "missing-audit",
+                    expected_owner=os.getuid(),
+                    expected_group=os.getgid(),
+                )
+            )
+
+    def test_startup_gate_rejects_audit_symlink_hardlink_and_special_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            target = root / "outside.json"
+            target.write_text("{}\n", encoding="ascii")
+            target.chmod(0o600)
+            review_name = f"recovery-review-{'a' * 64}.json"
+            entry = audit / review_name
+            kwargs = {"expected_owner": os.getuid(), "expected_group": os.getgid()}
+
+            entry.symlink_to(target)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+            entry.unlink()
+
+            os.link(target, entry)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+            entry.unlink()
+
+            os.mkfifo(entry, 0o600)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+    def test_startup_gate_requires_complete_hash_bound_incident_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            release, previous = "a" * 40, "b" * 40
+            manifest = {
+                "approved_release_sha": release,
+                "previous_release_sha": previous,
+                "database_backup": "/backup/test.sqlite3",
+                "database_backup_sha256": "c" * 64,
+                "shared_preflight_backup": "/audit/preflight.py",
+                "shared_preflight_sha256": "d" * 64,
+                "created_at_utc": "2026-11-15T12:00:00+00:00",
+            }
+            manifest_raw = json.dumps(manifest, sort_keys=True).encode("ascii")
+            manifest_path = audit / f"deployment-{release}.json"
+            manifest_path.write_bytes(manifest_raw)
+            manifest_path.chmod(0o600)
+            journal = {
+                **manifest,
+                "phase": "manual_recovery_required",
+                "fail_closed_verified": True,
+                "fail_closed_error": None,
+                "manifest": str(manifest_path),
+            }
+            journal_raw = json.dumps(journal, sort_keys=True).encode("ascii") + b"\n"
+            journal_sha = hashlib.sha256(journal_raw).hexdigest()
+            archive = audit / f"deployment-state-{journal_sha}.json"
+            archive.write_bytes(journal_raw)
+            archive.chmod(0o600)
+            ack = {
+                "schema_version": 1,
+                "journal_sha256": journal_sha,
+                "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+                "approved_release_sha": release,
+                "previous_release_sha": previous,
+                "decision": "manual_recovery_verified",
+                "approved_by": "reviewer",
+                "approval_reference": "review-record-1",
+                "approved_at_utc": "2026-11-15T12:00:00+00:00",
+            }
+            ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            kwargs = {"expected_owner": os.getuid(), "expected_group": os.getgid()}
+            self.assertTrue(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+            contradictory = dict(journal, recovery_note="different retained record")
+            contradictory_raw = (
+                json.dumps(contradictory, sort_keys=True).encode("ascii") + b"\n"
+            )
+            contradictory_sha = hashlib.sha256(contradictory_raw).hexdigest()
+            contradictory_archive = audit / f"deployment-state-{contradictory_sha}.json"
+            contradictory_archive.write_bytes(contradictory_raw)
+            contradictory_archive.chmod(0o600)
+            contradictory_ack = dict(
+                ack,
+                journal_sha256=contradictory_sha,
+                manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+            )
+            contradictory_ack_path = (
+                audit / f"deployment-recovery-ack-{contradictory_sha}.json"
+            )
+            contradictory_ack_path.write_text(
+                json.dumps(contradictory_ack, sort_keys=True), encoding="ascii"
+            )
+            contradictory_ack_path.chmod(0o600)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+            contradictory_archive.unlink()
+            contradictory_ack_path.unlink()
+
+            # Correctly completed and acknowledged incidents permit normal start.
+            journal["phase"] = "complete"
+            ack["decision"] = "deployment_completion_verified"
+            archive.unlink()
+            ack_path.unlink()
+            journal_raw = json.dumps(journal, sort_keys=True).encode("ascii") + b"\n"
+            journal_sha = hashlib.sha256(journal_raw).hexdigest()
+            archive = audit / f"deployment-state-{journal_sha}.json"
+            archive.write_bytes(journal_raw)
+            archive.chmod(0o600)
+            ack["journal_sha256"] = journal_sha
+            ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            self.assertTrue(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+            # A bad fail-closed marker blocks even with a matching archive/ack.
+            journal["phase"] = "manual_recovery_required"
+            journal["fail_closed_verified"] = False
+            ack["decision"] = "manual_recovery_verified"
+            archive.unlink()
+            ack_path.unlink()
+            journal_raw = json.dumps(journal, sort_keys=True).encode("ascii") + b"\n"
+            journal_sha = hashlib.sha256(journal_raw).hexdigest()
+            archive = audit / f"deployment-state-{journal_sha}.json"
+            archive.write_bytes(journal_raw)
+            archive.chmod(0o600)
+            ack["journal_sha256"] = journal_sha
+            ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+            # Restore a valid incident, then reject a bad approval reference.
+            journal["fail_closed_verified"] = True
+            archive.unlink()
+            ack_path.unlink()
+            journal_raw = json.dumps(journal, sort_keys=True).encode("ascii") + b"\n"
+            journal_sha = hashlib.sha256(journal_raw).hexdigest()
+            archive = audit / f"deployment-state-{journal_sha}.json"
+            archive.write_bytes(journal_raw)
+            archive.chmod(0o600)
+            ack.update(journal_sha256=journal_sha, approval_reference="bad ref")
+            ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+            # Contradictory backup evidence in the manifest is rejected.
+            ack["approval_reference"] = "CHANGE-1"
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            manifest["database_backup_sha256"] = "e" * 64
+            manifest_raw = json.dumps(manifest, sort_keys=True).encode("ascii")
+            manifest_path.write_bytes(manifest_raw)
+            manifest_path.chmod(0o600)
+            ack["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            ack["approval_reference"] = "CHANGE-1"
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+            manifest["database_backup_sha256"] = "c" * 64
+            manifest["shared_preflight_sha256"] = "f" * 64
+            manifest_raw = json.dumps(manifest, sort_keys=True).encode("ascii")
+            manifest_path.write_bytes(manifest_raw)
+            manifest_path.chmod(0o600)
+            ack["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+            ack_path.write_text(json.dumps(ack, sort_keys=True), encoding="ascii")
+            ack_path.chmod(0o600)
+            self.assertFalse(preflight.deployment_recovery_is_clear(audit, **kwargs))
+
+    def test_startup_gate_detects_audit_directory_mutation_during_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            audit.chmod(0o700)
+            original_listdir = os.listdir
+            changed = False
+
+            def mutate_after_first_listing(path):
+                nonlocal changed
+                entries = original_listdir(path)
+                if not changed:
+                    changed = True
+                    (audit / "deployment-unexpected.json").write_text("{}\n")
+                    (audit / "deployment-unexpected.json").chmod(0o600)
+                return entries
+
+            with patch.object(
+                preflight.os, "listdir", side_effect=mutate_after_first_listing
+            ):
+                self.assertFalse(
+                    preflight.deployment_recovery_is_clear(
+                        audit, expected_owner=os.getuid(), expected_group=os.getgid()
+                    )
+                )
+
+    def test_startup_main_stops_before_database_check_when_recovery_is_pending(
+        self,
+    ) -> None:
+        with (
+            patch.dict(os.environ, {"ARMORY_DATABASE_PATH": "/unused/database"}),
+            patch.object(preflight, "deployment_recovery_is_clear", return_value=False),
+            patch.object(preflight, "armory_process_present") as process_check,
+            patch.object(
+                preflight, "database_metadata_is_safe"
+            ) as database_check,
+        ):
+            self.assertEqual(preflight.main([]), 78)
+            process_check.assert_not_called()
+            database_check.assert_not_called()
+
     def _make_venv_release(self, root: Path, system_python: Path) -> Path:
         release = root / "release"
         bin_dir = release / ".venv/bin"
         bin_dir.mkdir(parents=True)
         (release / ".venv/lib").mkdir()
-        (release / ".venv/lib64").symlink_to(
-            "lib", target_is_directory=True
-        )
+        (release / ".venv/lib64").symlink_to("lib", target_is_directory=True)
         (release / "app.py").write_text("pass\n", encoding="ascii")
         (release / "app.py").chmod(0o644)
         system_python.write_text("#!/bin/sh\n", encoding="ascii")
@@ -108,9 +375,7 @@ class ProductionInstallTests(unittest.TestCase):
                 "_trusted_directory_chain",
                 return_value=True,
             ):
-                with self.assertRaisesRegex(
-                    InstallError, "unapproved symbolic link"
-                ):
+                with self.assertRaisesRegex(InstallError, "unapproved symbolic link"):
                     production_install._verify_release_readable(
                         release,
                         os.getuid(),
@@ -132,9 +397,7 @@ class ProductionInstallTests(unittest.TestCase):
                 "_trusted_directory_chain",
                 return_value=True,
             ):
-                with self.assertRaisesRegex(
-                    InstallError, "unapproved symbolic link"
-                ):
+                with self.assertRaisesRegex(InstallError, "unapproved symbolic link"):
                     production_install._verify_release_readable(
                         release,
                         os.getuid(),
@@ -455,9 +718,11 @@ class ProductionInstallTests(unittest.TestCase):
             verify_database.assert_called_once_with(
                 state / "guild-armory.sqlite3", uid=os.getuid(), gid=os.getgid()
             )
-            copy_unit.assert_called_once_with(
-                preflight_source, installed_preflight, 0o755
+            copy_unit.assert_any_call(preflight_source, installed_preflight, 0o755)
+            copy_unit.assert_any_call(
+                repo / "deploy/recovery_audit.py", bin_dir / "recovery_audit.py", 0o644
             )
+            self.assertEqual(copy_unit.call_count, 2)
             switch_link.assert_called_once()
 
     def test_upgrade_process_guard_detects_bot_and_fails_closed_on_proc_error(
@@ -875,20 +1140,16 @@ class ProductionInstallTests(unittest.TestCase):
                 with self.assertRaises(InstallError):
                     validate_inputs(config, credential, expected_owner=os.getuid())
 
-    def test_preflight_rejects_missing_empty_and_uninitialized_db(self) -> None:
+    def test_preflight_rejects_missing_and_empty_database_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             missing = root / "missing.sqlite3"
-            self.assertFalse(preflight.database_is_ready(missing))
+            self.assertFalse(preflight.database_metadata_is_safe(missing))
 
             empty = root / "empty.sqlite3"
             empty.touch()
-            self.assertFalse(preflight.database_is_ready(empty))
-
-            uninitialized = root / "uninitialized.sqlite3"
-            with sqlite3.connect(uninitialized):
-                pass
-            self.assertFalse(preflight.database_is_ready(uninitialized))
+            empty.chmod(0o600)
+            self.assertFalse(preflight.database_metadata_is_safe(empty))
 
     def test_preflight_accepts_valid_zero_and_one_guild_databases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -897,41 +1158,40 @@ class ProductionInstallTests(unittest.TestCase):
                 with self.subTest(guild_count=guild_count):
                     database = root / f"guilds-{guild_count}.sqlite3"
                     _create_preflight_database(database, guild_count=guild_count)
-                    self.assertTrue(preflight.database_is_ready(database))
+                    database.chmod(0o600)
+                    self.assertTrue(preflight.database_metadata_is_safe(database))
 
-    def test_preflight_rejects_missing_required_tables_and_corrupt_database(self):
+    def test_preflight_does_not_open_or_interpret_database_contents(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            missing_tables = root / "missing-tables.sqlite3"
-            with sqlite3.connect(missing_tables) as connection:
-                connection.execute("CREATE TABLE guilds (guild_id INTEGER)")
-            missing_tables.chmod(0o600)
-            self.assertFalse(preflight.database_is_ready(missing_tables))
-
             corrupt = root / "corrupt.sqlite3"
             corrupt.write_bytes(b"not a SQLite database")
             corrupt.chmod(0o600)
-            self.assertFalse(preflight.database_is_ready(corrupt))
+            self.assertTrue(preflight.database_metadata_is_safe(corrupt))
 
     def test_preflight_rejects_wrong_owner_and_unsafe_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "private.sqlite3"
             _create_preflight_database(database)
+            database.chmod(0o600)
             self.assertFalse(
-                preflight.database_is_ready(database, expected_owner=os.getuid() + 1)
+                preflight.database_metadata_is_safe(
+                    database, expected_owner=os.getuid() + 1
+                )
             )
             database.chmod(0o640)
-            self.assertFalse(preflight.database_is_ready(database))
+            self.assertFalse(preflight.database_metadata_is_safe(database))
 
     def test_preflight_restore_marker_blocks_initialized_database(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "initialized.sqlite3"
             _create_preflight_database(database)
             Path(f"{database}.restore-in-progress").write_text("review")
-            self.assertFalse(preflight.database_is_ready(database))
+            database.chmod(0o600)
+            self.assertFalse(preflight.database_metadata_is_safe(database))
 
-    def test_installed_preflight_copy_keeps_empty_database_fix(self) -> None:
+    def test_installed_preflight_copy_keeps_metadata_only_database_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = Path(__file__).parents[1] / "deploy/systemd/armory-db-preflight.py"
@@ -953,8 +1213,9 @@ class ProductionInstallTests(unittest.TestCase):
             installed = importlib.util.module_from_spec(spec)
             loader.exec_module(installed)
             database = root / "empty-guilds.sqlite3"
-            _create_preflight_database(database)
-            self.assertTrue(installed.database_is_ready(database))
+            database.write_bytes(b"metadata check never opens SQLite")
+            database.chmod(0o600)
+            self.assertTrue(installed.database_metadata_is_safe(database))
 
     def test_startup_preflight_is_guild_agnostic(self) -> None:
         with (
@@ -965,27 +1226,29 @@ class ProductionInstallTests(unittest.TestCase):
                     "DISCORD_TEST_GUILD_ID": "123456789012345678",
                 },
             ),
+            patch.object(preflight, "deployment_recovery_is_clear", return_value=True),
             patch.object(preflight, "armory_process_present", return_value=False),
-            patch.object(preflight, "database_is_ready", return_value=True),
+            patch.object(preflight, "database_metadata_is_safe", return_value=True),
             patch.object(
                 preflight.pwd,
                 "getpwnam",
-                return_value=SimpleNamespace(pw_uid=os.getuid()),
+                return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()),
             ),
         ):
-            self.assertEqual(preflight.main(), 0)
+            self.assertEqual(preflight.main([]), 0)
 
     def test_startup_preflight_requires_database_path(self) -> None:
         with (
             patch.dict(os.environ, {"ARMORY_DATABASE_PATH": ""}),
+            patch.object(preflight, "deployment_recovery_is_clear", return_value=True),
             patch.object(preflight, "armory_process_present", return_value=False),
             patch.object(
                 preflight.pwd,
                 "getpwnam",
-                return_value=SimpleNamespace(pw_uid=os.getuid()),
+                return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()),
             ),
         ):
-            self.assertEqual(preflight.main(), 78)
+            self.assertEqual(preflight.main([]), 78)
 
     def test_preflight_finds_existing_armory_module_without_reading_env(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1003,11 +1266,14 @@ class ProductionInstallTests(unittest.TestCase):
     def test_existing_armory_process_still_blocks_preflight_database_check(self):
         with (
             patch.dict(os.environ, {"ARMORY_DATABASE_PATH": "/unused/database"}),
+            patch.object(preflight, "deployment_recovery_is_clear", return_value=True),
             patch.object(preflight, "armory_process_present", return_value=True),
-            patch.object(preflight, "database_is_ready") as database_is_ready,
+            patch.object(
+                preflight, "database_metadata_is_safe"
+            ) as database_metadata_is_safe,
         ):
-            self.assertEqual(preflight.main(), 78)
-            database_is_ready.assert_not_called()
+            self.assertEqual(preflight.main([]), 78)
+            database_metadata_is_safe.assert_not_called()
 
     def test_bot_unit_uses_root_preflight_and_nonstarting_install_files(self) -> None:
         root = Path(__file__).parents[1]
@@ -1016,7 +1282,8 @@ class ProductionInstallTests(unittest.TestCase):
         )
         installer = (root / "deploy/production_install.py").read_text(encoding="utf-8")
         self.assertIn(
-            "ExecStartPre=+/opt/wow-forever-armory-bot/bin/armory-db-preflight",
+            "ExecStartPre=+"
+            "/opt/wow-forever-armory-bot/bin/armory-db-preflight --unit bot",
             unit,
         )
         self.assertIn("LoadCredential=discord-token:", unit)

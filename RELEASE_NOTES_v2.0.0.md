@@ -1,7 +1,10 @@
 # WoW Forever Armory Bot v2.0.0 — Release Candidate
 
-**Status:** Prepared from `a1a6a2ad95302f7e3c4900f18e91691f43631e18` for
-review. This candidate is not deployed, pushed, or tagged.
+**Status:** This v2.0.0 candidate is developed on `release/v2.0.0`, which
+descends from checkpoint `a1a6a2ad95302f7e3c4900f18e91691f43631e18`
+(the v1.1.4 incident release). That checkpoint is not the v2.0.0 release
+commit. The final release commit is pending review and approval; this
+candidate is not deployed, pushed, or tagged.
 
 ## Included changes
 

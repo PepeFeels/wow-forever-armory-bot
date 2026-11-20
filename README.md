@@ -96,9 +96,6 @@ Example development configuration:
 
 ```dotenv
 DISCORD_BOT_TOKEN=your-private-test-token
-ARMORY_ENVIRONMENT=development
-# Optional: use a test guild for faster command propagation during development.
-DISCORD_TEST_GUILD_ID=123456789012345678
 ARMORY_TIMEOUT=10
 ARMORY_DATABASE_PATH=data/guild-armory.sqlite3
 ```
@@ -108,6 +105,11 @@ Run the bot only when you intend to connect to Discord:
 ```bash
 .venv/bin/python -m wow_forever_armory.discord_bot
 ```
+
+Bot startup registers commands locally but never creates or changes global
+Discord commands. Use the separate administrative workflow in `OPERATIONS.md`
+to review a command diff and obtain approval before an apply run. Deletions
+require a distinct approval.
 
 ### Tests
 
