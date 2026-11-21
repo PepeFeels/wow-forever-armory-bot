@@ -323,9 +323,7 @@ class ProductionInstallTests(unittest.TestCase):
             patch.dict(os.environ, {"ARMORY_DATABASE_PATH": "/unused/database"}),
             patch.object(preflight, "deployment_recovery_is_clear", return_value=False),
             patch.object(preflight, "armory_process_present") as process_check,
-            patch.object(
-                preflight, "database_metadata_is_safe"
-            ) as database_check,
+            patch.object(preflight, "database_metadata_is_safe") as database_check,
         ):
             self.assertEqual(preflight.main([]), 78)
             process_check.assert_not_called()

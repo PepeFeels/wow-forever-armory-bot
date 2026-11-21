@@ -154,9 +154,7 @@ class LoggingConfigTests(unittest.TestCase):
         sensitive_url = "https://example.invalid/path?token=query-secret&user=private"
         message = f"{token} {credential} {discord_id} {user_data} {sensitive_url}"
         with patch("wow_forever_armory.logging_config.sys.stderr", stderr):
-            configure_logging(
-                environ={"ARMORY_LOG_FORMAT": "json"}, secrets=(token,)
-            )
+            configure_logging(environ={"ARMORY_LOG_FORMAT": "json"}, secrets=(token,))
             try:
                 raise RuntimeError(message)
             except RuntimeError as exc:

@@ -98,9 +98,7 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
         create_database(database)
         original = sha256(database)
         with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
-            self.assertEqual(
-                self.verify(database, expected_sha256=original), (1, 1, 3)
-            )
+            self.assertEqual(self.verify(database, expected_sha256=original), (1, 1, 3))
         self.assertEqual(sha256(database), original)
         self.assertEqual(list(self.snapshot_root.iterdir()), [])
 

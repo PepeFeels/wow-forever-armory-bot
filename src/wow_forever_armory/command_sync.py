@@ -15,14 +15,13 @@ import json
 import os
 import re
 import stat
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import discord
 from discord.ext import commands
 
-from .discord_bot import GuildArmoryCommands
+from .discord_bot import ArmoryBot, GuildArmoryCommands
 
 TOKEN_PATH = Path("/etc/wow-forever-armory-bot/discord-token")
 SERVER_ONLY_FIELDS = frozenset({"id", "application_id", "guild_id", "version"})
@@ -70,11 +69,14 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def local_command_payloads(tree: discord.app_commands.CommandTree) -> list[dict[str, Any]]:
+def local_command_payloads(
+    tree: discord.app_commands.CommandTree,
+) -> list[dict[str, Any]]:
     """Serialize the locally registered global commands without API writes."""
     commands_by_key: dict[str, dict[str, Any]] = {}
     for command in tree.get_commands():
-        payload = _normalize_payload(command.to_dict(tree))
+        raw_payload: dict[str, Any] = dict(command.to_dict(tree))
+        payload = _normalize_payload(raw_payload)
         key = _command_key(payload)
         if key in commands_by_key:
             raise CommandSyncError("local command tree contains duplicate commands")
@@ -82,11 +84,13 @@ def local_command_payloads(tree: discord.app_commands.CommandTree) -> list[dict[
     return [commands_by_key[key] for key in sorted(commands_by_key)]
 
 
-def remote_command_payloads(remote_commands: list[discord.AppCommand]) -> list[dict[str, Any]]:
+def remote_command_payloads(
+    remote_commands: list[discord.app_commands.AppCommand],
+) -> list[dict[str, Any]]:
     """Serialize fetched global commands while excluding Discord-assigned IDs."""
     commands_by_key: dict[str, dict[str, Any]] = {}
     for command in remote_commands:
-        payload = command.to_dict()
+        payload: dict[str, Any] = dict(command.to_dict())
         payload["default_member_permissions"] = (
             None
             if command.default_member_permissions is None
@@ -119,6 +123,7 @@ def command_diff(
         current = remote_by_key.get(key)
         desired = local_by_key.get(key)
         if current is None:
+            assert desired is not None
             added.append(desired)
         elif desired is None:
             removed.append(current)
@@ -167,7 +172,9 @@ def validate_apply_approval(
             or deletion_approval_reference == approval_reference
         ):
             raise CommandSyncError("a distinct deletion approval reference is required")
-    elif approved_deletions_sha256 is not None or deletion_approval_reference is not None:
+    elif (
+        approved_deletions_sha256 is not None or deletion_approval_reference is not None
+    ):
         raise CommandSyncError("deletion approval was supplied when no deletion exists")
 
 
@@ -324,7 +331,9 @@ async def _run(args: argparse.Namespace) -> int:
         intents=discord.Intents.none(),
     )
     try:
-        await client.add_cog(GuildArmoryCommands(client))
+        # This client only registers the command tree; it never dispatches
+        # interaction handlers that require the full ArmoryBot runtime.
+        await client.add_cog(GuildArmoryCommands(cast(ArmoryBot, client)))
         # login() performs REST authentication only; it does not connect to the
         # gateway, initialize SQLite, start tasks, or sync application commands.
         await client.login(token)
@@ -337,7 +346,11 @@ async def _run(args: argparse.Namespace) -> int:
             deletion_approval_reference=args.deletion_approval_reference,
         )
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
-        return 0 if report["status"] in {"DRY_RUN", "NO_CHANGES", "APPLIED_AND_VERIFIED"} else 2
+        return (
+            0
+            if report["status"] in {"DRY_RUN", "NO_CHANGES", "APPLIED_AND_VERIFIED"}
+            else 2
+        )
     finally:
         await client.close()
 

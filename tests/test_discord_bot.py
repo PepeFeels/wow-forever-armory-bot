@@ -1,7 +1,6 @@
 """Guild Armory command and event tests with no Discord gateway access."""
 
 import asyncio
-import os
 import tempfile
 import traceback
 import unittest
@@ -311,7 +310,9 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_setup_registers_commands_without_any_sync(self) -> None:
         self.bot.add_cog = AsyncMock()
-        self.bot.tree.copy_global_to = MagicMock(side_effect=AssertionError("must not copy"))
+        self.bot.tree.copy_global_to = MagicMock(
+            side_effect=AssertionError("must not copy")
+        )
         self.bot.tree.sync = AsyncMock()
         with self.assertLogs("wow_forever_armory.discord_bot", level="INFO") as logs:
             await self.bot.setup_hook()
@@ -712,9 +713,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             return {222: first_channel, 223: second_channel}[channel_id]
 
         self.bot.get_armory_channel = AsyncMock(side_effect=channel_for)
-        self.bot.sync_member_row = AsyncMock(
-            return_value=MemberRowSyncOutcome.UPDATED
-        )
+        self.bot.sync_member_row = AsyncMock(return_value=MemberRowSyncOutcome.UPDATED)
         with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
             await self.bot.on_ready()
 

@@ -359,9 +359,7 @@ class ArmoryBot(commands.Bot):
             path = validate_armory_url(value, self.armory_client)
             verified = await self._verify_member(guild_id, interaction.user.id)
             if verified is None:
-                result = (
-                    "You must be a member of this server to edit its Armory."
-                )
+                result = "You must be a member of this server to edit its Armory."
             else:
                 guild, member = verified
                 config = await self.store.get_guild(guild_id)
@@ -487,9 +485,7 @@ class ArmoryBot(commands.Bot):
         except CharacterNotFound:
             result = "The character to replace is no longer in your list."
         except ValueError:
-            result = (
-                "Enter a full character URL from the official WoW Armory."
-            )
+            result = "Enter a full character URL from the official WoW Armory."
         except ArmoryHTTPError as exc:
             _LOGGER.warning(
                 "Armory profile request failed", extra={"status": exc.status}
@@ -508,8 +504,7 @@ class ArmoryBot(commands.Bot):
             result = "Could not reach the WoW Armory. Please try again later."
         except discord.DiscordException, OSError, TimeoutError:
             result = (
-                "Guild Armory could not be updated right now. "
-                "Please try again later."
+                "Guild Armory could not be updated right now. Please try again later."
             )
             _LOGGER.warning("Guild Armory registration encountered a service failure")
         except Exception:
@@ -642,11 +637,7 @@ class ArmoryBot(commands.Bot):
                 )
         await self.store.set_row_message(state.guild_id, state.user_id, message.id)
         _LOGGER.info("member_image_updated")
-        return (
-            MemberRowSyncOutcome.CREATED
-            if created
-            else MemberRowSyncOutcome.UPDATED
-        )
+        return MemberRowSyncOutcome.CREATED if created else MemberRowSyncOutcome.UPDATED
 
     def _is_bot_attachment(self, message: discord.Message, filename: str) -> bool:
         return bool(

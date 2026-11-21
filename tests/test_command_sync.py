@@ -94,11 +94,15 @@ class CommandSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["unchanged"], ["1:same"])
         self.assertEqual(first["added"], [added])
-        self.assertEqual(first["changed"], [{"identity": "1:changed", "before": old, "after": new}])
+        self.assertEqual(
+            first["changed"], [{"identity": "1:changed", "before": old, "after": new}]
+        )
         self.assertEqual(first["removed"], [removed])
         self.assertEqual(len(first["diff_sha256"]), 64)
 
-    def test_apply_requires_exact_diff_approval_and_separate_deletion_approval(self) -> None:
+    def test_apply_requires_exact_diff_approval_and_separate_deletion_approval(
+        self,
+    ) -> None:
         removed = command_diff([], [payload("old", "Old")])
         with self.assertRaises(CommandSyncError):
             validate_apply_approval(
@@ -136,8 +140,6 @@ class CommandSyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_rejects_missing_approval_without_sync(self) -> None:
         self.client.tree.fetch_commands = AsyncMock(return_value=[])
         self.client.tree.sync = AsyncMock()
-        local = local_command_payloads(self.client.tree)
-        diff = command_diff(local, [])
         with self.assertRaisesRegex(CommandSyncError, "approval"):
             await review_or_apply(
                 self.client,

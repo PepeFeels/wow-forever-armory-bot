@@ -86,7 +86,7 @@ Use Python 3.14 or newer:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
 
