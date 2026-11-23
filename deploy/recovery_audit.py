@@ -84,6 +84,21 @@ TASK267_REVIEW_SHA256 = "784a8759817045c2c9b59545022e43c4cf23ae7772d26f37f61ebcb
 TASK267_INCIDENT_BACKUP_SHA256 = "e15bd8d7434246f71b4580437c63bd2f79b572c6d104b05b6e2c28f3d05345c9"
 TASK267_LATEST_BACKUP_SHA256 = "bc87d4f26b213fdca1466fffbd6ec5b9c707f6c2fdaa71927574f365b494cbc0"
 TASK267_PREFLIGHT_SHA256 = "c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803"
+TASK301_JOURNAL_SHA256 = "b957b1735570ad821ddbc5f4f8bcaa82ca635e1393394a439879bef531a7f4ca"
+TASK301_RELEASE_SHA = "fa15f4e3095fad60ff48a059f7ce07414633d07d"
+TASK301_PREVIOUS_SHA = "dcceeb85464e09e34b112e41b16a833226c72270"
+TASK301_BASE = Path("/opt/wow-forever-armory-bot")
+TASK301_DATABASE_SHA256 = "4b7e10b846c31fd080f21449478475f783cba00964f0b532b62606c356e1a998"
+TASK301_BACKUP_PATH = Path(
+    "/var/lib/wow-forever-armory-bot/backups/active/"
+    "guild-armory-20261123T173904.584416Z.sqlite3"
+)
+TASK301_BACKUP_SHA256 = "697b031ced2bf45818eafeb8b4d2556784da04873b1565ce6e1678007a112b5c"
+TASK301_HISTORICAL_PREFLIGHT_PATH = Path(
+    "/var/lib/armory-deployment-audit/"
+    "armory-db-preflight.dcceeb85464e09e34b112e41b16a833226c72270.py"
+)
+TASK301_HISTORICAL_PREFLIGHT_SHA256 = "c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803"
 TASK267_ADMIN_UID = 0
 TASK267_ADMIN_GID = 0
 TASK267_REPORT_PATH = Path("/var/lib/armory-deployment-audit/task267-verification-8ffae1176165b46c0e06733ac9d34a937ee033a0d6886a3bbcab7575b7cef96a.json")
@@ -111,6 +126,17 @@ ACK_FIELDS = {
     "approved_at_utc",
 }
 ACK_ADDENDUM_FIELDS = ACK_FIELDS | {"recovery_addendum_sha256"}
+PRE_SHUTDOWN_ACK_FIELDS = {
+    "schema_version",
+    "journal_sha256",
+    "approved_release_sha",
+    "previous_release_sha",
+    "decision",
+    "approved_by",
+    "approval_reference",
+    "approved_at_utc",
+    "evidence",
+}
 ADDENDUM_FIELDS = {
     "schema_version", "decision", "journal_sha256", "manifest_sha256",
     "verification_report_sha256", "historical_attestation_sha256",
@@ -1141,6 +1167,10 @@ def verify_audit_directory(
                     LEGACY_SERVICE_ACTIVATION,
                 )
             )
+            allowed_modes = {0o600, 0o700}
+            if PREFLIGHT_COPY.fullmatch(name):
+                # Historical saved preflights were installed read-only (0444).
+                allowed_modes |= {0o444, 0o644}
             if (
                 not allowed_name
                 or ".tmp." in name
@@ -1148,7 +1178,7 @@ def verify_audit_directory(
                 or info.st_uid != owner
                 or info.st_gid != group
                 or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) not in {0o600, 0o700}
+                or stat.S_IMODE(info.st_mode) not in allowed_modes
                 or _identity(info) != identity
             ):
                 raise AuditError("audit directory contains an unexpected file")
@@ -1209,6 +1239,7 @@ def verify_audit_directory(
         if set(archives) != set(acknowledgments):
             raise AuditError("an archive is missing its matching acknowledgment")
         bound: set[str] = set()
+        releases_without_manifest: set[str] = set()
         for journal_sha, archive_name in archives.items():
             journal_raw, journal = _read_json(
                 fd, archive_name, owner=owner, group=group
@@ -1217,7 +1248,7 @@ def verify_audit_directory(
                 raise AuditError("archived journal hash mismatch")
             phase = journal.get("phase")
             if phase == "manual_recovery_required":
-                if (
+                if journal.get("interrupted_phase") != "backup_verified" and (
                     journal.get("fail_closed_verified") is not True
                     or journal.get("fail_closed_error") is not None
                 ):
@@ -1236,6 +1267,86 @@ def verify_audit_directory(
                 or approved in bound
             ):
                 raise AuditError("journal release identity is invalid or duplicated")
+            if phase == "manual_recovery_required" and journal.get(
+                "interrupted_phase"
+            ) == "backup_verified":
+                ack_name = acknowledgments[journal_sha]
+                ack_raw, ack = _read_json(fd, ack_name, owner=owner, group=group)
+                if (
+                    journal_sha != TASK301_JOURNAL_SHA256
+                    or approved != TASK301_RELEASE_SHA
+                    or previous != TASK301_PREVIOUS_SHA
+                    or journal.get("database_backup") != str(TASK301_BACKUP_PATH)
+                    or journal.get("database_backup_sha256") != TASK301_BACKUP_SHA256
+                    or journal.get("database_signature") is not None
+                    or journal.get("shared_preflight_backup") is not None
+                    or journal.get("shared_preflight_sha256") is not None
+                    or type(ack.get("schema_version")) is not int
+                    or ack.get("schema_version") != 3
+                    or set(ack) != PRE_SHUTDOWN_ACK_FIELDS
+                    or ack.get("journal_sha256") != journal_sha
+                    or ack.get("approved_release_sha") != approved
+                    or ack.get("previous_release_sha") != previous
+                    or ack.get("decision") != "pre_shutdown_recovery_verified"
+                    or not isinstance(ack.get("approved_by"), str)
+                    or not ack["approved_by"].strip()
+                    or len(ack["approved_by"]) > 128
+                    or not isinstance(ack.get("approval_reference"), str)
+                    or re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
+                        ack["approval_reference"],
+                    ) is None
+                ):
+                    raise AuditError("pre-shutdown recovery acknowledgment is invalid")
+                try:
+                    ack_time = datetime.fromisoformat(ack["approved_at_utc"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise AuditError("pre-shutdown acknowledgment time is invalid") from exc
+                if ack_time.tzinfo is None or ack_time.utcoffset() != UTC.utcoffset(ack_time):
+                    raise AuditError("pre-shutdown acknowledgment time is not UTC")
+                evidence = ack.get("evidence")
+                expected_evidence_keys = {
+                    "release_target", "installation_marker", "database_signature",
+                    "database_sha256", "database_integrity", "database_counts",
+                    "backup_path", "backup_sha256", "backup_integrity",
+                    "backup_counts", "historical_preflight_path",
+                    "historical_preflight_sha256", "systemd_states",
+                    "armory_process_count",
+                }
+                if not isinstance(evidence, dict) or set(evidence) != expected_evidence_keys:
+                    raise AuditError("pre-shutdown recovery evidence is incomplete")
+                signature = evidence.get("database_signature")
+                if (
+                    evidence.get("release_target")
+                    != str(TASK301_BASE / "releases" / previous)
+                    or evidence.get("installation_marker") != previous
+                    or not isinstance(signature, list)
+                    or len(signature) != 8
+                    or any(type(value) is not int or value < 0 for value in signature)
+                    or evidence.get("database_sha256") != TASK301_DATABASE_SHA256
+                    or evidence.get("database_integrity") != "ok"
+                    or evidence.get("database_counts") != [1, 4, 4]
+                    or evidence.get("backup_path") != str(TASK301_BACKUP_PATH)
+                    or evidence.get("backup_sha256") != TASK301_BACKUP_SHA256
+                    or evidence.get("backup_integrity") != "ok"
+                    or evidence.get("backup_counts") != [1, 4, 4]
+                    or evidence.get("historical_preflight_path")
+                    != str(TASK301_HISTORICAL_PREFLIGHT_PATH)
+                    or evidence.get("historical_preflight_sha256")
+                    != TASK301_HISTORICAL_PREFLIGHT_SHA256
+                    or evidence.get("systemd_states") != {
+                        "wow-forever-armory-bot.service": ["inactive", "disabled"],
+                        "wow-forever-armory-backup.timer": ["inactive", "disabled"],
+                        "wow-forever-armory-backup.service": ["inactive", "static"],
+                    }
+                    or evidence.get("armory_process_count") != 0
+                ):
+                    raise AuditError("pre-shutdown evidence differs from its approved pins")
+                if approved in bound:
+                    raise AuditError("journal release identity is duplicated")
+                bound.add(approved)
+                releases_without_manifest.add(approved)
+                continue
             manifest_name = f"deployment-{approved}.json"
             if (
                 journal.get("manifest") != str(path / manifest_name)
@@ -1577,7 +1688,7 @@ def verify_audit_directory(
             raise AuditError("an orphan or missing recovery addendum exists")
         if hash_bound_reviews != expected_hash_bound_reviews:
             raise AuditError("an orphan or mismatched hash-bound recovery review exists")
-        if set(manifests) != bound:
+        if set(manifests) != bound - releases_without_manifest:
             raise AuditError("an orphan or contradictory manifest exists")
         referenced_results = {
             _read_json(fd, archive_name, owner=owner, group=group)[1].get(

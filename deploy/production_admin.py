@@ -58,6 +58,19 @@ RECOVERY_CHECKS = frozenset(
         "backup_service_state",
     }
 )
+PRE_SHUTDOWN_ACK_FIELDS = frozenset(
+    {
+        "schema_version",
+        "journal_sha256",
+        "approved_release_sha",
+        "previous_release_sha",
+        "decision",
+        "approved_by",
+        "approval_reference",
+        "approved_at_utc",
+        "evidence",
+    }
+)
 UNIT_REQUIREMENTS = {
     "wow-forever-armory-bot.service": ("inactive", "disabled"),
     "wow-forever-armory-backup.timer": ("inactive", "disabled"),
@@ -68,7 +81,22 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "d1f879a2a6e79aa338d450fc0022c6a40e72f1a3a10dac8bedae5d4d5eb26615"
+    "5146e2fa401a07883fdafd63d280865c34fccc388ef578a98bc0c3473ef5c23d"
+)
+TASK301_JOURNAL_SHA256 = "b957b1735570ad821ddbc5f4f8bcaa82ca635e1393394a439879bef531a7f4ca"
+TASK301_RELEASE_SHA = "fa15f4e3095fad60ff48a059f7ce07414633d07d"
+TASK301_PREVIOUS_SHA = "dcceeb85464e09e34b112e41b16a833226c72270"
+TASK301_DATABASE_SHA256 = "4b7e10b846c31fd080f21449478475f783cba00964f0b532b62606c356e1a998"
+TASK301_BACKUP = Path(
+    "/var/lib/wow-forever-armory-bot/backups/active/"
+    "guild-armory-20261123T173904.584416Z.sqlite3"
+)
+TASK301_BACKUP_SHA256 = "697b031ced2bf45818eafeb8b4d2556784da04873b1565ce6e1678007a112b5c"
+TASK301_HISTORICAL_PREFLIGHT = AUDIT_DIR / (
+    "armory-db-preflight.dcceeb85464e09e34b112e41b16a833226c72270.py"
+)
+TASK301_HISTORICAL_PREFLIGHT_SHA256 = (
+    "c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803"
 )
 COMPLETION_SNAPSHOT_MODULE = COMPLETION_BASE / "bin/production_db_snapshot.py"
 SNAPSHOT_MODULE_SHA256 = (
@@ -3681,6 +3709,463 @@ def acknowledge_incident(
         os.close(directory_fd)
 
 
+def _task301_database_signature(path: Path) -> list[int]:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise AdminError("production database metadata is unsafe")
+    return [
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_uid,
+        info.st_gid,
+        info.st_mode,
+    ]
+
+
+def _task301_pre_shutdown_evidence(
+    journal: Mapping[str, Any],
+    *,
+    base: Path,
+    database: Path,
+    audit_dir: Path,
+    backup: Path,
+    historical_preflight: Path,
+    owner_uid: int,
+    owner_gid: int,
+    service_uid: int,
+    service_gid: int,
+    state_reader: Callable[[], Mapping[str, list[str]]],
+    process_reader: Callable[[], int],
+    snapshot_verifier: Callable[..., tuple[int, int, int]],
+    locked_directory_fd: int,
+) -> dict[str, Any]:
+    """Freshly verify the one approved backup_verified incident, read-only."""
+    current = base / "current"
+    try:
+        pointer_info = current.lstat()
+        pointer = os.readlink(current)
+        target = current.resolve(strict=True)
+    except OSError as exc:
+        raise AdminError("current release pointer is unavailable") from exc
+    expected_target = base / "releases" / TASK301_PREVIOUS_SHA
+    if (
+        not stat.S_ISLNK(pointer_info.st_mode)
+        or pointer_info.st_uid != owner_uid
+        or pointer not in {
+            f"releases/{TASK301_PREVIOUS_SHA}",
+            str(expected_target),
+        }
+        or target != expected_target
+    ):
+        raise AdminError("current release is not the approved previous release")
+    release_fd = _open_private_directory(
+        expected_target,
+        owner_uid=owner_uid,
+        exact_mode=stat.S_IMODE(expected_target.stat().st_mode),
+    )
+    try:
+        marker, _ = _read_at(
+            release_fd, ".installation-complete", owner_uid=owner_uid, mode=0o444
+        )
+    finally:
+        os.close(release_fd)
+    if marker.decode("ascii").strip() != TASK301_PREVIOUS_SHA:
+        raise AdminError("previous release marker is invalid")
+
+    if database != COMPLETION_DATABASE or backup != TASK301_BACKUP:
+        # Test seams may use temporary paths; production CLI pins the real ones.
+        if owner_uid == 0:
+            raise AdminError("production database or backup path differs from pin")
+    db_info = database.lstat()
+    db_signature = _task301_database_signature(database)
+    if (
+        db_info.st_uid != service_uid
+        or db_info.st_gid != service_gid
+        or stat.S_IMODE(db_info.st_mode) != 0o600
+    ):
+        raise AdminError("production database ownership or mode is unsafe")
+    db_hash = _hash_regular_file(
+        database,
+        owner_uid=service_uid,
+        owner_gid=service_gid,
+        mode=0o600,
+        parent_mode=0o700,
+    )
+    if db_hash != TASK301_DATABASE_SHA256:
+        raise AdminError("production database bytes differ from reviewed evidence")
+    db_counts = snapshot_verifier(
+        database,
+        expected_owner=service_uid,
+        expected_group=service_gid,
+        expected_sha256=TASK301_DATABASE_SHA256,
+    )
+    if tuple(db_counts) != (1, 4, 4):
+        raise AdminError("production database contents differ from reviewed evidence")
+
+    if (
+        journal.get("database_backup") != str(backup)
+        or journal.get("database_backup_sha256") != TASK301_BACKUP_SHA256
+        or journal.get("database_signature") is not None
+        or journal.get("shared_preflight_backup") is not None
+        or journal.get("shared_preflight_sha256") is not None
+    ):
+        raise AdminError("journal does not match the interrupted backup_verified schema")
+    backup_hash = _hash_regular_file(
+        backup,
+        owner_uid=service_uid,
+        owner_gid=service_gid,
+        mode=0o600,
+        parent_mode=0o700,
+    )
+    if backup_hash != TASK301_BACKUP_SHA256:
+        raise AdminError("registered backup hash differs from reviewed evidence")
+    backup_counts = snapshot_verifier(
+        backup,
+        expected_owner=service_uid,
+        expected_group=service_gid,
+        expected_sha256=TASK301_BACKUP_SHA256,
+    )
+    if tuple(backup_counts) != (1, 4, 4):
+        raise AdminError("registered backup contents differ from reviewed evidence")
+
+    historical_hash = _hash_regular_file(
+        historical_preflight,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+        mode=0o444,
+        parent_mode=0o700,
+        locked_directory_fd=locked_directory_fd,
+    )
+    if historical_hash != TASK301_HISTORICAL_PREFLIGHT_SHA256:
+        raise AdminError("historical DB-preflight evidence differs from its pin")
+    states = dict(state_reader())
+    expected_states = {
+        SERVICE_NAME: ["inactive", "disabled"],
+        TIMER_NAME: ["inactive", "disabled"],
+        BACKUP_SERVICE: ["inactive", "static"],
+    }
+    if states != expected_states:
+        raise AdminError("Armory services are not in the required stopped state")
+    if process_reader() != 0:
+        raise AdminError("an Armory process is still running")
+    if _task301_database_signature(database) != db_signature:
+        raise AdminError("production database changed during recovery verification")
+    if os.readlink(current) != pointer or current.resolve(strict=True) != expected_target:
+        raise AdminError("current release pointer changed during recovery verification")
+    return {
+        "release_target": str(expected_target),
+        "installation_marker": TASK301_PREVIOUS_SHA,
+        "database_signature": db_signature,
+        "database_sha256": db_hash,
+        "database_integrity": "ok",
+        "database_counts": list(db_counts),
+        "backup_path": str(backup),
+        "backup_sha256": backup_hash,
+        "backup_integrity": "ok",
+        "backup_counts": list(backup_counts),
+        "historical_preflight_path": str(historical_preflight),
+        "historical_preflight_sha256": historical_hash,
+        "systemd_states": states,
+        "armory_process_count": 0,
+    }
+
+
+def acknowledge_task301_pre_shutdown(
+    audit_dir: Path,
+    *,
+    expected_journal_sha256: str,
+    approved_by: str,
+    approval_reference: str,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+    base: Path = COMPLETION_BASE,
+    database: Path = COMPLETION_DATABASE,
+    backup: Path = TASK301_BACKUP,
+    historical_preflight: Path = TASK301_HISTORICAL_PREFLIGHT,
+    service_uid: int | None = None,
+    service_gid: int | None = None,
+    state_reader: Callable[[], Mapping[str, list[str]]] = _systemd_states,
+    process_reader: Callable[[], int] | None = None,
+    snapshot_verifier: Callable[..., tuple[int, int, int]] | None = None,
+    history_verifier: Callable[[Path, int, int], Any] | None = None,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> tuple[str, str]:
+    """Archive and acknowledge the pinned pre-shutdown incident without DB writes."""
+    if (
+        expected_journal_sha256 != TASK301_JOURNAL_SHA256
+        or owner_uid != os.geteuid()
+        or (owner_uid == 0 and (audit_dir != AUDIT_DIR or owner_gid != 0))
+        or not approved_by.strip()
+        or len(approved_by) > 128
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", approval_reference)
+        is None
+    ):
+        raise AdminError("pre-shutdown recovery request is not the approved incident")
+    if service_uid is None or service_gid is None:
+        try:
+            service_uid = pwd.getpwnam("wow-armory").pw_uid
+            service_gid = grp.getgrnam("wow-armory").gr_gid
+        except KeyError as exc:
+            raise AdminError("Armory service account is unavailable") from exc
+    if process_reader is None:
+        def process_reader() -> int:
+            try:
+                result = subprocess.run(
+                    ["/usr/bin/pgrep", "-af", "wow_forever_armory"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise AdminError("Armory process state could not be verified") from exc
+            if result.returncode not in {0, 1}:
+                raise AdminError("Armory process state could not be verified")
+            return sum("pgrep" not in line for line in result.stdout.splitlines())
+    if snapshot_verifier is None:
+        snapshot_module = load_reviewed_python_source(
+            COMPLETION_SNAPSHOT_MODULE,
+            expected_sha256=SNAPSHOT_MODULE_SHA256,
+            owner_uid=owner_uid,
+        )
+        snapshot_verifier = snapshot_module.verify_database_snapshot
+
+    if history_verifier is None:
+        def history_verifier(path: Path, uid: int, gid: int) -> None:
+            verifier = load_reviewed_python_source(
+                COMPLETION_AUDIT_VALIDATOR,
+                expected_sha256=RECOVERY_AUDIT_SHA256,
+                owner_uid=uid,
+            )
+            verifier.verify_audit_directory(
+                path,
+                owner=uid,
+                group=gid,
+                acquire_lock=False,
+                preserved_historical_directories=("reviewed-v2.0.0", "archive"),
+            )
+
+    directory_fd = _open_private_directory(
+        audit_dir, owner_uid=owner_uid, exact_mode=0o700
+    )
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _verify_directory_binding(
+            directory_fd, audit_dir, owner_uid=owner_uid, exact_mode=0o700
+        )
+        archive_name = f"deployment-state-{expected_journal_sha256}.json"
+        ack_name = f"deployment-recovery-ack-{expected_journal_sha256}.json"
+        active_present = True
+        try:
+            active_info = os.stat(
+                "deployment-state.json", dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            active_present = False
+            active_info = None
+        if not active_present:
+            journal_raw, _ = _read_at(
+                directory_fd,
+                archive_name,
+                owner_uid=owner_uid,
+                mode=0o600,
+            )
+        else:
+            archive_present = False
+            try:
+                archive_info = os.stat(
+                    archive_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                archive_present = True
+            except FileNotFoundError:
+                archive_info = None
+            expected_links = 2 if archive_present else 1
+            if active_info.st_nlink != expected_links or (
+                archive_info is not None and archive_info.st_nlink != 2
+            ):
+                raise AdminError("active journal archive link state is unsafe")
+            journal_raw, _ = _read_at(
+                directory_fd,
+                "deployment-state.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                expected_nlink=expected_links,
+            )
+            if archive_present:
+                archive_raw, _ = _read_at(
+                    directory_fd,
+                    archive_name,
+                    owner_uid=owner_uid,
+                    mode=0o600,
+                    expected_nlink=2,
+                )
+                if archive_raw != journal_raw:
+                    raise AdminError("active and archived journal bytes differ")
+        journal_sha = hashlib.sha256(journal_raw).hexdigest()
+        if journal_sha != expected_journal_sha256:
+            raise AdminError("journal bytes differ from the approved incident hash")
+        journal = _json_object(journal_raw)
+        if (
+            journal.get("phase") != "manual_recovery_required"
+            or journal.get("interrupted_phase") != "backup_verified"
+            or journal.get("approved_release_sha") != TASK301_RELEASE_SHA
+            or journal.get("previous_release_sha") != TASK301_PREVIOUS_SHA
+            or journal.get("database_signature") is not None
+            or journal.get("shared_preflight_backup") is not None
+            or journal.get("shared_preflight_sha256") is not None
+        ):
+            raise AdminError("journal does not match the approved pre-shutdown incident")
+        if not active_present:
+            history_verifier(audit_dir, owner_uid, owner_gid)
+            ack_raw, _ = _read_at(
+                directory_fd, ack_name, owner_uid=owner_uid, mode=0o600
+            )
+            ack = _json_object(ack_raw)
+            if (
+                set(ack) != PRE_SHUTDOWN_ACK_FIELDS
+                or ack.get("schema_version") != 3
+                or ack.get("journal_sha256") != journal_sha
+                or ack.get("approved_release_sha") != TASK301_RELEASE_SHA
+                or ack.get("previous_release_sha") != TASK301_PREVIOUS_SHA
+                or ack.get("approved_by") != approved_by
+                or ack.get("approval_reference") != approval_reference
+                or ack.get("decision") != "pre_shutdown_recovery_verified"
+            ):
+                raise AdminError("existing recovery acknowledgment is inconsistent")
+            _parse_utc(ack.get("approved_at_utc"))
+            return journal_sha, hashlib.sha256(ack_raw).hexdigest()
+
+        observed = _task301_pre_shutdown_evidence(
+            journal,
+            base=base,
+            database=database,
+            audit_dir=audit_dir,
+            backup=backup,
+            historical_preflight=historical_preflight,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            service_uid=service_uid,
+            service_gid=service_gid,
+            state_reader=state_reader,
+            process_reader=process_reader,
+            snapshot_verifier=snapshot_verifier,
+            locked_directory_fd=directory_fd,
+        )
+        try:
+            os.stat(ack_name, dir_fd=directory_fd, follow_symlinks=False)
+            ack_exists = True
+        except FileNotFoundError:
+            ack_exists = False
+        if ack_exists:
+            ack_raw, _ = _read_at(directory_fd, ack_name, owner_uid=owner_uid, mode=0o600)
+            ack = _json_object(ack_raw)
+            if (
+                set(ack) != PRE_SHUTDOWN_ACK_FIELDS
+                or ack.get("schema_version") != 3
+                or ack.get("journal_sha256") != journal_sha
+                or ack.get("approved_release_sha") != TASK301_RELEASE_SHA
+                or ack.get("previous_release_sha") != TASK301_PREVIOUS_SHA
+                or ack.get("approved_by") != approved_by
+                or ack.get("approval_reference") != approval_reference
+                or ack.get("decision") != "pre_shutdown_recovery_verified"
+                or ack.get("evidence") != observed
+            ):
+                raise AdminError("existing recovery acknowledgment differs from fresh evidence")
+            _parse_utc(ack.get("approved_at_utc"))
+        else:
+            approved_at = clock().astimezone(UTC).isoformat()
+            ack = {
+                "schema_version": 3,
+                "journal_sha256": journal_sha,
+                "approved_release_sha": TASK301_RELEASE_SHA,
+                "previous_release_sha": TASK301_PREVIOUS_SHA,
+                "decision": "pre_shutdown_recovery_verified",
+                "approved_by": approved_by,
+                "approval_reference": approval_reference,
+                "approved_at_utc": approved_at,
+                "evidence": observed,
+            }
+            ack_raw = (json.dumps(ack, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        try:
+            os.stat(archive_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.link(
+                "deployment-state.json",
+                archive_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            os.fsync(directory_fd)
+        archived_raw, _ = _read_at(
+            directory_fd,
+            archive_name,
+            owner_uid=owner_uid,
+            mode=0o600,
+            expected_nlink=2 if active_present else 1,
+        )
+        if archived_raw != journal_raw:
+            raise AdminError("archived journal bytes do not match original")
+        fresh_observed = _task301_pre_shutdown_evidence(
+            journal,
+            base=base,
+            database=database,
+            audit_dir=audit_dir,
+            backup=backup,
+            historical_preflight=historical_preflight,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            service_uid=service_uid,
+            service_gid=service_gid,
+            state_reader=state_reader,
+            process_reader=process_reader,
+            snapshot_verifier=snapshot_verifier,
+            locked_directory_fd=directory_fd,
+        )
+        if fresh_observed != observed:
+            raise AdminError("recovery evidence changed before acknowledgment")
+        if not ack_exists:
+            _write_new_at(
+                directory_fd,
+                ack_name,
+                ack_raw,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o600,
+            )
+        final_observed = _task301_pre_shutdown_evidence(
+            journal,
+            base=base,
+            database=database,
+            audit_dir=audit_dir,
+            backup=backup,
+            historical_preflight=historical_preflight,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            service_uid=service_uid,
+            service_gid=service_gid,
+            state_reader=state_reader,
+            process_reader=process_reader,
+            snapshot_verifier=snapshot_verifier,
+            locked_directory_fd=directory_fd,
+        )
+        if final_observed != observed:
+            raise AdminError("recovery evidence changed before journal archival")
+        if active_present:
+            os.unlink("deployment-state.json", dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        history_verifier(audit_dir, owner_uid, owner_gid)
+        return journal_sha, hashlib.sha256(ack_raw).hexdigest()
+    finally:
+        os.close(directory_fd)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3693,6 +4178,10 @@ def _parser() -> argparse.ArgumentParser:
     ack.add_argument("--review-record", type=Path, required=True)
     ack.add_argument("--approved-by", required=True)
     ack.add_argument("--approval-reference", required=True)
+    ack_pre_shutdown = commands.add_parser("acknowledge-pre-shutdown-recovery")
+    ack_pre_shutdown.add_argument("--journal-sha256", required=True)
+    ack_pre_shutdown.add_argument("--approved-by", required=True)
+    ack_pre_shutdown.add_argument("--approval-reference", required=True)
     ack_addendum = commands.add_parser("acknowledge-recovery-addendum")
     ack_addendum.add_argument("--journal-sha256", required=True)
     ack_addendum.add_argument("--review-record", type=Path, required=True)
@@ -3742,6 +4231,20 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "Incident archived and acknowledgment written; "
                 f"journal_sha256={journal_sha}; manifest_sha256={manifest_sha}"
+            )
+            return 0
+        if args.command == "acknowledge-pre-shutdown-recovery":
+            journal_sha, ack_sha = acknowledge_task301_pre_shutdown(
+                AUDIT_DIR,
+                expected_journal_sha256=args.journal_sha256,
+                approved_by=args.approved_by,
+                approval_reference=args.approval_reference,
+                owner_uid=0,
+                owner_gid=0,
+            )
+            print(
+                "Pre-shutdown incident archived and acknowledged; "
+                f"journal_sha256={journal_sha}; acknowledgment_sha256={ack_sha}"
             )
             return 0
         if args.command == "acknowledge-recovery-addendum":

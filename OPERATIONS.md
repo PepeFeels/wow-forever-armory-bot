@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "a6d45850a8532ab4be53b4cdc1a58f715c67ab641572297b7aa920b0db2406e9"
+ADMIN_SHA256 = "6c95fa1171fa431acbd7a1e6cdfd5eed7a97ae7f5fec2b83a38cb22e8c11ba38"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1981,3 +1981,17 @@ TASK 262 content SHA-256, and compares the bytes directly. The alias is only
 compatibility material: it is not parsed, added to recovery records, or
 counted as independent evidence. Other recovery-attestation names, a missing
 canonical file, content/hash mismatch, unsafe metadata or a link fail closed.
+
+## TASK-301 backup-verified recovery
+
+`production_admin.py acknowledge-pre-shutdown-recovery` is restricted to the
+hash-pinned TASK-301 journal interrupted at `backup_verified`. It rechecks the
+live release pointer and marker, production database hash and isolated SQLite
+snapshot, registered backup hash and snapshot, historical preflight hash,
+stopped systemd units, and absence of an Armory process. It then preserves the
+original journal bytes under the journal-hash archive name and writes the
+administrative acknowledgment. It does not require a deployment manifest and
+does not modify the database or backup. See `TASK-301-RECOVERY.md` for the
+exact journal identity, command invocation, test evidence, and current GO/NO-GO.
+The corrected deployment preflight source SHA-256 is
+`6ff1b97b8cc35829daf88c1ab853c31b8e251346215001eb667eedfe55d55e93`.

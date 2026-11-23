@@ -10,27 +10,38 @@ Before the correction, a pre-shutdown failure after `backup_verified` could not 
 
 ## Tests
 
-The deployment/recovery and release-metadata suite passed: **326 passed, 75 subtests passed** across wrapper, administrative recovery, preflight, database snapshot/install/migration, recovery audit, recovery compatibility, and pin tests.
-
-The whole repository suite does not currently collect because `tests/test_command_sync.py` imports missing `wow_forever_armory.command_sync`. Excluding that module before updating the release pins yielded 498 passes, 142 passing subtests, and four failures: two Discord setup/sync expectations and two release-metadata pins. The release-metadata pins are now updated and pass; the two Discord test failures are outside TASK-301 deployment/recovery scope and remain before claiming a fully passing repository suite.
+The deployment/recovery and release-metadata suite passed: **334 passed, 75 subtests passed**. The full repository suite passed: **519 passed, 142 subtests passed**. Tests ran with `PYTHONPATH=src` so they import this candidate checkout. Earlier missing-module and Discord setup/sync errors came from the shared virtual environment importing an older, separate checkout; this candidate contains `wow_forever_armory.command_sync`, and no Discord code changes were needed. The test run reported only upstream `asyncio.iscoroutinefunction` deprecation warnings.
 
 ## Production evidence and exact safe next action
 
-The confirmed facts provided for TASK-301 are: current release `dcceeb85464e09e34b112e41b16a833226c72270`, candidate `fa15f4e3095fad60ff48a059f7ce07414633d07d`, journal `manual_recovery_required` interrupted at `backup_verified`, and bot/timer `inactive/disabled`. The historical preflight hash is `c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803`; the approved candidate preflight hash supplied for comparison is `48c6b711e2518f1086101728412c126812369234735e4758c33eb3a4f981ea8f`.
-
-The journal bytes, database integrity, registered backup checksum, and registered characters have not been independently verified in this workspace. Do not run recovery, migration, restore, installation, or service activation until those checks have been reviewed. After verifying the committed diagnostic script SHA-256 from this report, the administrator can run this single command from the shared workspace on `nololinux-server`:
-
-```sh
-sudo /usr/bin/python3 -I /home/codex-dev/projects/wow-forever-armory-bot/TASK-301/deploy/task301_readonly_diagnostics.py
-```
-
-It emits a JSON report containing selected non-secret journal fields and its hash, active release marker, SQLite integrity and table row counts, backup hashes/integrity, preflight inventory, systemd state, and Armory process count. It does not write to the database, journal, backups, units, or secrets. It hashes the backup referenced by the journal and reports whether it matches the registered checksum. SQLite verification uses the bundled snapshot verifier only after its source SHA-256 matches the reviewed constant.
+The administrator's read-only diagnostic output confirms current release `dcceeb85464e09e34b112e41b16a833226c72270`, candidate `fa15f4e3095fad60ff48a059f7ce07414633d07d`, journal hash `b957b1735570ad821ddbc5f4f8bcaa82ca635e1393394a439879bef531a7f4ca`, phase `manual_recovery_required` interrupted at `backup_verified`, and null database-signature/preflight fields. It reports production DB SHA-256 `4b7e10b846c31fd080f21449478475f783cba00964f0b532b62606c356e1a998`, integrity `ok`, counts (guilds/members/characters) `1/4/4`; registered backup SHA-256 `697b031ced2bf45818eafeb8b4d2556784da04873b1565ce6e1678007a112b5c`, matching the journal, integrity `ok`, same counts; historical preflight SHA-256 `c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803`; previous-release pointer/marker; bot and timer inactive/disabled; backup service inactive/static; and zero Armory processes. The candidate preflight SHA-256 reported for the approved earlier candidate is `48c6b711e2518f1086101728412c126812369234735e4758c33eb3a4f981ea8f`.
 
 ## Recovery decision
 
-The supported `production_admin.py acknowledge-recovery` path is currently restricted to a fail-closed incident interrupted at `installer_started` and requires a deployment manifest. It does **not** accept a `manual_recovery_required` journal interrupted at `backup_verified` without that manifest. The current production incident therefore cannot safely be acknowledged through the existing command. Do not edit the active journal, fabricate a manifest, or bypass the validator. A dedicated hash-bound pre-shutdown recovery path must first be implemented and tested against the actual redacted journal schema and registered backup evidence. Until then the exact production acknowledgment invocation cannot safely be supplied.
+The ordinary `acknowledge-recovery` path requires a manifest and cannot process this interrupted phase. This commit adds the narrowly pinned command `acknowledge-pre-shutdown-recovery`. It accepts only the exact journal SHA above and rechecks the current release pointer/marker, production DB SHA and isolated SQLite snapshot, registered backup SHA and snapshot, historical preflight SHA, all three systemd states, and zero Armory processes. It repeats the checks around acknowledgment publication to detect changes during the operation. Any mismatch stops before removing the active journal name. On success, it hard-links the exact journal bytes to `deployment-state-<sha>.json`, writes a schema 3 acknowledgment with fresh evidence and administrator approval, then removes only the active journal name; the original journal remains byte-identical in the archive. Both `recovery_audit.py` and startup preflight verify the archive/ack pair without a deployment manifest. The database and backup are read-only.
 
-After that workflow is approved and the evidence matches, the planned sequence is: hash-bind a review record to the active journal; use the reviewed root-owned `production_admin.py` recovery command to archive and acknowledge without changing journal bytes; rerun the read-only audit/preflight; stage the candidate with release and installer pins; run the production wrapper once; verify the generated backup and manifest; finalize and activate using the administrative workflow; then check one bot process, systemd active/enabled states, Discord connection, command response, registered characters, and an Armory refresh. Never restore the backup unless the live database fails integrity and a separate reviewed restore has a verified recovery path.
+After the corrected candidate and root-owned admin tool have been staged and independently hash-checked, the administrator recovery invocation is:
 
-**Recommendation: NO-GO for production recovery and deployment** until the admin returns the diagnostic output and the pre-shutdown journal acknowledgment workflow exists and passes hash-bound recovery tests.
+```sh
+sudo /opt/wow-forever-armory-bot/bin/production_admin.py acknowledge-pre-shutdown-recovery \
+  --journal-sha256 b957b1735570ad821ddbc5f4f8bcaa82ca635e1393394a439879bef531a7f4ca \
+  --approved-by nolo-admin \
+  --approval-reference TASK-301
+```
+
+Do not run this command as part of this task turn. After it succeeds, independently run the recovery audit/preflight before staging the deployment pin for the corrected release commit. Then run the production wrapper once, check the new backup and manifest, finalize and activate with the administrative workflow, and verify one bot process, active/enabled units, Discord connection, command response, retained registered characters, and an Armory refresh. Do not restore the backup: both current database and registered backup have matching counts and `ok` integrity. A restore would be unnecessary and destructive.
+
+**Recommendation: GO to stage and review the hash-pinned recovery command; GO to execute its acknowledgment only after the administrator verifies the staged source hashes and records the approval. NO-GO for deployment and service activation until recovery succeeds and startup preflight passes.** No privileged production command was run in this task turn.
+
+## Corrected candidate source hashes
+
+| File | SHA-256 |
+| --- | --- |
+| `deploy/production_admin.py` | `6c95fa1171fa431acbd7a1e6cdfd5eed7a97ae7f5fec2b83a38cb22e8c11ba38` |
+| `deploy/production_wrapper.py` | `b67ce47220c7f002d9cb6111fa6ce6bb8c4a570e2b1250756c720e2c7866920c` |
+| `deploy/production_preflight.py` | `6ff1b97b8cc35829daf88c1ab853c31b8e251346215001eb667eedfe55d55e93` |
+| `deploy/recovery_audit.py` | `5146e2fa401a07883fdafd63d280865c34fccc388ef578a98bc0c3473ef5c23d` |
+| `deploy/systemd/armory-db-preflight.py` | `bf93b4973b6df18cb80161e95db268e74e7f301a46d5c5e33c37eed8404fc70b` |
+| `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
+| `deploy/task301_readonly_diagnostics.py` | `da23624be35d1353f50a2efdff03e3c464569db84de6608ecc0fe0c3841d654d` |
 
