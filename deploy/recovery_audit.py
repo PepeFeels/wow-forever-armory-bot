@@ -21,7 +21,9 @@ class AuditError(ValueError):
 ARCHIVE = re.compile(r"deployment-state-([0-9a-f]{64})\.json\Z")
 ACK = re.compile(r"deployment-recovery-ack-([0-9a-f]{64})\.json\Z")
 MANIFEST = re.compile(r"deployment-([0-9a-f]{40})\.json\Z")
-PREFLIGHT_COPY = re.compile(r"armory-db-preflight\.([0-9a-f]{40})\.py\Z")
+PREFLIGHT_COPY = re.compile(
+    r"armory-db-preflight\.([0-9a-f]{40})(?:\.([0-9a-f]{64}))?\.py\Z"
+)
 REVIEW = re.compile(
     r"recovery-review-([0-9a-f]{64})(?:-([0-9a-f]{64}))?\.json\Z"
 )
@@ -1258,6 +1260,20 @@ def verify_audit_directory(
                 != manifest.get("shared_preflight_sha256")
             ):
                 raise AuditError("manifest contradicts its journal")
+            preflight_path = Path(str(manifest.get("shared_preflight_backup", "")))
+            preflight_match = PREFLIGHT_COPY.fullmatch(preflight_path.name)
+            # Older manifests used implementation-specific filenames. Preserve
+            # those records verbatim; when the filename uses our known naming
+            # convention, bind its release and optional content hash.
+            if preflight_match is not None and (
+                preflight_match.group(1) != previous
+                or (
+                    preflight_match.group(2) is not None
+                    and preflight_match.group(2)
+                    != manifest.get("shared_preflight_sha256")
+                )
+            ):
+                raise AuditError("versioned preflight name is not bound to its content")
             deployment_id = journal.get("deployment_id")
             result_name = journal.get("installation_result")
             result_sha = journal.get("installation_result_sha256")
@@ -1274,7 +1290,7 @@ def verify_audit_directory(
                 result_raw, result = _read_json(
                     fd, result_name, owner=owner, group=group
                 )
-                expected_result_fields = {
+                legacy_result_fields = {
                     "schema_version",
                     "deployment_id",
                     "approved_release_sha",
@@ -1293,10 +1309,16 @@ def verify_audit_directory(
                     "observed_service_states",
                     "verified_at_utc",
                 }
+                result_schema = result.get("schema_version")
+                expected_result_fields = (
+                    legacy_result_fields | {"initial_unit_states"}
+                    if result_schema == 2
+                    else legacy_result_fields
+                )
                 if (
                     hashlib.sha256(result_raw).hexdigest() != result_sha
                     or set(result) != expected_result_fields
-                    or result.get("schema_version") != 1
+                    or result_schema not in {1, 2}
                     or result.get("deployment_id") != deployment_id
                     or result.get("approved_release_sha") != approved
                     or result.get("previous_release_sha") != previous
@@ -1350,6 +1372,11 @@ def verify_audit_directory(
                     )
                     or result.get("database_signature")
                     != journal.get("database_signature")
+                    or (
+                        result_schema == 2
+                        and result.get("initial_unit_states")
+                        != journal.get("initial_unit_states")
+                    )
                     or result.get("intended_service_state")
                     != journal.get("service_state")
                     or result.get("intended_backup_timer_state")
@@ -1369,6 +1396,34 @@ def verify_audit_directory(
                     or journal.get("installer_exit_code") != 0
                 ):
                     raise AuditError("installation result contradicts its journal")
+                if result_schema == 2:
+                    initial_states = result.get("initial_unit_states")
+                    if not isinstance(initial_states, dict) or set(initial_states) != {
+                        "wow-forever-armory-bot.service",
+                        "wow-forever-armory-backup.timer",
+                        "wow-forever-armory-backup.service",
+                    }:
+                        raise AuditError("initial systemd observations are incomplete")
+                    for unit in (
+                        "wow-forever-armory-bot.service",
+                        "wow-forever-armory-backup.timer",
+                    ):
+                        value = initial_states[unit]
+                        if value not in (
+                            ["active", "enabled"],
+                            ["inactive", "disabled"],
+                        ):
+                            raise AuditError("initial managed unit state is invalid")
+                    backup_initial = initial_states[
+                        "wow-forever-armory-backup.service"
+                    ]
+                    if (
+                        not isinstance(backup_initial, list)
+                        or len(backup_initial) != 2
+                        or backup_initial[0] != "inactive"
+                        or backup_initial[1] not in {"static", "disabled"}
+                    ):
+                        raise AuditError("initial backup job state is invalid")
                 try:
                     verified_at = datetime.fromisoformat(result["verified_at_utc"])
                 except ValueError as exc:

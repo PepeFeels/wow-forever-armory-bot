@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "adc1d661cdb2124c4311ddb5fae47af397810fa50799203ec300fb22947fc5bd"
+ADMIN_SHA256 = "a6d45850a8532ab4be53b4cdc1a58f715c67ab641572297b7aa920b0db2406e9"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1885,11 +1885,11 @@ TASK 298 candidate hashes:
 | `deploy/production_admin.py` | `adc1d661cdb2124c4311ddb5fae47af397810fa50799203ec300fb22947fc5bd` |
 | `deploy/production_preflight.py` | `a7f6274f744b72d30cc8a7832e2a17775038ca043cd6010b7f12a8e01c8c3e14` |
 | `deploy/production_wrapper.py` | `4cd83e9d6eeab7fd46c210837bf4f61cb6c676b4ea6bd6d965f7d3751c1342b6` |
-| `deploy/systemd/armory-db-preflight.py` | `48c6b711e2518f1086101728412c126812369234735e4758c33eb3a4f981ea8f` |
+| `deploy/systemd/armory-db-preflight.py` | `969dfafcf67b63bfe66e80b60af47f1982622c9173d7ab522c8e2114d6a53185` |
 
 DEV permission-compatibility correction (not yet a release pin):
 `deploy/production_preflight.py` SHA-256 is
-`7bf3ef0f9fe2bab32968c6bc06b2df282565c5255770e400b910ad16fab34038` and
+`96aa614ed9e18144fc996da8e5d0f8ea00d3121fee60f759a2a9c05c4c5ed529` and
 `deploy/production_wrapper.py` SHA-256 is
 `503c5b1d6a556d7b53eedd62f8aae1c640588f28420975120f0a3b597745dc64`.
 These working-tree hashes are review evidence, not release pins; no existing

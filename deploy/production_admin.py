@@ -68,7 +68,7 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "ef05cc4bda55136ac51e9d2b548f61e863aa2f54d9da7d049d4baee3e5fbb927"
+    "d1f879a2a6e79aa338d450fc0022c6a40e72f1a3a10dac8bedae5d4d5eb26615"
 )
 COMPLETION_SNAPSHOT_MODULE = COMPLETION_BASE / "bin/production_db_snapshot.py"
 SNAPSHOT_MODULE_SHA256 = (
@@ -652,11 +652,20 @@ def _validate_manifest(
         raise AdminError("incident manifest does not match the active journal")
     backup = Path(str(journal.get("database_backup", "")))
     saved_preflight = Path(str(journal.get("shared_preflight_backup", "")))
+    preflight_match = re.fullmatch(
+        rf"armory-db-preflight\.{re.escape(previous_sha)}(?:\.([0-9a-f]{{64}}))?\.py",
+        saved_preflight.name,
+    )
     if (
         backup.parent != Path("/var/lib/wow-forever-armory-bot/backups")
         or not backup.name.startswith("guild-armory-")
         or backup.suffix != ".sqlite3"
-        or saved_preflight != audit_dir / f"armory-db-preflight.{previous_sha}.py"
+        or saved_preflight.parent != audit_dir
+        or preflight_match is None
+        or (
+            preflight_match.group(1) is not None
+            and preflight_match.group(1) != journal.get("shared_preflight_sha256")
+        )
     ):
         raise AdminError("incident artifact paths are invalid")
     for field in ("database_backup_sha256", "shared_preflight_sha256"):
@@ -1743,7 +1752,7 @@ def _verify_completion_evidence(
         or release == previous
     ):
         raise AdminError("deployment journal is not eligible for completion")
-    expected_report_fields = {
+    legacy_report_fields = {
         "schema_version",
         "deployment_id",
         "approved_release_sha",
@@ -1762,9 +1771,15 @@ def _verify_completion_evidence(
         "observed_service_states",
         "verified_at_utc",
     }
+    report_schema = report.get("schema_version")
+    expected_report_fields = (
+        legacy_report_fields | {"initial_unit_states"}
+        if report_schema == 2
+        else legacy_report_fields
+    )
     if (
         set(report) != expected_report_fields
-        or report.get("schema_version") != 1
+        or report_schema not in {1, 2}
         or report.get("deployment_id") != journal.get("deployment_id")
         or report.get("approved_release_sha") != release
         or report.get("previous_release_sha") != previous
@@ -1781,8 +1796,35 @@ def _verify_completion_evidence(
         or report.get("installer_sha256")
         != journal.get("deployment_pin_installer_sha256")
         or report.get("deployment_pin_sha256") != journal.get("deployment_pin_sha256")
+        or (
+            report_schema == 2
+            and report.get("initial_unit_states")
+            != journal.get("initial_unit_states")
+        )
     ):
         raise AdminError("installation result contradicts deployment journal")
+    if report_schema == 2:
+        initial_states = report.get("initial_unit_states")
+        if not isinstance(initial_states, Mapping) or set(initial_states) != {
+            SERVICE_NAME,
+            TIMER_NAME,
+            BACKUP_SERVICE,
+        }:
+            raise AdminError("installation report initial unit states are incomplete")
+        for unit in (SERVICE_NAME, TIMER_NAME):
+            if initial_states[unit] not in (
+                ["active", "enabled"],
+                ["inactive", "disabled"],
+            ):
+                raise AdminError("installation report initial unit state is invalid")
+        backup_initial = initial_states[BACKUP_SERVICE]
+        if (
+            not isinstance(backup_initial, list)
+            or len(backup_initial) != 2
+            or backup_initial[0] != "inactive"
+            or backup_initial[1] not in {"static", "disabled"}
+        ):
+            raise AdminError("installation report initial backup state is invalid")
     if (
         manifest.get("approved_release_sha") != release
         or manifest.get("previous_release_sha") != previous

@@ -51,7 +51,7 @@ INSTALLER = BASE / "bin/production_install.py"
 INSTALLER_SHA256 = "0" * 64
 DEPLOYMENT_PIN_SHA256 = "0" * 64
 RECOVERY_AUDIT_SHA256 = (
-    "ef05cc4bda55136ac51e9d2b548f61e863aa2f54d9da7d049d4baee3e5fbb927"
+    "d1f879a2a6e79aa338d450fc0022c6a40e72f1a3a10dac8bedae5d4d5eb26615"
 )
 PYTHON = Path("/usr/bin/python3.14")
 GIT = Path("/usr/bin/git")
@@ -1185,7 +1185,11 @@ def _preserve_preflight() -> tuple[Path, str]:
     source_hash = _sha256(source)
     if _sha256(PREFLIGHT) != source_hash:
         raise Refusal("the current and approved shared database preflight differ")
-    destination = AUDIT_DIR / f"armory-db-preflight.{PREVIOUS_SHA}.py"
+    # Keep historical copies immutable. The previous-release-only filename
+    # collides when the shared preflight changes across a deployment retry.
+    destination = AUDIT_DIR / (
+        f"armory-db-preflight.{PREVIOUS_SHA}.{source_hash}.py"
+    )
     payload = source.read_bytes()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -1563,17 +1567,21 @@ class DeploymentJournal:
 
     def start(self, states: Mapping[str, tuple[str, str]]) -> None:
         record = {
+            "journal_schema_version": 2,
             "deployment_id": secrets.token_hex(16),
             "approved_release_sha": RELEASE_SHA,
             "previous_release_sha": PREVIOUS_SHA,
             "deployment_pin_installer_sha256": INSTALLER_SHA256,
             "deployment_pin_sha256": DEPLOYMENT_PIN_SHA256,
             "phase": "prepared",
-            # Desired post-approval operating state is fixed by the approved
-            # release policy. Observed initial state is only used for safe
-            # cleanup before shutdown; it never triggers a service start.
+            # service_state and backup_timer_state remain the approved
+            # post-deployment targets. Persist the actually observed states
+            # separately so recovery can distinguish intent from observation.
             "service_state": ["active", "enabled"],
             "backup_timer_state": ["active", "enabled"],
+            "initial_unit_states": {
+                unit: list(state) for unit, state in states.items()
+            },
             "started_at_utc": datetime.now(UTC).isoformat(),
         }
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -1635,9 +1643,14 @@ DEPLOYMENT_TRANSITIONS = {
     },
     "backup_verified": {
         "backup_and_preflight_verified",
+        "aborted_before_service_changes",
         "manual_recovery_required",
     },
-    "backup_and_preflight_verified": {"shutdown_started", "manual_recovery_required"},
+    "backup_and_preflight_verified": {
+        "shutdown_started",
+        "aborted_before_service_changes",
+        "manual_recovery_required",
+    },
     "shutdown_started": {"installer_started", "manual_recovery_required"},
     "installer_started": {"installer_returned", "manual_recovery_required"},
     "installer_returned": {"release_verified", "manual_recovery_required"},
@@ -1782,6 +1795,16 @@ def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
             try:
                 ops["restore_timer"](states[BACKUP_TIMER])
                 final_states = ops["observe_unit_states"]()
+                expected_initial = {
+                    unit: tuple(state) for unit, state in states.items()
+                }
+                observed = {
+                    unit: tuple(state) for unit, state in final_states.items()
+                }
+                if observed != expected_initial:
+                    raise Refusal(
+                        "initial systemd states were not restored before shutdown"
+                    )
                 journal.update(
                     "aborted_before_service_changes",
                     interrupted_phase=phase,
@@ -1790,7 +1813,7 @@ def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
                     database_check_failure=diagnostic,
                     installer_failure=installer_diagnostic,
                 )
-            except BaseException:
+            except BaseException as restore_exc:
                 try:
                     final_states = ops["observe_unit_states"]()
                 except BaseException:
@@ -1801,6 +1824,7 @@ def perform_deployment(ops: Mapping[str, Any], journal: Any) -> None:
                         interrupted_phase=phase,
                         failure_class=failure,
                         final_unit_states=final_states,
+                        timer_restore_error=type(restore_exc).__name__,
                         database_check_failure=diagnostic,
                         installer_failure=installer_diagnostic,
                     )
@@ -1977,7 +2001,7 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
         if _db_signature() != stopped_db_signature:
             raise Refusal("the production database changed during installation")
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "deployment_id": deployment_id,
             "approved_release_sha": RELEASE_SHA,
             "previous_release_sha": PREVIOUS_SHA,
@@ -1992,6 +2016,9 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
             "database_signature": list(stopped_db_signature),
             "intended_service_state": ["active", "enabled"],
             "intended_backup_timer_state": ["active", "enabled"],
+            "initial_unit_states": {
+                key: list(value) for key, value in original_states.items()
+            },
             "observed_service_states": {
                 key: list(value) for key, value in observed.items()
             },

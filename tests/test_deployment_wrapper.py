@@ -98,7 +98,74 @@ class InstallerDiagnosticTests(unittest.TestCase):
             record = json.loads((audit / "deployment-state.json").read_text())
             self.assertEqual(record["service_state"], ["active", "enabled"])
             self.assertEqual(record["backup_timer_state"], ["active", "enabled"])
+            self.assertEqual(
+                record["initial_unit_states"],
+                {unit: list(state) for unit, state in stopped.items()},
+            )
             self.assertEqual(stopped[wrapper.SERVICE], ("inactive", "disabled"))
+
+    def test_preflight_preservation_versions_new_copy_and_keeps_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir = root / "repo/deploy/systemd"
+            source_dir.mkdir(parents=True)
+            source = source_dir / "armory-db-preflight.py"
+            source.write_bytes(b"approved new preflight\n")
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            previous = "a" * 40
+            legacy = audit / f"armory-db-preflight.{previous}.py"
+            legacy.write_bytes(b"immutable historical preflight\n")
+            legacy.chmod(0o700)
+            legacy_before = (legacy.read_bytes(), legacy.stat().st_mtime_ns)
+            expected_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            with (
+                patch.object(wrapper, "REPO", root / "repo"),
+                patch.object(wrapper, "PREFLIGHT", source),
+                patch.object(wrapper, "AUDIT_DIR", audit),
+                patch.object(wrapper, "PREVIOUS_SHA", previous),
+                patch.object(wrapper, "_assert_managed_file"),
+                patch.object(wrapper.os, "chown"),
+            ):
+                preserved, digest = wrapper._preserve_preflight()
+                self.assertEqual(digest, expected_hash)
+                self.assertEqual(
+                    preserved.name,
+                    f"armory-db-preflight.{previous}.{expected_hash}.py",
+                )
+                self.assertEqual(preserved.read_bytes(), source.read_bytes())
+                self.assertEqual(
+                    wrapper._preserve_preflight(), (preserved, expected_hash)
+                )
+
+            self.assertEqual(
+                (legacy.read_bytes(), legacy.stat().st_mtime_ns), legacy_before
+            )
+
+    def test_preflight_preservation_rejects_wrong_bytes_at_versioned_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir = root / "repo/deploy/systemd"
+            source_dir.mkdir(parents=True)
+            source = source_dir / "armory-db-preflight.py"
+            source.write_bytes(b"approved preflight\n")
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            previous = "b" * 40
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            conflict = audit / f"armory-db-preflight.{previous}.{source_hash}.py"
+            conflict.write_bytes(b"different bytes\n")
+            conflict.chmod(0o700)
+            with (
+                patch.object(wrapper, "REPO", root / "repo"),
+                patch.object(wrapper, "PREFLIGHT", source),
+                patch.object(wrapper, "AUDIT_DIR", audit),
+                patch.object(wrapper, "PREVIOUS_SHA", previous),
+                patch.object(wrapper, "_assert_managed_file"),
+            ):
+                with self.assertRaisesRegex(wrapper.Refusal, "different checksum"):
+                    wrapper._preserve_preflight()
 
     def test_deployment_rejects_mixed_bot_and_timer_baseline(self):
         with self.assertRaisesRegex(wrapper.Refusal, "states do not match"):
@@ -625,11 +692,23 @@ class InstallerDiagnosticTests(unittest.TestCase):
             calls.append(command)
             return next(outputs)
 
+        real_lstat = Path.lstat
+
+        def fake_lstat(path):
+            if path == wrapper.REPO / ".git":
+                return SimpleNamespace(st_dev=1, st_ino=2)
+            return real_lstat(path)
+
         with (
             patch.object(wrapper, "_assert_root_owned_tree"),
-            patch.object(wrapper, "_validate_git_metadata", return_value=(Path(wrapper.REPO / ".git").lstat())),
+            patch.object(
+                wrapper,
+                "_validate_git_metadata",
+                return_value=SimpleNamespace(st_dev=1, st_ino=2),
+            ),
             patch.object(wrapper, "_check_git_config"),
             patch.object(wrapper, "_run", side_effect=fake_run),
+            patch.object(Path, "lstat", fake_lstat),
         ):
             wrapper._check_checkout()
 
@@ -646,7 +725,11 @@ class InstallerDiagnosticTests(unittest.TestCase):
         )
         with (
             patch.object(wrapper, "_assert_root_owned_tree"),
-            patch.object(wrapper, "_validate_git_metadata", return_value=(Path(wrapper.REPO / ".git").lstat())),
+            patch.object(
+                wrapper,
+                "_validate_git_metadata",
+                return_value=SimpleNamespace(st_dev=1, st_ino=2),
+            ),
             patch.object(wrapper, "_check_git_config"),
             patch.object(wrapper, "_run", side_effect=lambda *_a, **_k: next(bad_ref)),
             self.assertRaises(wrapper.Refusal),
@@ -1125,10 +1208,17 @@ class InstallerDiagnosticTests(unittest.TestCase):
                 fail_closed_calls,
             )
             restored = []
+            states = ops["states"]
+            ops["observe_unit_states"] = lambda: states
+
+            def restore_timer(state):
+                restored.append(state)
+                states[wrapper.BACKUP_TIMER] = tuple(state)
+
             ops["wait_backup_idle"] = lambda: (_ for _ in ()).throw(
                 RuntimeError("private detail")
             )
-            ops["restore_timer"] = lambda state: restored.append(state)
+            ops["restore_timer"] = restore_timer
             with self.assertRaises(wrapper.Refusal):
                 wrapper.perform_deployment(ops, journal)
             self.assertEqual(restored, [ops["states"][wrapper.BACKUP_TIMER]])
@@ -1139,6 +1229,114 @@ class InstallerDiagnosticTests(unittest.TestCase):
             ][0]
             self.assertNotIn("private detail", repr(record))
             self.assertIsNone(record["installer_failure"])
+
+    def test_timer_restore_error_is_recorded_as_manual_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = MemoryJournal()
+            ops = self._ops_for_installer_failure(
+                Path(temporary), RuntimeError("unused"), journal, []
+            )
+            ops["wait_backup_idle"] = lambda: (_ for _ in ()).throw(
+                RuntimeError("synthetic wait failure")
+            )
+            ops["restore_timer"] = lambda _state: (_ for _ in ()).throw(
+                RuntimeError("synthetic timer restoration failure")
+            )
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.perform_deployment(ops, journal)
+            phases = [phase for phase, _details in journal.records]
+            self.assertIn("manual_recovery_required", phases)
+            self.assertNotIn("aborted_before_service_changes", phases)
+            manual = next(
+                details
+                for phase, details in journal.records
+                if phase == "manual_recovery_required"
+            )
+            self.assertEqual(manual["timer_restore_error"], "RuntimeError")
+
+    def test_backup_verified_preflight_failure_aborts_after_exact_state_restore(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            states = {
+                wrapper.SERVICE: ("inactive", "disabled"),
+                wrapper.BACKUP_TIMER: ("inactive", "disabled"),
+                wrapper.BACKUP_SERVICE: ("inactive", "static"),
+            }
+            restored = []
+            ops = {
+                "states": states,
+                "check_database": lambda: None,
+                "pause_timer": lambda: None,
+                "wait_backup_idle": lambda: None,
+                "backup": lambda: (audit / "backup.sqlite3", "a" * 64, {}),
+                "acquire_backup_locks": lambda: None,
+                "recheck_backup_exclusive": lambda *args: None,
+                "preserve_preflight": lambda: (_ for _ in ()).throw(
+                    wrapper.Refusal("preflight path is occupied")
+                ),
+                "write_manifest": lambda *args: audit / "manifest.json",
+                "shutdown": lambda: self.fail("bot shutdown must not start"),
+                "fail_closed": lambda: self.fail("fail-closed stop is not needed"),
+                "restore_timer": lambda state: restored.append(state),
+                "observe_unit_states": lambda: states,
+                "release_backup_locks": lambda _: None,
+            }
+
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.perform_deployment(ops, journal)
+
+            record = json.loads((audit / "deployment-state.json").read_text())
+            self.assertEqual(record["phase"], "aborted_before_service_changes")
+            self.assertEqual(record["interrupted_phase"], "backup_verified")
+            self.assertEqual(restored, [states[wrapper.BACKUP_TIMER]])
+            self.assertEqual(
+                record["final_unit_states"],
+                {unit: list(state) for unit, state in states.items()},
+            )
+            self.assertEqual(
+                record["initial_unit_states"],
+                {unit: list(state) for unit, state in states.items()},
+            )
+
+    def test_pre_shutdown_abort_refuses_if_any_initial_state_was_not_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            audit.mkdir(mode=0o700)
+            journal = wrapper.DeploymentJournal(audit, owner_uid=os.getuid())
+            states = {
+                wrapper.SERVICE: ("active", "enabled"),
+                wrapper.BACKUP_TIMER: ("active", "enabled"),
+                wrapper.BACKUP_SERVICE: ("inactive", "static"),
+            }
+            observed = dict(states)
+            observed[wrapper.BACKUP_TIMER] = ("inactive", "disabled")
+            ops = {
+                "states": states,
+                "check_database": lambda: None,
+                "pause_timer": lambda: None,
+                "wait_backup_idle": lambda: None,
+                "backup": lambda: (audit / "backup.sqlite3", "b" * 64, {}),
+                "acquire_backup_locks": lambda: None,
+                "recheck_backup_exclusive": lambda *args: None,
+                "preserve_preflight": lambda: (_ for _ in ()).throw(
+                    wrapper.Refusal("preflight path is occupied")
+                ),
+                "write_manifest": lambda *args: audit / "manifest.json",
+                "shutdown": lambda: self.fail("bot shutdown must not start"),
+                "fail_closed": lambda: self.fail("fail-closed stop is not needed"),
+                "restore_timer": lambda state: None,
+                "observe_unit_states": lambda: observed,
+                "release_backup_locks": lambda _: None,
+            }
+
+            with self.assertRaises(wrapper.Refusal):
+                wrapper.perform_deployment(ops, journal)
+
+            record = json.loads((audit / "deployment-state.json").read_text())
+            self.assertEqual(record["phase"], "manual_recovery_required")
+            self.assertEqual(record["interrupted_phase"], "backup_verified")
 
     def test_real_journal_accepts_safe_abort_before_service_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
