@@ -54,6 +54,9 @@ class Task301PreShutdownRecoveryTests(unittest.TestCase):
         self.preflight_hash = hashlib.sha256(self.preflight.read_bytes()).hexdigest()
         self.journal_path = self.audit / "deployment-state.json"
         journal = {
+            # The interrupted deployment already had a deployment ID, but
+            # failed before its installation-result file could be published.
+            "deployment_id": "4aec20d12ac86e5cc7510aa039e68eed",
             "phase": "manual_recovery_required",
             "interrupted_phase": "backup_verified",
             "approved_release_sha": self.release,
@@ -162,6 +165,28 @@ class Task301PreShutdownRecoveryTests(unittest.TestCase):
         recovery_audit.verify_audit_directory(
             self.audit, owner=self.uid, group=self.gid, acquire_lock=False
         )
+
+    def test_pre_shutdown_id_without_installation_result_is_not_an_orphan(self):
+        self._run()
+        self.assertFalse(
+            (self.audit / "deployment-installation-4aec20d12ac86e5cc7510aa039e68eed.json").exists()
+        )
+        recovery_audit.verify_audit_directory(
+            self.audit, owner=self.uid, group=self.gid, acquire_lock=False
+        )
+
+    def test_pre_shutdown_id_with_contradictory_installation_result_fails_closed(self):
+        self._run()
+        result = self.audit / "deployment-installation-4aec20d12ac86e5cc7510aa039e68eed.json"
+        result.write_text("{}\n", encoding="utf-8")
+        result.chmod(0o600)
+        with self.assertRaisesRegex(
+            recovery_audit.AuditError,
+            "pre-shutdown incident has contradictory installation evidence",
+        ):
+            recovery_audit.verify_audit_directory(
+                self.audit, owner=self.uid, group=self.gid, acquire_lock=False
+            )
 
     def test_admin_parser_exposes_the_narrow_hash_bound_recovery_command(self):
         args = admin._parser().parse_args(

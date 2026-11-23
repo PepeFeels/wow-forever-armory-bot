@@ -1208,6 +1208,7 @@ def verify_audit_directory(
         task267_addenda: dict[str, dict] = {}
         hash_bound_reviews: set[str] = set()
         expected_hash_bound_reviews: set[str] = set()
+        pre_shutdown_deployment_ids: set[str] = set()
         for name in names:
             match = ARCHIVE.fullmatch(name)
             if match:
@@ -1362,6 +1363,18 @@ def verify_audit_directory(
                     raise AuditError("pre-shutdown evidence differs from its approved pins")
                 if approved in bound:
                     raise AuditError("journal release identity is duplicated")
+                deployment_id = journal.get("deployment_id")
+                if (
+                    not isinstance(deployment_id, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
+                    or journal.get("installation_result") is not None
+                    or journal.get("installation_result_sha256") is not None
+                    or deployment_id in installation_results
+                ):
+                    raise AuditError(
+                        "pre-shutdown incident has contradictory installation evidence"
+                    )
+                pre_shutdown_deployment_ids.add(deployment_id)
                 bound.add(approved)
                 releases_without_manifest.add(approved)
                 continue
@@ -1715,7 +1728,9 @@ def verify_audit_directory(
             for archive_name in archives.values()
         }
         if set(installation_results) != {
-            value for value in referenced_results if isinstance(value, str)
+            value
+            for value in referenced_results
+            if isinstance(value, str) and value not in pre_shutdown_deployment_ids
         }:
             raise AuditError("an orphan or contradictory installation result exists")
         activation_attempts: dict[str, list[tuple[int, str, list[dict]]]] = {}

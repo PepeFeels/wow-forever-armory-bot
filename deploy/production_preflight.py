@@ -30,7 +30,7 @@ from typing import Any
 BRANCH = "release/v2.0.0"
 FAILED_V1_RELEASE = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
 APPROVED_PREFLIGHT_SHA256 = (
-    "fa920864ea21e9c3152f0999455984a8ff9d6100fc50b269e0b8c40144e6ff1f"
+    "7613de528c3c12425f1b1a4aba1cca616d5082205d0cb60088ac06dccce3cb20"
 )
 BASE = Path("/opt/wow-forever-armory-bot")
 REPO = BASE / "deployment-checkout"
@@ -44,7 +44,7 @@ BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
 RECOVERY_AUDIT_SHA256 = (
-    "990cc8b5d8631d192766210b4fbf418ea2831b96ba05d81399adbc845ddca778"
+    "6108865e3606de3b44eeea561d5fce67490133c338cd6eadcb2b41fd7f1700fc"
 )
 SYSTEM_PYTHON = "/usr/bin/python3.14"
 VENV_SYMLINK_TARGETS = {
