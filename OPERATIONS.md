@@ -1886,3 +1886,21 @@ TASK 298 candidate hashes:
 | `deploy/production_preflight.py` | `f29967ec9570f3686d486484283973c6b3511a3d5112c51eb91602810597381b` |
 | `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
 | `deploy/systemd/armory-db-preflight.py` | `916b5d57f07bde1b4fe6f45d4617a5aec4053d7733c97db31cc0a80529820014` |
+
+## TASK 298 recovery-attestation filename blocker
+
+The observed name `recovery-attestation-f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json`
+contains the SHA-256 of the known TASK 267 incident journal. That suffix
+identifies the journal reference; it does not authenticate the JSON bytes.
+The reviewed runbook pins the journal and recovery ACK, and the TASK 267
+addendum pins a different historical attestation named
+`task262-attestation-<content-sha256>.json`. Neither defines a digest or
+validation rule for this `recovery-attestation-<journal-sha256>.json` object.
+
+The recovery validator therefore continues to reject this name as an
+unexpected audit-root file. A regression test proves the known synthetic
+journal/ACK chain passes without the object and that adding this exact
+otherwise well-formed, mode-`0600` name fails closed. Do not add a filename
+allowlist or treat the object as recovery evidence until an independently
+reviewed protocol supplies an expected content digest or equivalent
+authenticated binding. PROD remains NO-GO for the current preflight blocker.

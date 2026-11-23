@@ -142,6 +142,37 @@ def as_root_owned_metadata(audit: Path, callback):
 
 
 class HistoricalAuditPermissionTests(unittest.TestCase):
+    def test_recovery_attestation_name_without_content_pin_stays_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            make_active_chain(audit)
+            self.assertEqual(
+                recovery_audit.verify_audit_directory(
+                    audit, owner=os.getuid(), group=os.getgid()
+                ),
+                1,
+            )
+
+            # The filename binds to the known journal identity, but the
+            # protocol has no expected digest for this file's own bytes.
+            attestation = audit / (
+                "recovery-attestation-"
+                "f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json"
+            )
+            attestation.write_text(
+                '{"journal_sha256":"f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb",'
+                '"decision":"manual_recovery_verified"}\n',
+                encoding="ascii",
+            )
+            attestation.chmod(0o600)
+            with self.assertRaisesRegex(
+                recovery_audit.AuditError,
+                "audit directory contains an unexpected file",
+            ):
+                recovery_audit.verify_audit_directory(
+                    audit, owner=os.getuid(), group=os.getgid()
+                )
+
     def observed_executable(self, audit: Path, *, payload: bytes = b"x" * 43_813) -> Path:
         target = audit / "archive" / "pre-wrapper-fix-20261114T184045Z" / "armory-deploy-a1a6a2a"
         target.parent.mkdir(mode=0o700)
