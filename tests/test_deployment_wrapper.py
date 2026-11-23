@@ -44,6 +44,23 @@ class MemoryJournal:
 
 
 class InstallerDiagnosticTests(unittest.TestCase):
+    def test_wrapper_accepts_only_hash_pinned_previous_backup_unit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "previous.service"
+            candidate = root / "candidate.service"
+            fixture = Path(__file__).parent / "fixtures/task298-previous-backup.service"
+            old.write_bytes(fixture.read_bytes())
+            candidate.write_bytes(
+                (Path(__file__).parents[1] / "deploy/systemd/wow-forever-armory-backup.service").read_bytes()
+            )
+            metadata = SimpleNamespace(st_gid=0, st_nlink=1)
+            with patch.object(wrapper, "_assert_managed_file", return_value=metadata):
+                wrapper._verify_previous_backup_unit(old, candidate)
+                candidate.write_bytes(candidate.read_bytes() + b"# unexpected\n")
+                with self.assertRaisesRegex(wrapper.Refusal, "exact approved previous"):
+                    wrapper._verify_previous_backup_unit(old, candidate)
+
     def test_active_backup_directory_is_created_beside_preserved_history(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"

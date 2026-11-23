@@ -50,11 +50,14 @@ SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")
 STATE = Path("/var/lib/wow-forever-armory-bot")
+SYSTEMD_DIRECTORY = Path("/etc/systemd/system")
 UNIT_FILES = (
     "wow-forever-armory-bot.service",
     "wow-forever-armory-backup.service",
     "wow-forever-armory-backup.timer",
 )
+PREVIOUS_BACKUP_UNIT_SHA256 = "e5c4497e36a31c93e4418472e390db9e45e3590a726df6f10b7ef41a3eb72b70"
+RELEASE_BACKUP_UNIT_SHA256 = "4d2358635efbc02394ed99f7cbaf84b8a1620188399aee0b3185bcb23bfe97b0"
 ENABLEABLE_UNITS = (
     "wow-forever-armory-bot.service",
     "wow-forever-armory-backup.timer",
@@ -860,6 +863,57 @@ def _copy_unit(source: Path, destination: Path, mode: int = 0o644) -> None:
     os.replace(temporary, destination)
 
 
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(131072), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_previous_backup_unit(path: Path, expected_release_unit: Path) -> None:
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o644
+        or info.st_nlink != 1
+        or _sha256_file(path) != PREVIOUS_BACKUP_UNIT_SHA256
+        or _sha256_file(expected_release_unit) != PREVIOUS_BACKUP_UNIT_SHA256
+    ):
+        raise InstallError("installed backup unit is not the pinned previous version")
+
+
+def _upgrade_backup_unit(source: Path, destination: Path, previous_release: Path) -> None:
+    """Apply only the pinned old-to-new backup unit transition, without activation."""
+    try:
+        old_release_unit = previous_release / "deploy/systemd/wow-forever-armory-backup.service"
+        candidate_hash = _sha256_file(source)
+        _verify_previous_backup_unit(destination, old_release_unit)
+    except OSError as exc:
+        raise InstallError("backup unit transition evidence is unavailable") from exc
+    if (
+        candidate_hash != RELEASE_BACKUP_UNIT_SHA256
+    ):
+        raise InstallError("backup unit does not match the exact approved transition")
+    _run(["systemd-analyze", "verify", str(source)])
+    try:
+        _copy_unit(source, destination, 0o644)
+        _run(["systemctl", "daemon-reload"])
+    except BaseException as exc:
+        try:
+            _copy_unit(old_release_unit, destination, 0o644)
+            _run(["systemctl", "daemon-reload"])
+        except BaseException as rollback_exc:
+            raise InstallError(
+                "backup unit update and automatic restoration failed; manual recovery required"
+            ) from rollback_exc
+        raise InstallError("backup unit update failed and previous version was restored") from exc
+
+
 def install(
     repo: Path,
     config_source: Path,
@@ -906,7 +960,7 @@ def install(
     if configured_logo is not None:
         _validate_logo_asset(configured_logo, uid, gid)
     deploy = repo / "deploy"
-    systemd_directory = Path("/etc/systemd/system")
+    systemd_directory = SYSTEMD_DIRECTORY
     runtime_files = (
         (deploy / "systemd/armory-launch", BASE / "bin/armory-launch"),
         (
@@ -917,6 +971,7 @@ def install(
         *((deploy / "systemd" / name, systemd_directory / name) for name in UNIT_FILES),
     )
     if upgrade_existing:
+        previous_release = (BASE / "current").resolve(strict=True)
         for source, destination in runtime_files:
             if source.name == "recovery_audit.py":
                 try:
@@ -936,6 +991,11 @@ def install(
                     expected_owner=0,
                     maximum_bytes=262144,
                     exact_mode=0o755,
+                )
+                continue
+            if source.name == "wow-forever-armory-backup.service" and _sha256_file(source) == RELEASE_BACKUP_UNIT_SHA256:
+                _verify_previous_backup_unit(
+                    destination, previous_release / "deploy/systemd" / source.name
                 )
                 continue
             if (
@@ -967,11 +1027,31 @@ def install(
         preflight_destination = BASE / "bin/armory-db-preflight"
         _copy_unit(preflight_source, preflight_destination, 0o755)
         _copy_unit(deploy / "recovery_audit.py", BASE / "bin/recovery_audit.py", 0o644)
+    previous_release = (BASE / "current").resolve(strict=True) if upgrade_existing else None
     _install_current_link(
         release,
         upgrade_existing=upgrade_existing,
         repo=repo if upgrade_existing else None,
     )
+    if upgrade_existing and "wow-forever-armory-backup.service" in UNIT_FILES:
+        try:
+            _upgrade_backup_unit(
+                deploy / "systemd/wow-forever-armory-backup.service",
+                systemd_directory / "wow-forever-armory-backup.service",
+                previous_release,
+            )
+        except BaseException:
+            rollback_link = BASE / ".current.rollback"
+            try:
+                if rollback_link.exists() or rollback_link.is_symlink():
+                    raise InstallError("temporary rollback link already exists")
+                rollback_link.symlink_to(Path("releases") / previous_release.name)
+                os.replace(rollback_link, BASE / "current")
+            except BaseException as rollback_exc:
+                raise InstallError(
+                    "backup unit transition failed and release pointer restoration failed; manual recovery required"
+                ) from rollback_exc
+            raise
 
     config = ETC / "config"
     if not upgrade_existing:

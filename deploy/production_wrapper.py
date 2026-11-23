@@ -59,6 +59,8 @@ SYSTEMCTL = Path("/usr/bin/systemctl")
 SERVICE = "wow-forever-armory-bot.service"
 BACKUP_TIMER = "wow-forever-armory-backup.timer"
 BACKUP_SERVICE = "wow-forever-armory-backup.service"
+PREVIOUS_BACKUP_UNIT_SHA256 = "e5c4497e36a31c93e4418472e390db9e45e3590a726df6f10b7ef41a3eb72b70"
+RELEASE_BACKUP_UNIT_SHA256 = "4d2358635efbc02394ed99f7cbaf84b8a1620188399aee0b3185bcb23bfe97b0"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 MANAGED_UNITS = (SERVICE, BACKUP_TIMER)
 SECURE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
@@ -92,6 +94,7 @@ AUTHORIZED_WRITE_PATHS = (
     PREFLIGHT,
     BACKUPS,
     AUDIT_DIR,
+    Path("/etc/systemd/system/wow-forever-armory-backup.service"),
 )
 
 
@@ -173,6 +176,7 @@ def apply_deployment_pin(
         PREFLIGHT,
         BACKUPS,
         AUDIT_DIR,
+        Path("/etc/systemd/system/wow-forever-armory-backup.service"),
     )
 
 
@@ -788,6 +792,17 @@ def _assert_directory(
     return info
 
 
+def _verify_previous_backup_unit(installed: Path, candidate: Path) -> None:
+    info = _assert_managed_file(installed, owner=0, mode=0o644)
+    if (
+        info.st_gid != 0
+        or info.st_nlink != 1
+        or _sha256(installed) != PREVIOUS_BACKUP_UNIT_SHA256
+        or _sha256(candidate) != RELEASE_BACKUP_UNIT_SHA256
+    ):
+        raise Refusal("installed backup unit is not the exact approved previous version")
+
+
 def _assert_installer() -> None:
     """Require the pinned, root-owned installer before any deployment work."""
     _assert_managed_file(INSTALLER, owner=0, mode=0o755)
@@ -848,6 +863,11 @@ def _check_paths_and_current() -> tuple[int, int]:
     for unit in (SERVICE, BACKUP_SERVICE, BACKUP_TIMER):
         source = REPO / "deploy/systemd" / unit
         installed = Path("/etc/systemd/system") / unit
+        if unit == BACKUP_SERVICE:
+            if not source.is_file():
+                raise Refusal("trusted release backup unit is unavailable")
+            _verify_previous_backup_unit(installed, source)
+            continue
         _assert_managed_file(installed, owner=0, mode=0o644)
         if not source.is_file() or source.read_bytes() != installed.read_bytes():
             raise Refusal("installed systemd files differ from the trusted release")
@@ -1789,6 +1809,14 @@ def deploy(journal: DeploymentJournal | None = None) -> None:
             raise Refusal(
                 "the installed shared database preflight checksum is unexpected"
             )
+        installed_backup_unit = Path("/etc/systemd/system") / BACKUP_SERVICE
+        info = _assert_managed_file(installed_backup_unit, owner=0, mode=0o644)
+        if (
+            info.st_gid != 0
+            or info.st_nlink != 1
+            or _sha256(installed_backup_unit) != RELEASE_BACKUP_UNIT_SHA256
+        ):
+            raise Refusal("installed backup unit does not match the approved release")
         if _db_signature() != stopped_db_signature:
             raise Refusal(
                 "the production database changed during code-only installation"

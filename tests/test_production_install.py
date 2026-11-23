@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import ExitStack
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
@@ -550,6 +551,97 @@ class ProductionInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(InstallError, "stopped"):
                 _assert_units_stopped_and_disabled(upgrade_existing=True)
 
+    def test_exact_backup_unit_transition_is_verified_and_dormant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "systemd/wow-forever-armory-backup.service"
+            destination.parent.mkdir()
+            fixture = Path(__file__).parent / "fixtures/task298-previous-backup.service"
+            destination.write_bytes(fixture.read_bytes())
+            old_release = root / "previous"
+            old_release_unit = old_release / "deploy/systemd/wow-forever-armory-backup.service"
+            old_release_unit.parent.mkdir(parents=True)
+            old_release_unit.write_bytes(fixture.read_bytes())
+            candidate = Path(__file__).parents[1] / "deploy/systemd/wow-forever-armory-backup.service"
+            real_lstat = Path.lstat
+            root_owned = SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0, st_nlink=1
+            )
+
+            def lstat(path):
+                return root_owned if path == destination else real_lstat(path)
+
+            def atomic_copy(source, target, mode):
+                target.write_bytes(Path(source).read_bytes())
+                target.chmod(mode)
+
+            with (
+                patch.object(Path, "lstat", lstat),
+                patch.object(production_install, "_copy_unit", side_effect=atomic_copy),
+                patch.object(production_install, "_run") as run,
+            ):
+                production_install._upgrade_backup_unit(candidate, destination, old_release)
+
+            self.assertEqual(destination.read_bytes(), candidate.read_bytes())
+            self.assertEqual(
+                [call.args[0][:2] for call in run.call_args_list],
+                [["systemd-analyze", "verify"], ["systemctl", "daemon-reload"]],
+            )
+
+    def test_backup_unit_transition_rejects_modified_previous_unit_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "installed.service"
+            fixture = Path(__file__).parent / "fixtures/task298-previous-backup.service"
+            destination.write_bytes(fixture.read_bytes() + b"# modified\n")
+            old_release = root / "previous"
+            old_release_unit = old_release / "deploy/systemd/wow-forever-armory-backup.service"
+            old_release_unit.parent.mkdir(parents=True)
+            old_release_unit.write_bytes(fixture.read_bytes())
+            candidate = Path(__file__).parents[1] / "deploy/systemd/wow-forever-armory-backup.service"
+            real_lstat = Path.lstat
+            root_owned = SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0, st_nlink=1
+            )
+            with (
+                patch.object(Path, "lstat", lambda path: root_owned if path == destination else real_lstat(path)),
+                patch.object(production_install, "_copy_unit") as copy_unit,
+            ):
+                with self.assertRaisesRegex(InstallError, "pinned previous version"):
+                    production_install._upgrade_backup_unit(candidate, destination, old_release)
+            copy_unit.assert_not_called()
+            self.assertEqual(destination.read_bytes(), fixture.read_bytes() + b"# modified\n")
+
+    def test_backup_unit_reload_failure_restores_exact_previous_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "installed.service"
+            fixture = Path(__file__).parent / "fixtures/task298-previous-backup.service"
+            destination.write_bytes(fixture.read_bytes())
+            old_release = root / "previous"
+            old_release_unit = old_release / "deploy/systemd/wow-forever-armory-backup.service"
+            old_release_unit.parent.mkdir(parents=True)
+            old_release_unit.write_bytes(fixture.read_bytes())
+            candidate = Path(__file__).parents[1] / "deploy/systemd/wow-forever-armory-backup.service"
+            real_lstat = Path.lstat
+            root_owned = SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0, st_nlink=1
+            )
+
+            def atomic_copy(source, target, mode):
+                target.write_bytes(Path(source).read_bytes())
+                target.chmod(mode)
+
+            with (
+                patch.object(Path, "lstat", lambda path: root_owned if path == destination else real_lstat(path)),
+                patch.object(production_install, "_copy_unit", side_effect=atomic_copy),
+                patch.object(production_install, "_run", side_effect=[None, InstallError("reload failed"), None]) as run,
+            ):
+                with self.assertRaisesRegex(InstallError, "was restored"):
+                    production_install._upgrade_backup_unit(candidate, destination, old_release)
+            self.assertEqual(destination.read_bytes(), fixture.read_bytes())
+            self.assertEqual(run.call_args_list[-1].args[0], ["systemctl", "daemon-reload"])
+
     def test_upgrade_path_does_not_invoke_database_migration(self) -> None:
         import inspect
 
@@ -626,17 +718,31 @@ class ProductionInstallTests(unittest.TestCase):
             base = root / "opt/wow-forever-armory-bot"
             etc = root / "etc/wow-forever-armory-bot"
             state = root / "var/lib/wow-forever-armory-bot"
+            systemd = root / "etc/systemd/system"
             bin_dir = base / "bin"
             releases = base / "releases"
             etc.mkdir(parents=True)
             state.mkdir(parents=True)
+            systemd.mkdir(parents=True)
             bin_dir.mkdir(parents=True)
             releases.mkdir()
 
             old_release = releases / ("a" * 40)
             old_release.mkdir()
             (old_release / ".installation-complete").write_text("a" * 40)
+            previous_unit = old_release / "deploy/systemd/wow-forever-armory-backup.service"
+            previous_unit.parent.mkdir(parents=True)
+            previous_unit.write_bytes(
+                (Path(__file__).parent / "fixtures/task298-previous-backup.service").read_bytes()
+            )
             (base / "current").symlink_to(old_release)
+
+            for unit in production_install.UNIT_FILES:
+                target = systemd / unit
+                if unit == "wow-forever-armory-backup.service":
+                    target.write_bytes(previous_unit.read_bytes())
+                else:
+                    target.write_bytes((repo / "deploy/systemd" / unit).read_bytes())
 
             config = etc / "config"
             credential = etc / "discord-token"
@@ -653,58 +759,64 @@ class ProductionInstallTests(unittest.TestCase):
 
             database = state / "guild-armory.sqlite3"
             _create_preflight_database(database, guild_count=0)
-            snapshot_root = root / "private-snapshots"
-            snapshot_root.mkdir(mode=0o700)
             service_account = SimpleNamespace(
                 pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir="/nonexistent"
             )
             service_group = SimpleNamespace(gr_gid=os.getgid())
             release_sha = "b" * 40
 
-            with (
-                patch.object(production_install, "BASE", base),
-                patch.object(production_install, "ETC", etc),
-                patch.object(production_install, "STATE", state),
-                patch.object(production_install, "UNIT_FILES", ()),
-                patch.object(
-                    production_install,
-                    "os",
-                    SimpleNamespace(geteuid=lambda: 0),
-                ),
-                patch.object(production_install, "_check_repository"),
-                patch.object(production_install, "validate_inputs"),
-                patch.object(production_install, "_require_supported_runtime"),
-                patch.object(production_install, "_assert_units_stopped_and_disabled"),
-                patch.object(
-                    production_install.pwd,
-                    "getpwnam",
-                    return_value=service_account,
-                ),
-                patch.object(
-                    production_install.grp,
-                    "getgrnam",
-                    return_value=service_group,
-                ),
-                patch.object(
-                    production_install, "_configured_logo_path", return_value=None
-                ),
-                patch.object(
-                    production_install, "_read_regular_file", return_value=b"old"
-                ),
-                patch.object(production_install, "_mkdir_owned"),
-                patch.object(production_install, "_assert_no_armory_process"),
-                patch.object(production_install, "_install_release"),
-                patch.object(production_install, "_copy_unit") as copy_unit,
-                patch.object(
-                    production_install, "_install_current_link"
-                ) as switch_link,
-                patch.object(
-                    production_install,
-                    "_verify_upgrade_database",
-                    wraps=production_install._verify_upgrade_database,
-                ) as verify_database,
-                patch.object(production_db_snapshot, "SNAPSHOT_ROOT", snapshot_root),
-            ):
+            with ExitStack() as stack:
+                for target, attribute, value in (
+                    (production_install, "BASE", base),
+                    (production_install, "ETC", etc),
+                    (production_install, "STATE", state),
+                    (production_install, "SYSTEMD_DIRECTORY", systemd),
+                ):
+                    stack.enter_context(patch.object(target, attribute, value))
+                for target, attribute, kwargs in (
+                    (production_install.os, "geteuid", {"return_value": 0}),
+                    (production_install.os, "chown", {}),
+                    (production_install, "_check_repository", {}),
+                    (production_install, "validate_inputs", {}),
+                    (production_install, "_require_supported_runtime", {}),
+                    (production_install, "_assert_units_stopped_and_disabled", {}),
+                    (production_install.pwd, "getpwnam", {"return_value": service_account}),
+                    (production_install.grp, "getgrnam", {"return_value": service_group}),
+                    (production_install, "_configured_logo_path", {"return_value": None}),
+                    (production_install, "_read_regular_file", {"return_value": b"old"}),
+                    (production_install, "_mkdir_owned", {}),
+                    (production_install, "_assert_no_armory_process", {}),
+                    (production_install, "_install_release", {}),
+                ):
+                    stack.enter_context(patch.object(target, attribute, **kwargs))
+                copy_unit = stack.enter_context(
+                    patch.object(
+                        production_install,
+                        "_copy_unit",
+                        wraps=production_install._copy_unit,
+                    )
+                )
+                switch_link = stack.enter_context(
+                    patch.object(production_install, "_install_current_link")
+                )
+                run = stack.enter_context(patch.object(production_install, "_run"))
+                verify_unit_metadata = stack.enter_context(
+                    patch.object(production_install, "_verify_previous_backup_unit")
+                )
+                verify_database = stack.enter_context(
+                    patch.object(
+                        production_install,
+                        "_verify_upgrade_database",
+                        wraps=production_install._verify_upgrade_database,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        production_install,
+                        "verify_database_snapshot",
+                        return_value=(0, 0, 0),
+                    )
+                )
                 production_install.install(
                     repo,
                     config,
@@ -720,7 +832,22 @@ class ProductionInstallTests(unittest.TestCase):
             copy_unit.assert_any_call(
                 repo / "deploy/recovery_audit.py", bin_dir / "recovery_audit.py", 0o644
             )
-            self.assertEqual(copy_unit.call_count, 2)
+            self.assertEqual(copy_unit.call_count, 3)
+            self.assertEqual(
+                (systemd / "wow-forever-armory-backup.service").read_bytes(),
+                (repo / "deploy/systemd/wow-forever-armory-backup.service").read_bytes(),
+            )
+            verify_unit_metadata.assert_any_call(
+                systemd / "wow-forever-armory-backup.service", previous_unit
+            )
+            self.assertEqual(verify_unit_metadata.call_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    ["systemd-analyze", "verify", str(repo / "deploy/systemd/wow-forever-armory-backup.service")],
+                    ["systemctl", "daemon-reload"],
+                ],
+            )
             switch_link.assert_called_once()
 
     def test_upgrade_process_guard_detects_bot_and_fails_closed_on_proc_error(
