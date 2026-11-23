@@ -37,7 +37,7 @@ Do not run this command as part of this task turn. After it succeeds, independen
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/production_admin.py` | `73d53c607ef7628ca411936d762bb8b311e9de32babf07d51e908533cd58650f` |
+| `deploy/production_admin.py` | `4eab58ec53245af1d0610a1695e796ec132d0795aecc439ef553ce93a9f236ed` |
 | `deploy/production_wrapper.py` | `f8a67bb81e88883c2bc989553720ad5c678083fb6e4378e641669f3aee70672c` |
 | `deploy/production_preflight.py` | `cdcd22a19d2df221a149f594c0f93819da0abe9c28de083127d782f4f48941f7` |
 | `deploy/recovery_audit.py` | `02465785fa96cf13fce668e8df59d35dfa0bd2d7eb227153ff74f6b7697de5fc` |

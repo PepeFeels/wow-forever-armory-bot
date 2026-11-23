@@ -1405,6 +1405,92 @@ class ProductionAdminTests(unittest.TestCase):
             self._provision_pin(path)
         self.assertEqual(path.read_bytes(), b"original\n")
 
+    def test_pin_rotation_archives_old_bytes_and_is_idempotent(self) -> None:
+        path = self.root / "deployment-pin.json"
+        history = self.root / "deployment-pin-history"
+        old_raw = self._provision_pin(path)
+        old_hash = hashlib.sha256(old_raw).hexdigest()
+        arguments = {
+            "history_dir": history,
+            "expected_current_pin_sha256": old_hash,
+            "expected_current_release_sha": "a" * 40,
+            "expected_previous_sha": "b" * 40,
+            "release_sha": "d" * 40,
+            "previous_sha": "b" * 40,
+            "installer_sha256": "c" * 64,
+            "approved_by": "release-admin",
+            "approval_reference": "TASK-302-DEPLOY",
+            "owner_uid": self.owner,
+            "owner_gid": self.group,
+            "parent_mode": 0o700,
+        }
+        old_result_hash, new_hash = admin.rotate_pin(path, **arguments)
+        archive = history / f"deployment-pin-{old_hash}.json"
+        self.assertEqual(old_result_hash, old_hash)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), new_hash)
+        self.assertEqual(archive.read_bytes(), old_raw)
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(json.loads(path.read_bytes())["release_sha"], "d" * 40)
+        approval = history / f"deployment-pin-rotation-{old_hash}-{new_hash}.json"
+        approval_record = json.loads(approval.read_bytes())
+        self.assertEqual(approval_record["previous_pin_sha256"], old_hash)
+        self.assertEqual(approval_record["current_pin_sha256"], new_hash)
+        self.assertEqual(approval_record["approval_reference"], "TASK-302-DEPLOY")
+        self.assertEqual(approval.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(admin.rotate_pin(path, **arguments), (old_hash, new_hash))
+        self.assertEqual(archive.read_bytes(), old_raw)
+
+    def test_pin_rotation_refuses_contradictory_existing_history(self) -> None:
+        path = self.root / "deployment-pin.json"
+        history = self.root / "deployment-pin-history"
+        old_raw = self._provision_pin(path)
+        old_hash = hashlib.sha256(old_raw).hexdigest()
+        history.mkdir(mode=0o700)
+        archive = history / f"deployment-pin-{old_hash}.json"
+        archive.write_bytes(b"contradictory history\n")
+        archive.chmod(0o400)
+        with self.assertRaisesRegex(admin.AdminError, "existing pin history differs"):
+            admin.rotate_pin(
+                path,
+                history_dir=history,
+                expected_current_pin_sha256=old_hash,
+                expected_current_release_sha="a" * 40,
+                expected_previous_sha="b" * 40,
+                release_sha="d" * 40,
+                previous_sha="b" * 40,
+                installer_sha256="c" * 64,
+                approved_by="release-admin",
+                approval_reference="TASK-302-DEPLOY",
+                owner_uid=self.owner,
+                owner_gid=self.group,
+                parent_mode=0o700,
+            )
+        self.assertEqual(path.read_bytes(), old_raw)
+        self.assertEqual(archive.read_bytes(), b"contradictory history\n")
+
+    def test_pin_rotation_rejects_unexpected_current_pin_without_replacement(self) -> None:
+        path = self.root / "deployment-pin.json"
+        history = self.root / "deployment-pin-history"
+        old_raw = self._provision_pin(path)
+        arguments = {
+            "history_dir": history,
+            "expected_current_pin_sha256": "0" * 64,
+            "expected_current_release_sha": "a" * 40,
+            "expected_previous_sha": "b" * 40,
+            "release_sha": "d" * 40,
+            "previous_sha": "b" * 40,
+            "installer_sha256": "c" * 64,
+            "approved_by": "release-admin",
+            "approval_reference": "TASK-302-DEPLOY",
+            "owner_uid": self.owner,
+            "owner_gid": self.group,
+            "parent_mode": 0o700,
+        }
+        with self.assertRaisesRegex(admin.AdminError, "differs from approved rotation"):
+            admin.rotate_pin(path, **arguments)
+        self.assertEqual(path.read_bytes(), old_raw)
+        self.assertFalse(history.exists())
+
     def test_pin_refuses_symlink_without_touching_target(self) -> None:
         target = self.root / "protected-target"
         target.write_bytes(b"do not change\n")

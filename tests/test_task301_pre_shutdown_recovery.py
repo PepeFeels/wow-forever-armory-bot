@@ -203,6 +203,30 @@ class Task301PreShutdownRecoveryTests(unittest.TestCase):
         self.assertEqual(args.command, "acknowledge-pre-shutdown-recovery")
         self.assertEqual(args.journal_sha256, self.journal_hash)
 
+    def test_admin_parser_exposes_the_explicit_pin_rotation_command(self):
+        args = admin._parser().parse_args(
+            [
+                "rotate-pin",
+                "--expected-current-pin-sha256",
+                "0" * 64,
+                "--expected-current-release-sha",
+                "a" * 40,
+                "--expected-previous-sha",
+                "b" * 40,
+                "--release-sha",
+                "c" * 40,
+                "--previous-sha",
+                "b" * 40,
+                "--installer-sha256",
+                "d" * 64,
+                "--approved-by",
+                "release-admin",
+                "--approval-reference",
+                "TASK-302-DEPLOY",
+            ]
+        )
+        self.assertEqual(args.command, "rotate-pin")
+
     def test_sqlite_sidecars_are_metadata_bound_and_unsafe_files_fail_closed(self):
         wal = Path(f"{self.database}-wal")
         wal.write_bytes(b"stable sidecar bytes")

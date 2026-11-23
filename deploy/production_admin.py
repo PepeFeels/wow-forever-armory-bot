@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 PIN_PATH = Path("/etc/wow-forever-armory-bot/deployment-pin.json")
+PIN_HISTORY_DIR = PIN_PATH.parent / "deployment-pin-history"
 AUDIT_DIR = Path("/var/lib/armory-deployment-audit")
 MAX_JSON_BYTES = 65_536
 MAX_SOURCE_BYTES = 1_048_576
@@ -556,6 +557,226 @@ def provision_pin(
     finally:
         os.close(directory_fd)
     return raw
+
+
+def rotate_pin(
+    path: Path,
+    *,
+    history_dir: Path,
+    expected_current_pin_sha256: str,
+    expected_current_release_sha: str,
+    expected_previous_sha: str,
+    release_sha: str,
+    previous_sha: str,
+    installer_sha256: str,
+    approved_by: str,
+    approval_reference: str,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+    parent_mode: int = 0o750,
+) -> tuple[str, str]:
+    """Hash-bind a pin rotation after preserving the exact old pin bytes."""
+    for value in (
+        expected_current_pin_sha256,
+        installer_sha256,
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise AdminError("deployment pin hash is invalid")
+    for value in (
+        expected_current_release_sha,
+        expected_previous_sha,
+        release_sha,
+        previous_sha,
+    ):
+        if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise AdminError("deployment pin release identity is invalid")
+    if (
+        history_dir.parent != path.parent
+        or history_dir.name in {"", ".", ".."}
+        or "/" in history_dir.name
+        or
+        release_sha == previous_sha
+        or release_sha == expected_current_release_sha
+        or expected_current_release_sha == expected_previous_sha
+        or previous_sha != expected_previous_sha
+        or not isinstance(approved_by, str)
+        or not approved_by.strip()
+        or len(approved_by) > 128
+        or not isinstance(approval_reference, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", approval_reference)
+        is None
+    ):
+        raise AdminError("deployment pin rotation request is invalid")
+    new_raw = (
+        json.dumps(
+            {
+                "release_sha": release_sha,
+                "previous_sha": previous_sha,
+                "installer_sha256": installer_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    new_hash = hashlib.sha256(new_raw).hexdigest()
+    parent_fd = _open_private_directory(
+        path.parent, owner_uid=owner_uid, exact_mode=parent_mode
+    )
+    history_fd = -1
+    try:
+        old_raw, old_info = _read_at(
+            parent_fd, path.name, owner_uid=owner_uid, mode=0o600
+        )
+        old_hash = hashlib.sha256(old_raw).hexdigest()
+        old_pin = _json_object(old_raw)
+
+        def verify_or_write_rotation_record() -> None:
+            rotation_name = f"deployment-pin-rotation-{expected_current_pin_sha256}-{new_hash}.json"
+            rotation_expected = {
+                "schema_version": 1,
+                "previous_pin_sha256": expected_current_pin_sha256,
+                "current_pin_sha256": new_hash,
+                "previous_release_sha": expected_current_release_sha,
+                "current_release_sha": release_sha,
+                "approved_by": approved_by.strip(),
+                "approval_reference": approval_reference,
+            }
+            try:
+                os.stat(rotation_name, dir_fd=history_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                record = {
+                    **rotation_expected,
+                    "approved_at_utc": datetime.now(UTC).isoformat(),
+                }
+                _write_new_at(
+                    history_fd,
+                    rotation_name,
+                    (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"),
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    mode=0o400,
+                )
+                return
+            record_raw, _ = _read_at(
+                history_fd, rotation_name, owner_uid=owner_uid, mode=0o400
+            )
+            record = _json_object(record_raw)
+            if (
+                set(record) != set(rotation_expected) | {"approved_at_utc"}
+                or any(record.get(key) != value for key, value in rotation_expected.items())
+            ):
+                raise AdminError("pin rotation approval record is contradictory")
+            _parse_utc(record.get("approved_at_utc"))
+
+        if old_hash == new_hash and old_pin == {
+            "release_sha": release_sha,
+            "previous_sha": previous_sha,
+            "installer_sha256": installer_sha256,
+        }:
+            history_fd = _open_private_directory(
+                history_dir, owner_uid=owner_uid, exact_mode=0o700
+            )
+            archive_name = f"deployment-pin-{expected_current_pin_sha256}.json"
+            archived_raw, _ = _read_at(
+                history_fd, archive_name, owner_uid=owner_uid, mode=0o400
+            )
+            if hashlib.sha256(archived_raw).hexdigest() != expected_current_pin_sha256:
+                raise AdminError("pin rotation archive does not match its expected hash")
+            verify_or_write_rotation_record()
+            return expected_current_pin_sha256, new_hash
+        if (
+            old_hash != expected_current_pin_sha256
+            or set(old_pin) != {"release_sha", "previous_sha", "installer_sha256"}
+            or old_pin.get("release_sha") != expected_current_release_sha
+            or old_pin.get("previous_sha") != expected_previous_sha
+            or old_pin.get("installer_sha256") != installer_sha256
+        ):
+            raise AdminError("current deployment pin differs from approved rotation")
+
+        try:
+            os.mkdir(history_dir.name, 0o700, dir_fd=parent_fd)
+            if os.geteuid() == 0:
+                os.chown(history_dir.name, owner_uid, owner_gid, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        history_fd = _open_private_directory(
+            history_dir, owner_uid=owner_uid, exact_mode=0o700
+        )
+
+        archive_name = f"deployment-pin-{old_hash}.json"
+        try:
+            _write_new_at(
+                history_fd,
+                archive_name,
+                old_raw,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o400,
+            )
+        except AdminError as exc:
+            if "refusing to overwrite" not in str(exc):
+                raise
+            archived_raw, _ = _read_at(
+                history_fd, archive_name, owner_uid=owner_uid, mode=0o400
+            )
+            if archived_raw != old_raw:
+                raise AdminError("existing pin history differs from current pin") from exc
+        verify_or_write_rotation_record()
+
+        temporary_name = f".deployment-pin-rotation-{new_hash}.json"
+        try:
+            os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            staged_exists = False
+        else:
+            staged_exists = True
+        if staged_exists:
+            staged_raw, _ = _read_at(
+                parent_fd, temporary_name, owner_uid=owner_uid, mode=0o600
+            )
+            if staged_raw != new_raw:
+                raise AdminError("interrupted pin rotation file is contradictory")
+        else:
+            _write_new_at(
+                parent_fd,
+                temporary_name,
+                new_raw,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o600,
+            )
+        current_raw, current_info = _read_at(
+            parent_fd, path.name, owner_uid=owner_uid, mode=0o600
+        )
+        if (
+            current_raw != old_raw
+            or _signature(current_info) != _signature(old_info)
+        ):
+            raise AdminError("deployment pin changed before atomic rotation")
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        rotated_raw, rotated_info = _read_at(
+            parent_fd, path.name, owner_uid=owner_uid, mode=0o600
+        )
+        if rotated_raw != new_raw or rotated_info.st_nlink != 1:
+            raise AdminError("rotated deployment pin failed read-back validation")
+        _verify_directory_binding(
+            parent_fd, path.parent, owner_uid=owner_uid, exact_mode=parent_mode
+        )
+        return old_hash, new_hash
+    except OSError as exc:
+        raise AdminError("deployment pin rotation stopped on a filesystem error") from exc
+    finally:
+        if history_fd >= 0:
+            os.close(history_fd)
+        os.close(parent_fd)
 
 
 def load_reviewed_python_source(
@@ -4224,6 +4445,15 @@ def _parser() -> argparse.ArgumentParser:
     pin.add_argument("--release-sha", required=True)
     pin.add_argument("--previous-sha", required=True)
     pin.add_argument("--installer-sha256", required=True)
+    rotate_pin_parser = commands.add_parser("rotate-pin")
+    rotate_pin_parser.add_argument("--expected-current-pin-sha256", required=True)
+    rotate_pin_parser.add_argument("--expected-current-release-sha", required=True)
+    rotate_pin_parser.add_argument("--expected-previous-sha", required=True)
+    rotate_pin_parser.add_argument("--release-sha", required=True)
+    rotate_pin_parser.add_argument("--previous-sha", required=True)
+    rotate_pin_parser.add_argument("--installer-sha256", required=True)
+    rotate_pin_parser.add_argument("--approved-by", required=True)
+    rotate_pin_parser.add_argument("--approval-reference", required=True)
     ack = commands.add_parser("acknowledge-recovery")
     ack.add_argument("--journal-sha256", required=True)
     ack.add_argument("--review-record", type=Path, required=True)
@@ -4268,6 +4498,27 @@ def main(argv: list[str] | None = None) -> int:
                 parent_mode=0o750,
             )
             print("Deployment pin created and verified.")
+            return 0
+        if args.command == "rotate-pin":
+            old_hash, new_hash = rotate_pin(
+                PIN_PATH,
+                history_dir=PIN_HISTORY_DIR,
+                expected_current_pin_sha256=args.expected_current_pin_sha256,
+                expected_current_release_sha=args.expected_current_release_sha,
+                expected_previous_sha=args.expected_previous_sha,
+                release_sha=args.release_sha,
+                previous_sha=args.previous_sha,
+                installer_sha256=args.installer_sha256,
+                approved_by=args.approved_by,
+                approval_reference=args.approval_reference,
+                owner_uid=0,
+                owner_gid=0,
+                parent_mode=0o750,
+            )
+            print(
+                "Deployment pin rotated with immutable hash-bound history; "
+                f"previous_pin_sha256={old_hash}; current_pin_sha256={new_hash}"
+            )
             return 0
         if args.command == "acknowledge-recovery":
             journal_sha, manifest_sha = acknowledge_incident(
