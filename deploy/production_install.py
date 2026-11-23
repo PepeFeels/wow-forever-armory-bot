@@ -881,8 +881,16 @@ def _verify_previous_backup_unit(path: Path, expected_release_unit: Path) -> Non
         or info.st_gid != 0
         or stat.S_IMODE(info.st_mode) != 0o644
         or info.st_nlink != 1
-        or _sha256_file(path) != PREVIOUS_BACKUP_UNIT_SHA256
-        or _sha256_file(expected_release_unit) != PREVIOUS_BACKUP_UNIT_SHA256
+    ):
+        raise InstallError("installed backup unit is not the pinned previous version")
+    installed_hash = _sha256_file(path)
+    previous_release_hash = _sha256_file(expected_release_unit)
+    if (
+        (installed_hash, previous_release_hash)
+        not in {
+            (PREVIOUS_BACKUP_UNIT_SHA256, PREVIOUS_BACKUP_UNIT_SHA256),
+            (RELEASE_BACKUP_UNIT_SHA256, RELEASE_BACKUP_UNIT_SHA256),
+        }
     ):
         raise InstallError("installed backup unit is not the pinned previous version")
 
@@ -899,6 +907,8 @@ def _upgrade_backup_unit(source: Path, destination: Path, previous_release: Path
         candidate_hash != RELEASE_BACKUP_UNIT_SHA256
     ):
         raise InstallError("backup unit does not match the exact approved transition")
+    if _sha256_file(destination) == candidate_hash:
+        return
     _run(["systemd-analyze", "verify", str(source)])
     try:
         _copy_unit(source, destination, 0o644)

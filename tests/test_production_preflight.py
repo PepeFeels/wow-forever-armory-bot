@@ -1078,9 +1078,11 @@ class ProductionPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary)
             checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
-            self.assertEqual(
-                checker._verify_archived_deployments(audit, owner=os.getuid()), 0
-            )
+            with patch.object(production_preflight, "REPO", Path(__file__).parents[1]):
+                self.assertEqual(
+                    checker._verify_archived_deployments(audit, owner=os.getuid()),
+                    0,
+                )
 
     def test_archived_audit_uses_validator_from_protected_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1116,30 +1118,29 @@ class ProductionPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary)
             archive, manifest, ack = self._recovery_fixture(audit)
-            self.assertEqual(
-                production_preflight.Preflight._verify_archived_deployments(
-                    audit, owner=os.getuid()
-                ),
-                1,
-            )
-
-            ack.unlink()
-            with self.assertRaises(ValueError):
+            with patch.object(production_preflight, "REPO", Path(__file__).parents[1]):
                 production_preflight.Preflight._verify_archived_deployments(
                     audit, owner=os.getuid()
                 )
-            self._recovery_fixture(audit, ack_changes={"manifest_sha256": "0" * 64})
-            with self.assertRaises(ValueError):
-                production_preflight.Preflight._verify_archived_deployments(
-                    audit, owner=os.getuid()
+                ack.unlink()
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                self._recovery_fixture(
+                    audit, ack_changes={"manifest_sha256": "0" * 64}
                 )
-            manifest.write_text("{}\n", encoding="ascii")
-            manifest.chmod(0o600)
-            with self.assertRaises(ValueError):
-                production_preflight.Preflight._verify_archived_deployments(
-                    audit, owner=os.getuid()
-                )
-            self.assertTrue(archive.exists())
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                manifest.write_text("{}\n", encoding="ascii")
+                manifest.chmod(0o600)
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                self.assertTrue(archive.exists())
 
     def test_preflight_rejects_unverified_fail_closed_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

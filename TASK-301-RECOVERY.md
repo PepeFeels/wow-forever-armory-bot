@@ -37,11 +37,12 @@ Do not run this command as part of this task turn. After it succeeds, independen
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/production_admin.py` | `99ffe29ed335494e8277e5d18f74adff6afb2c4ec32effacdd0e41cd8dd7dafe` |
-| `deploy/production_wrapper.py` | `f8a67bb81e88883c2bc989553720ad5c678083fb6e4378e641669f3aee70672c` |
-| `deploy/production_preflight.py` | `4b6b664e5c19e3ce1284f722713618ca38de8e24fce431e697a6036492e33ea4` |
-| `deploy/recovery_audit.py` | `02465785fa96cf13fce668e8df59d35dfa0bd2d7eb227153ff74f6b7697de5fc` |
-| `deploy/systemd/armory-db-preflight.py` | `3ab1bf66ba00aee7e269dc1dea5a799fa886d49f1ebb09f56fa99cc3beea6da6` |
+| `deploy/production_admin.py` | `9c065401d7de563451983b6d0c0985eeb418176110f1de1d7cab37f418602e58` |
+| `deploy/production_wrapper.py` | `eb79a56e44721b561eb76238e1dfa65f4112b0e54e52ae0e1ec4de23643b6080` |
+| `deploy/production_preflight.py` | `d908181ce8b40e99207e67cac64a846c51a29b1f7e46590c8d2d95187e53b738` |
+| `deploy/production_install.py` | `347f7c659f939c69ea8e106dcc387dd53a7158fa3c1ae22bb8474e38fa7abb9c` |
+| `deploy/recovery_audit.py` | `00a4eacd84f6fdaba660a5bed9c84da5412d85c243f27df3926f32f76a14da09` |
+| `deploy/systemd/armory-db-preflight.py` | `6106670e27ec9ec235e46078c9fa84a2adb03be5fc95aae7b3ac969607c80f39` |
 | `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
 | `deploy/task301_readonly_diagnostics.py` | `da23624be35d1353f50a2efdff03e3c464569db84de6608ecc0fe0c3841d654d` |
 

@@ -61,6 +61,18 @@ class InstallerDiagnosticTests(unittest.TestCase):
                 with self.assertRaisesRegex(wrapper.Refusal, "exact approved previous"):
                     wrapper._verify_previous_backup_unit(old, candidate)
 
+    def test_wrapper_accepts_exact_candidate_backup_unit_as_idempotent_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installed = root / "installed.service"
+            candidate = Path(__file__).parents[1] / (
+                "deploy/systemd/wow-forever-armory-backup.service"
+            )
+            installed.write_bytes(candidate.read_bytes())
+            metadata = SimpleNamespace(st_gid=0, st_nlink=1)
+            with patch.object(wrapper, "_assert_managed_file", return_value=metadata):
+                wrapper._verify_previous_backup_unit(installed, candidate)
+
     def test_active_backup_directory_is_created_beside_preserved_history(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"

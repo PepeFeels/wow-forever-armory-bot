@@ -622,6 +622,16 @@ def _valid_activation_action(action: object) -> bool:
     )
 
 
+def _valid_observed_unit_states(states: object) -> bool:
+    return isinstance(states, dict) and all(
+        isinstance(state, list)
+        and len(state) == 2
+        and state[0] in {"active", "activating", "inactive", "failed"}
+        and state[1] in {"enabled", "disabled", "static", "indirect"}
+        for state in states.values()
+    )
+
+
 def _expected_activation_actions(intended: dict) -> list[dict]:
     result = []
     for unit in ("wow-forever-armory-bot.service", "wow-forever-armory-backup.timer"):
@@ -1861,13 +1871,8 @@ def verify_audit_directory(
                         event["approval_reference"],
                     )
                     is None
-                    or not isinstance(event.get("observed_states"), dict)
-                    or any(
-                        not isinstance(state, list)
-                        or len(state) != 2
-                        or state[0] not in {"active", "inactive", "failed"}
-                        or state[1] not in {"enabled", "disabled", "static", "indirect"}
-                        for state in event.get("observed_states", {}).values()
+                    or not _valid_observed_unit_states(
+                        event.get("observed_states")
                     )
                     or not _valid_utc(event.get("recorded_at_utc"))
                     or event.get("completion_ack_sha256")

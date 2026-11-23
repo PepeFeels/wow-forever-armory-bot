@@ -612,6 +612,42 @@ class ProductionInstallTests(unittest.TestCase):
             copy_unit.assert_not_called()
             self.assertEqual(destination.read_bytes(), fixture.read_bytes() + b"# modified\n")
 
+    def test_backup_unit_transition_is_idempotent_when_candidate_is_preinstalled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "installed.service"
+            candidate = Path(__file__).parents[1] / (
+                "deploy/systemd/wow-forever-armory-backup.service"
+            )
+            destination.write_bytes(candidate.read_bytes())
+            old_release = root / "previous"
+            old_release_unit = (
+                old_release / "deploy/systemd/wow-forever-armory-backup.service"
+            )
+            old_release_unit.parent.mkdir(parents=True)
+            old_release_unit.write_bytes(candidate.read_bytes())
+            real_lstat = Path.lstat
+            root_owned = SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0, st_nlink=1
+            )
+            with (
+                patch.object(
+                    Path,
+                    "lstat",
+                    lambda path: root_owned if path == destination else real_lstat(path),
+                ),
+                patch.object(production_install, "_copy_unit") as copy_unit,
+                patch.object(production_install, "_run") as run,
+            ):
+                production_install._upgrade_backup_unit(
+                    candidate, destination, old_release
+                )
+            copy_unit.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(destination.read_bytes(), candidate.read_bytes())
+
     def test_backup_unit_reload_failure_restores_exact_previous_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

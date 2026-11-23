@@ -570,6 +570,12 @@ The active deployment wrapper writes to `backups/active/`; rejecting that
 documented path would leave a successfully installed release impossible to
 finalize.
 
+Backup-unit upgrades are idempotent when the exact approved candidate unit is
+already installed and the previous release contains that same hash. The
+installer still accepts the exact old-to-new transition and rejects every
+other hash pairing. This supports recovery after an interrupted preparation
+that installed the candidate unit before the application release.
+
 The deployment wrapper records the database signature after managed services
 have stopped and before the installer starts. If recovery later finds changed
 `mtime_ns` or `ctime_ns`, preserve the original incident signature; do not edit
@@ -679,7 +685,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "99ffe29ed335494e8277e5d18f74adff6afb2c4ec32effacdd0e41cd8dd7dafe"
+ADMIN_SHA256 = "9c065401d7de563451983b6d0c0985eeb418176110f1de1d7cab37f418602e58"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1327,6 +1333,10 @@ the backup job service directly. A failed action records failure when
 possible, then attempts to stop and disable both managed units. If event
 publication or state verification fails, the result is NO-GO and manual review
 is required; an absent terminal success event is never treated as success.
+Audit validation accepts systemd's `activating` state only as a recorded
+observation during this transition. It does not count as a completed action or
+authorize a service start; the hash-bound final success event and current unit
+state checks remain required.
 
 An interrupted attempt can resume only with the same administrator and
 approval reference while it is incomplete. A failed attempt is terminal and
@@ -2007,4 +2017,4 @@ administrative acknowledgment. It does not require a deployment manifest and
 does not modify the database or backup. See `TASK-301-RECOVERY.md` for the
 exact journal identity, command invocation, test evidence, and current GO/NO-GO.
 The corrected deployment preflight source SHA-256 is
-`4b6b664e5c19e3ce1284f722713618ca38de8e24fce431e697a6036492e33ea4`.
+`d908181ce8b40e99207e67cac64a846c51a29b1f7e46590c8d2d95187e53b738`.

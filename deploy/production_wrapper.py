@@ -51,7 +51,7 @@ INSTALLER = BASE / "bin/production_install.py"
 INSTALLER_SHA256 = "0" * 64
 DEPLOYMENT_PIN_SHA256 = "0" * 64
 RECOVERY_AUDIT_SHA256 = (
-    "02465785fa96cf13fce668e8df59d35dfa0bd2d7eb227153ff74f6b7697de5fc"
+    "00a4eacd84f6fdaba660a5bed9c84da5412d85c243f27df3926f32f76a14da09"
 )
 PYTHON = Path("/usr/bin/python3.14")
 GIT = Path("/usr/bin/git")
@@ -896,11 +896,16 @@ def _assert_directory(
 
 def _verify_previous_backup_unit(installed: Path, candidate: Path) -> None:
     info = _assert_managed_file(installed, owner=0, mode=0o644)
+    installed_hash = _sha256(installed)
+    candidate_hash = _sha256(candidate)
     if (
         info.st_gid != 0
         or info.st_nlink != 1
-        or _sha256(installed) != PREVIOUS_BACKUP_UNIT_SHA256
-        or _sha256(candidate) != RELEASE_BACKUP_UNIT_SHA256
+        or installed_hash not in {
+            PREVIOUS_BACKUP_UNIT_SHA256,
+            RELEASE_BACKUP_UNIT_SHA256,
+        }
+        or candidate_hash != RELEASE_BACKUP_UNIT_SHA256
     ):
         raise Refusal("installed backup unit is not the exact approved previous version")
 

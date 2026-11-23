@@ -143,6 +143,21 @@ def as_root_owned_metadata(audit: Path, callback):
 
 
 class HistoricalAuditPermissionTests(unittest.TestCase):
+    def test_observed_unit_states_accept_systemd_activating_transition(self):
+        self.assertTrue(
+            recovery_audit._valid_observed_unit_states(
+                {
+                    "wow-forever-armory-backup.service": ["activating", "static"],
+                    "wow-forever-armory-backup.timer": ["active", "enabled"],
+                }
+            )
+        )
+        self.assertFalse(
+            recovery_audit._valid_observed_unit_states(
+                {"wow-forever-armory-backup.service": ["unknown", "static"]}
+            )
+        )
+
     def test_pinned_preserved_preflight_is_verified_as_read_only_evidence(self) -> None:
         service_uid = 4242
         service_gid = 4343
