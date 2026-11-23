@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "c3d04a7e4ee3a032b149869dc35f98f415fc0a414293b90806773e1c83052e1d"
+ADMIN_SHA256 = "adc1d661cdb2124c4311ddb5fae47af397810fa50799203ec300fb22947fc5bd"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1882,25 +1882,27 @@ TASK 298 candidate hashes:
 | File | SHA-256 |
 | --- | --- |
 | `deploy/recovery_audit.py` | `756155878fb49f902c0ebf15cdb5c18900da6e7715d21188e84c4aa39ace51fb` |
-| `deploy/production_admin.py` | `c3d04a7e4ee3a032b149869dc35f98f415fc0a414293b90806773e1c83052e1d` |
-| `deploy/production_preflight.py` | `f29967ec9570f3686d486484283973c6b3511a3d5112c51eb91602810597381b` |
-| `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
-| `deploy/systemd/armory-db-preflight.py` | `916b5d57f07bde1b4fe6f45d4617a5aec4053d7733c97db31cc0a80529820014` |
+| `deploy/production_admin.py` | `adc1d661cdb2124c4311ddb5fae47af397810fa50799203ec300fb22947fc5bd` |
+| `deploy/production_preflight.py` | `a7f6274f744b72d30cc8a7832e2a17775038ca043cd6010b7f12a8e01c8c3e14` |
+| `deploy/production_wrapper.py` | `4cd83e9d6eeab7fd46c210837bf4f61cb6c676b4ea6bd6d965f7d3751c1342b6` |
+| `deploy/systemd/armory-db-preflight.py` | `48c6b711e2518f1086101728412c126812369234735e4758c33eb3a4f981ea8f` |
 
-## TASK 298 recovery-attestation filename blocker
+## TASK 298 recovery-attestation compatibility duplicate
 
 The observed name `recovery-attestation-f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json`
-contains the SHA-256 of the known TASK 267 incident journal. That suffix
-identifies the journal reference; it does not authenticate the JSON bytes.
-The reviewed runbook pins the journal and recovery ACK, and the TASK 267
-addendum pins a different historical attestation named
-`task262-attestation-<content-sha256>.json`. Neither defines a digest or
-validation rule for this `recovery-attestation-<journal-sha256>.json` object.
+contains the SHA-256 of the known TASK 267 incident journal. Its bytes have
+been compared in PROD with the canonical
+`task262-attestation-dc82c79862053f64f460e41cc18bca6a90308545d4a4ac56781c09628dde09c4.json`;
+both have SHA-256
+`dc82c79862053f64f460e41cc18bca6a90308545d4a4ac56781c09628dde09c4` and the
+byte comparison was true.
 
-The recovery validator therefore continues to reject this name as an
-unexpected audit-root file. A regression test proves the known synthetic
-journal/ACK chain passes without the object and that adding this exact
-otherwise well-formed, mode-`0600` name fails closed. Do not add a filename
-allowlist or treat the object as recovery evidence until an independently
-reviewed protocol supplies an expected content digest or equivalent
-authenticated binding. PROD remains NO-GO for the current preflight blocker.
+The validator accepts only the exact legacy alias
+`recovery-attestation-f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json`.
+When present, it requires the canonical TASK 262 file alongside it, validates
+both as regular root:root mode-`0600` single-link files with the existing
+no-follow, stable-read checks, independently hashes both against the pinned
+TASK 262 content SHA-256, and compares the bytes directly. The alias is only
+compatibility material: it is not parsed, added to recovery records, or
+counted as independent evidence. Other recovery-attestation names, a missing
+canonical file, content/hash mismatch, unsafe metadata or a link fail closed.

@@ -94,6 +94,9 @@ TASK267_REVIEW_PATH = Path(f"/var/lib/armory-deployment-audit/task262-review-{TA
 TASK267_ATTESTATION_FILE = re.compile(r"task262-attestation-[0-9a-f]{64}\.json\Z")
 TASK267_REVIEW_FILE = re.compile(r"task262-review-[0-9a-f]{64}\.json\Z")
 TASK267_REPORT_FILE = re.compile(r"task267-verification-[0-9a-f]{64}\.json\Z")
+RECOVERY_ATTESTATION_DUPLICATE_NAME = (
+    f"recovery-attestation-{TASK267_JOURNAL_SHA256}.json"
+)
 ACK_FIELDS = {
     "schema_version",
     "journal_sha256",
@@ -702,7 +705,15 @@ def _verify_legacy_activation_events(
                 raise AuditError("legacy activation report is invalid")
 
 
-def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
+def _read_audit_bytes(
+    directory_fd: int,
+    name: str,
+    *,
+    owner: int,
+    group: int,
+    maximum: int = 65536,
+) -> bytes:
+    """Read one root-owned audit file safely without parsing its contents."""
     if not hasattr(os, "O_NOATIME"):
         raise AuditError("filesystem cannot guarantee atime-safe audit reads")
     before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -712,7 +723,7 @@ def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
         or before.st_gid != group
         or stat.S_IMODE(before.st_mode) != 0o600
         or before.st_nlink != 1
-        or before.st_size > 65536
+        or before.st_size > maximum
     ):
         raise AuditError("unsafe audit file metadata")
     fd = os.open(
@@ -731,12 +742,12 @@ def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(fd, min(8192, 65537 - total))
+            chunk = os.read(fd, min(8192, maximum + 1 - total))
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > 65536:
+            if total > maximum:
                 raise AuditError("audit file exceeds size limit")
         raw = b"".join(chunks)
         after_fd = os.fstat(fd)
@@ -749,6 +760,11 @@ def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
             raise AuditError("audit file changed while reading")
     finally:
         os.close(fd)
+    return raw
+
+
+def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
+    raw = _read_audit_bytes(directory_fd, name, owner=owner, group=group)
 
     def unique(pairs):
         result = {}
@@ -765,6 +781,34 @@ def _read_json(directory_fd: int, name: str, *, owner: int, group: int):
     if not isinstance(value, dict):
         raise AuditError("audit JSON is not an object")
     return raw, value
+
+
+def _verify_recovery_attestation_duplicate(
+    directory_fd: int,
+    names: set[str],
+    *,
+    owner: int,
+    group: int,
+) -> None:
+    """Verify the exact legacy alias against TASK 262, without trusting it."""
+    duplicate_name = RECOVERY_ATTESTATION_DUPLICATE_NAME
+    canonical_name = TASK267_ATTESTATION_PATH.name
+    if duplicate_name not in names:
+        return
+    if owner != TASK267_ADMIN_UID or group != TASK267_ADMIN_GID:
+        raise AuditError("recovery attestation duplicate requires root ownership")
+    if canonical_name not in names:
+        raise AuditError("recovery attestation duplicate lacks its canonical TASK 262 file")
+    duplicate_raw = _read_audit_bytes(directory_fd, duplicate_name, owner=owner, group=group)
+    canonical_raw = _read_audit_bytes(directory_fd, canonical_name, owner=owner, group=group)
+    duplicate_sha = hashlib.sha256(duplicate_raw).hexdigest()
+    canonical_sha = hashlib.sha256(canonical_raw).hexdigest()
+    if (
+        duplicate_sha != TASK267_ATTESTATION_SHA256
+        or canonical_sha != TASK267_ATTESTATION_SHA256
+        or duplicate_raw != canonical_raw
+    ):
+        raise AuditError("recovery attestation duplicate does not match TASK 262 content")
 
 
 def _audit_snapshot(
@@ -1044,6 +1088,7 @@ def verify_audit_directory(
                 raise AuditError("audit directory is being modified") from exc
         before_snapshot = _audit_snapshot(fd)
         names = set(before_snapshot[0])
+        _verify_recovery_attestation_duplicate(fd, names, owner=owner, group=group)
         historical_snapshot = tuple(
             item
             for name in sorted(preserved_historical_directories)
@@ -1077,7 +1122,7 @@ def verify_audit_directory(
                 and name != TASK267_REPORT_PATH.name
             ):
                 raise AuditError("unexpected historical recovery evidence filename")
-            allowed_name = any(
+            allowed_name = name == RECOVERY_ATTESTATION_DUPLICATE_NAME or any(
                 pattern.fullmatch(name)
                 for pattern in (
                     ARCHIVE,

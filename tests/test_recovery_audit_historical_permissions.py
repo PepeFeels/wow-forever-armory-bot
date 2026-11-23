@@ -142,36 +142,89 @@ def as_root_owned_metadata(audit: Path, callback):
 
 
 class HistoricalAuditPermissionTests(unittest.TestCase):
-    def test_recovery_attestation_name_without_content_pin_stays_fail_closed(self):
+    def _write_attestation_pair(self, audit: Path, canonical: bytes, duplicate: bytes) -> tuple[Path, Path]:
+        canonical_path = audit / recovery_audit.TASK267_ATTESTATION_PATH.name
+        duplicate_path = audit / recovery_audit.RECOVERY_ATTESTATION_DUPLICATE_NAME
+        canonical_path.write_bytes(canonical)
+        duplicate_path.write_bytes(duplicate)
+        canonical_path.chmod(0o600)
+        duplicate_path.chmod(0o600)
+        return canonical_path, duplicate_path
+
+    def test_exact_recovery_attestation_duplicate_is_accepted_only_as_same_pinned_bytes(self):
+        self.assertEqual(
+            recovery_audit.TASK267_ATTESTATION_SHA256,
+            "dc82c79862053f64f460e41cc18bca6a90308545d4a4ac56781c09628dde09c4",
+        )
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit"
             make_active_chain(audit)
-            self.assertEqual(
-                recovery_audit.verify_audit_directory(
-                    audit, owner=os.getuid(), group=os.getgid()
-                ),
-                1,
-            )
-
-            # The filename binds to the known journal identity, but the
-            # protocol has no expected digest for this file's own bytes.
-            attestation = audit / (
-                "recovery-attestation-"
-                "f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json"
-            )
-            attestation.write_text(
-                '{"journal_sha256":"f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb",'
-                '"decision":"manual_recovery_verified"}\n',
-                encoding="ascii",
-            )
-            attestation.chmod(0o600)
-            with self.assertRaisesRegex(
-                recovery_audit.AuditError,
-                "audit directory contains an unexpected file",
-            ):
-                recovery_audit.verify_audit_directory(
-                    audit, owner=os.getuid(), group=os.getgid()
+            content = b'{"synthetic":"TASK 262 attestation fixture"}\n'
+            content_sha = hashlib.sha256(content).hexdigest()
+            canonical, duplicate = self._write_attestation_pair(audit, content, content)
+            before = snapshot(audit)
+            with patch.object(recovery_audit, "TASK267_ATTESTATION_SHA256", content_sha):
+                count = as_root_owned_metadata(
+                    audit,
+                    lambda: recovery_audit.verify_audit_directory(
+                        audit, owner=0, group=0
+                    ),
                 )
+            self.assertEqual(count, 1)
+            self.assertEqual(canonical.read_bytes(), duplicate.read_bytes())
+            self.assertEqual(snapshot(audit), before)
+
+    def test_recovery_attestation_duplicate_rejects_content_metadata_and_missing_pair(self):
+        cases = ("different-bytes", "no-canonical", "wrong-mode", "hardlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                audit = Path(temporary) / "audit"
+                make_active_chain(audit)
+                content = b'{"synthetic":"TASK 262 attestation fixture"}\n'
+                content_sha = hashlib.sha256(content).hexdigest()
+                if case == "no-canonical":
+                    duplicate = audit / recovery_audit.RECOVERY_ATTESTATION_DUPLICATE_NAME
+                    duplicate.write_bytes(content)
+                    duplicate.chmod(0o600)
+                else:
+                    canonical, duplicate = self._write_attestation_pair(audit, content, content)
+                    if case == "different-bytes":
+                        duplicate.write_bytes(content + b" ")
+                        duplicate.chmod(0o600)
+                    elif case == "wrong-mode":
+                        duplicate.chmod(0o640)
+                    elif case == "hardlink":
+                        os.link(duplicate, duplicate.with_name("second-link"))
+                with patch.object(recovery_audit, "TASK267_ATTESTATION_SHA256", content_sha):
+                    with self.assertRaises(recovery_audit.AuditError):
+                        as_root_owned_metadata(
+                            audit,
+                            lambda: recovery_audit.verify_audit_directory(
+                                audit, owner=0, group=0
+                            ),
+                        )
+
+    def test_other_recovery_attestation_names_remain_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            make_active_chain(audit)
+            content = b'{"synthetic":"TASK 262 attestation fixture"}\n'
+            content_sha = hashlib.sha256(content).hexdigest()
+            self._write_attestation_pair(audit, content, content)
+            other = audit / f"recovery-attestation-{'0' * 64}.json"
+            other.write_bytes(content)
+            other.chmod(0o600)
+            with patch.object(recovery_audit, "TASK267_ATTESTATION_SHA256", content_sha):
+                with self.assertRaisesRegex(
+                    recovery_audit.AuditError,
+                    "audit directory contains an unexpected file",
+                ):
+                    as_root_owned_metadata(
+                        audit,
+                        lambda: recovery_audit.verify_audit_directory(
+                            audit, owner=0, group=0
+                        ),
+                    )
 
     def observed_executable(self, audit: Path, *, payload: bytes = b"x" * 43_813) -> Path:
         target = audit / "archive" / "pre-wrapper-fix-20261114T184045Z" / "armory-deploy-a1a6a2a"
