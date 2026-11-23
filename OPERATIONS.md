@@ -1889,9 +1889,9 @@ TASK 298 candidate hashes:
 
 DEV permission-compatibility correction (not yet a release pin):
 `deploy/production_preflight.py` SHA-256 is
-`51480be1ffa3af663b7a5bf7e0f5e09f45b4e958ba473e07e017ef489a2cf4e7` and
+`7bf3ef0f9fe2bab32968c6bc06b2df282565c5255770e400b910ad16fab34038` and
 `deploy/production_wrapper.py` SHA-256 is
-`d62b5eb92d21442f17875b6e211369509a4305af2f9af3a8713f58f80e874b9e`.
+`503c5b1d6a556d7b53eedd62f8aae1c640588f28420975120f0a3b597745dc64`.
 These working-tree hashes are review evidence, not release pins; no existing
 release artifact or deployment pin is updated by this DEV change.
 
@@ -1907,6 +1907,43 @@ Git with system/global config disabled, replacement objects disabled, and
 fsmonitor, hooks, credentials, symlink handling, and bare-repository behavior
 overridden to safe values. The release branch, HEAD, clean worktree, and
 required ancestry checks remain mandatory.
+
+TASK 299Q4 adds an explicit Git metadata boundary before any branch, HEAD,
+status, release identity, or ancestry query. The `.git` entry must be a real
+directory inside the canonical checkout; its device and inode are recorded and
+rechecked after validation. Git's exact child environment is fixed, so
+`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`, alternate
+index paths, and other inherited Git variables cannot redirect a query. Local
+Git config remains allowlisted, with worktree config extensions excluded.
+Reject repositories containing `objects/info/alternates`,
+`objects/info/http-alternates`, `info/grafts`, `shallow`, any `refs/replace`
+directory, or any `refs/replace/*` record in `packed-refs`. Symlinks, hard
+links, special files, and files or directories on a different filesystem
+inside the checkout are rejected. `GIT_NO_REPLACE_OBJECTS=1` remains set for
+every Git subprocess.
+
+For local review, run the complete test suite and verify Git object integrity
+from the candidate checkout. Then inspect the Git metadata directly; all
+redirector paths must be absent, and packed refs must contain no replace-ref
+names:
+
+```bash
+python3 -m pytest -p no:cacheprovider -q
+git fsck --full --no-reflogs
+test ! -e .git/objects/info/alternates
+test ! -e .git/objects/info/http-alternates
+test ! -e .git/info/grafts
+test ! -e .git/shallow
+test ! -e .git/refs/replace
+! /usr/bin/grep -E '(^| )refs/replace/' .git/packed-refs
+git status --short --branch
+git rev-parse HEAD
+git rev-parse HEAD^{tree}
+sha256sum deploy/production_wrapper.py deploy/production_preflight.py
+```
+
+These checks and the generated pin/artifacts are local review evidence. They do
+not provision a production pin, authorize publication, or authorize deployment.
 
 For a corrected candidate, the root-owned wrapper at
 `/usr/local/sbin/armory-deploy-v2` must be replaced with the reviewed wrapper

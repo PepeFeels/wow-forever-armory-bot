@@ -237,6 +237,7 @@ class Preflight:
             marker_info = marker.lstat()
             if not stat.S_ISDIR(marker_info.st_mode):
                 return False
+            root_device = path.lstat().st_dev
             for directory, names, files in os.walk(
                 path, followlinks=False, onerror=Preflight._walk_error
             ):
@@ -261,6 +262,7 @@ class Preflight:
                     if (
                         stat.S_ISLNK(info.st_mode)
                         or info.st_uid != owner_uid
+                        or info.st_dev != root_device
                         or unsafe_write_bits
                         or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
                         or not (is_directory or stat.S_ISREG(info.st_mode))
@@ -295,6 +297,46 @@ class Preflight:
             if key not in allowed_keys:
                 return False
         return True
+
+    @staticmethod
+    def _validate_git_metadata(path: Path, *, owner_uid: int = 0) -> bool:
+        """Reject Git metadata that can redirect object or history validation."""
+        git_dir = path / ".git"
+        try:
+            before = git_dir.lstat()
+            if not stat.S_ISDIR(before.st_mode) or before.st_uid != owner_uid:
+                return False
+            if any(
+                item.exists() or item.is_symlink()
+                for item in (
+                    git_dir / "objects/info/alternates",
+                    git_dir / "objects/info/http-alternates",
+                    git_dir / "info/grafts",
+                    git_dir / "shallow",
+                )
+            ):
+                return False
+            replace_refs = git_dir / "refs/replace"
+            if replace_refs.exists() or replace_refs.is_symlink():
+                return False
+            packed_refs = git_dir / "packed-refs"
+            if packed_refs.exists():
+                info = packed_refs.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != owner_uid
+                    or info.st_nlink != 1
+                ):
+                    return False
+                if any(
+                    line.split(" ", 1)[-1].startswith("refs/replace/")
+                    for line in packed_refs.read_text(encoding="ascii").splitlines()
+                ):
+                    return False
+            after = git_dir.lstat()
+            return (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        except (OSError, UnicodeError):
+            return False
 
     @staticmethod
     def _secure_json_with_hash(
@@ -440,6 +482,9 @@ class Preflight:
                     "candidate checkout is not root-owned and write-protected",
                 )
                 return
+            if not self._validate_git_metadata(self.candidate):
+                self.add("candidate_git", "FAIL", "candidate Git metadata is unsafe")
+                return
             branch = self._git(self.candidate, "branch", "--show-current")
             head = self._git(self.candidate, "rev-parse", "HEAD")
             ref = self._git(self.candidate, "rev-parse", f"refs/heads/{BRANCH}")
@@ -565,6 +610,9 @@ class Preflight:
                     "FAIL",
                     "checkout is not a root-owned, write-protected full Git clone",
                 )
+                return None, False
+            if not self._validate_git_metadata(path):
+                self.add(label, "FAIL", "checkout Git metadata is unsafe")
                 return None, False
             root = self._git(path, "rev-parse", "--show-toplevel")
             branch = self._git(path, "branch", "--show-current")

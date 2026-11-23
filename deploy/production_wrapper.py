@@ -493,6 +493,42 @@ def _check_git_config() -> None:
         raise Refusal("the protected checkout has unapproved local Git settings")
 
 
+def _validate_git_metadata(path: Path, *, owner_uid: int = 0) -> os.stat_result:
+    """Reject Git metadata that can redirect object or history validation."""
+    git_dir = path / ".git"
+    try:
+        before = git_dir.lstat()
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != owner_uid:
+            raise Refusal("the protected checkout Git directory is unsafe")
+        forbidden = (
+            git_dir / "objects/info/alternates",
+            git_dir / "objects/info/http-alternates",
+            git_dir / "info/grafts",
+            git_dir / "shallow",
+        )
+        if any(item.exists() or item.is_symlink() for item in forbidden):
+            raise Refusal("the protected checkout has redirected Git history or objects")
+        loose_replace = git_dir / "refs/replace"
+        if loose_replace.exists() or loose_replace.is_symlink():
+            raise Refusal("the protected checkout contains replace refs")
+        packed_refs = git_dir / "packed-refs"
+        if packed_refs.exists():
+            packed_info = packed_refs.lstat()
+            if not stat.S_ISREG(packed_info.st_mode) or packed_info.st_nlink != 1:
+                raise Refusal("the protected checkout packed refs file is unsafe")
+            for line in packed_refs.read_text(encoding="ascii").splitlines():
+                if line.split(" ", 1)[-1].startswith("refs/replace/"):
+                    raise Refusal("the protected checkout contains packed replace refs")
+        after = git_dir.lstat()
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise Refusal("the protected checkout Git directory changed during inspection")
+        return after
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(
+            "the protected checkout Git metadata could not be validated"
+        ) from exc
+
+
 def _systemctl_state(action: str, unit: str) -> str:
     if unit not in UNITS or action not in {"is-active", "is-enabled"}:
         raise Refusal("an unapproved systemd unit or query was requested")
@@ -739,6 +775,7 @@ def _assert_root_owned_tree(
         raise error
 
     try:
+        root_device = path.lstat().st_dev
         for current, directories, files in os.walk(
             path, followlinks=False, onerror=onerror
         ):
@@ -772,6 +809,7 @@ def _assert_root_owned_tree(
                 if (
                     stat.S_ISLNK(info.st_mode)
                     or info.st_uid != owner_uid
+                    or info.st_dev != root_device
                     or unsafe_write_bits
                     or (
                         stat.S_ISREG(info.st_mode)
@@ -791,6 +829,7 @@ def _assert_root_owned_tree(
 
 def _check_checkout() -> None:
     _assert_root_owned_tree(REPO)
+    git_identity = _validate_git_metadata(REPO)
     _check_git_config()
     top = Path(
         _git("rev-parse", "--show-toplevel", capture=True)
@@ -804,6 +843,12 @@ def _check_checkout() -> None:
     validate_source_identity(branch, head, status)
     _git("merge-base", "--is-ancestor", PREVIOUS_SHA, RELEASE_SHA)
     _git("merge-base", "--is-ancestor", BASE_CHECKPOINT_SHA, RELEASE_SHA)
+    final_identity = (REPO / ".git").lstat()
+    if (git_identity.st_dev, git_identity.st_ino) != (
+        final_identity.st_dev,
+        final_identity.st_ino,
+    ):
+        raise Refusal("the protected checkout Git directory changed during validation")
 
 
 def _assert_managed_file(

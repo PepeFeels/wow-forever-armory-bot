@@ -537,6 +537,76 @@ class InstallerDiagnosticTests(unittest.TestCase):
         self.assertIn("core.symlinks=false", command)
         self.assertIn("core.bare=false", command)
 
+    def test_git_metadata_accepts_clean_repository_and_rejects_redirectors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            (git_dir / "packed-refs").write_text("# pack-refs with: peeled\n")
+            self.assertTrue(wrapper._validate_git_metadata(checkout, owner_uid=os.getuid()))
+            for relative in (
+                "objects/info/alternates",
+                "info/grafts",
+                "shallow",
+            ):
+                target = git_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("redirect\n")
+                self.assertRaises(wrapper.Refusal, wrapper._validate_git_metadata, checkout)
+                target.unlink()
+            (git_dir / "refs/replace").mkdir()
+            self.assertRaises(wrapper.Refusal, wrapper._validate_git_metadata, checkout)
+            (git_dir / "refs/replace").rmdir()
+            (git_dir / "packed-refs").write_text("a" * 40 + " refs/replace/" + "b" * 40 + "\n")
+            self.assertRaises(wrapper.Refusal, wrapper._validate_git_metadata, checkout)
+
+    def test_git_metadata_rejects_symlinked_metadata_and_git_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (git_dir / "objects/info/alternates").symlink_to(outside)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._validate_git_metadata(checkout, owner_uid=os.getuid())
+        for relative in (
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+            "shallow",
+            "refs/replace",
+            "packed-refs",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout = root / "checkout"
+                git_dir = checkout / ".git"
+                (git_dir / "objects/info").mkdir(parents=True)
+                (git_dir / "info").mkdir()
+                (git_dir / "refs").mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                target = git_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside, target_is_directory=True)
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._validate_git_metadata(checkout, owner_uid=os.getuid())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "real"
+            real.mkdir()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            (checkout / ".git").symlink_to(real, target_is_directory=True)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._validate_git_metadata(checkout, owner_uid=os.getuid())
+
     def test_protected_checkout_git_identity_and_ancestry_remain_pinned(self):
         calls = []
         outputs = iter(
@@ -557,10 +627,12 @@ class InstallerDiagnosticTests(unittest.TestCase):
 
         with (
             patch.object(wrapper, "_assert_root_owned_tree"),
+            patch.object(wrapper, "_validate_git_metadata", return_value=(Path(wrapper.REPO / ".git").lstat())),
             patch.object(wrapper, "_check_git_config"),
             patch.object(wrapper, "_run", side_effect=fake_run),
         ):
             wrapper._check_checkout()
+
         self.assertEqual(
             [call[-3:] for call in calls[-2:]],
             [
@@ -574,11 +646,26 @@ class InstallerDiagnosticTests(unittest.TestCase):
         )
         with (
             patch.object(wrapper, "_assert_root_owned_tree"),
+            patch.object(wrapper, "_validate_git_metadata", return_value=(Path(wrapper.REPO / ".git").lstat())),
             patch.object(wrapper, "_check_git_config"),
             patch.object(wrapper, "_run", side_effect=lambda *_a, **_k: next(bad_ref)),
             self.assertRaises(wrapper.Refusal),
         ):
             wrapper._check_checkout()
+
+    def test_invalid_git_metadata_is_rejected_before_any_git_query(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git/info").mkdir(parents=True)
+            (checkout / ".git/shallow").write_text("shallow commit\n")
+            with (
+                patch.object(wrapper, "REPO", checkout),
+                patch.object(wrapper, "_assert_root_owned_tree"),
+                patch.object(wrapper, "_run") as run,
+                self.assertRaises(wrapper.Refusal),
+            ):
+                wrapper._check_checkout()
+            run.assert_not_called()
 
     def test_recovery_validator_accepts_read_only_modes_and_checks_hash_before_exec(self):
         with tempfile.TemporaryDirectory() as temporary:

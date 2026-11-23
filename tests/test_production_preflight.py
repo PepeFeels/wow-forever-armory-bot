@@ -614,6 +614,7 @@ class ProductionPreflightTests(unittest.TestCase):
 
             with (
                 patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_validate_git_metadata", return_value=True),
                 patch.object(checker, "_git", side_effect=fake_git),
             ):
                 checker.checkout(path)
@@ -639,6 +640,7 @@ class ProductionPreflightTests(unittest.TestCase):
 
         with (
             patch.object(checker, "_trusted_checkout_tree", return_value=True),
+            patch.object(checker, "_validate_git_metadata", return_value=True),
             patch.object(checker, "_git", side_effect=fake_git),
         ):
             checker.candidate_git()
@@ -790,6 +792,98 @@ class ProductionPreflightTests(unittest.TestCase):
                 ):
                     self.assertFalse(checker._git_config_is_safe(Path("/unused")))
 
+    def test_git_metadata_accepts_clean_repository_and_rejects_redirectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            (git_dir / "packed-refs").write_text("# pack-refs with: peeled\n")
+            check = production_preflight.Preflight._validate_git_metadata
+            self.assertTrue(check(checkout, owner_uid=os.getuid()))
+            for relative in ("objects/info/alternates", "info/grafts", "shallow"):
+                item = git_dir / relative
+                item.parent.mkdir(parents=True, exist_ok=True)
+                item.write_text("redirect\n")
+                self.assertFalse(check(checkout, owner_uid=os.getuid()))
+                item.unlink()
+            (git_dir / "refs/replace").mkdir()
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+            (git_dir / "refs/replace").rmdir()
+            (git_dir / "packed-refs").write_text("a" * 40 + " refs/replace/" + "b" * 40 + "\n")
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+
+    def test_git_metadata_rejects_symlinked_metadata_and_git_directory(self) -> None:
+        check = production_preflight.Preflight._validate_git_metadata
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (git_dir / "objects/info/alternates").symlink_to(outside)
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "real").mkdir()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            (checkout / ".git").symlink_to(root / "real", target_is_directory=True)
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+        for relative in (
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+            "shallow",
+            "refs/replace",
+            "packed-refs",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout = root / "checkout"
+                git_dir = checkout / ".git"
+                (git_dir / "objects/info").mkdir(parents=True)
+                (git_dir / "info").mkdir()
+                (git_dir / "refs").mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                target = git_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside, target_is_directory=True)
+                self.assertFalse(check(checkout, owner_uid=os.getuid()))
+
+    def test_candidate_git_metadata_is_rejected_before_git_identity_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git/info").mkdir(parents=True)
+            (checkout / ".git/info/grafts").write_text("graft\n")
+            checker = production_preflight.Preflight(checkout, EXPECTED_SHA)
+            with (
+                patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_git") as git,
+            ):
+                checker.candidate_git()
+            self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+            git.assert_not_called()
+
+    def test_candidate_git_metadata_is_rejected_before_git_identity_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git/info").mkdir(parents=True)
+            (checkout / ".git/info/grafts").write_text("graft\n")
+            checker = production_preflight.Preflight(checkout, EXPECTED_SHA)
+            with (
+                patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_git") as git,
+            ):
+                checker.candidate_git()
+            self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+            git.assert_not_called()
+
     def test_candidate_git_filter_configuration_is_rejected(self) -> None:
         checker = production_preflight.Preflight(
             Path("/trusted/candidate"), EXPECTED_SHA
@@ -810,6 +904,7 @@ class ProductionPreflightTests(unittest.TestCase):
 
         with (
             patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_validate_git_metadata", return_value=True),
             patch.object(checker, "_git", side_effect=fake_git),
         ):
             checker.candidate_git()
