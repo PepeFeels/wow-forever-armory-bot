@@ -71,6 +71,7 @@ CHILD_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_TERMINAL_PROMPT": "0",
     # The installer creates a venv as root. Keep pip's cache/config out of
     # root's home and prevent user/system pip config from changing behavior.
@@ -79,6 +80,22 @@ CHILD_ENV = {
     "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     "TMPDIR": "/tmp",
 }
+ALLOWED_LOCAL_GIT_CONFIG_KEYS = frozenset(
+    {
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.symlinks",
+        "credential.helper",
+        "remote.origin.url",
+        "remote.origin.fetch",
+        f"branch.{BRANCH}.remote",
+        f"branch.{BRANCH}.merge",
+    }
+)
 DANGEROUS_ENV_PREFIXES = ("PYTHON", "LD_", "DYLD_")
 DANGEROUS_ENV_NAMES = {"BASH_ENV", "ENV", "PERL5OPT", "RUBYOPT", "NODE_OPTIONS"}
 # Review inventory of fixed application paths the approved installer/wrapper
@@ -436,6 +453,46 @@ def _run(
     return result.stdout.decode("utf-8", errors="strict").strip() if capture else ""
 
 
+def _git(*args: str, capture: bool = False) -> str:
+    """Run only fixed Git queries with external helpers and replacements disabled."""
+    return _run(
+        (
+            str(GIT),
+            "-c",
+            f"safe.directory={REPO}",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.symlinks=false",
+            "-c",
+            "core.bare=false",
+            "-C",
+            str(REPO),
+            *args,
+        ),
+        capture=capture,
+    )
+
+
+def _check_git_config() -> None:
+    """Reject unreviewed local Git settings before worktree queries run."""
+    raw_keys = _git(
+        "config",
+        "--local",
+        "--no-includes",
+        "--name-only",
+        "--list",
+        capture=True,
+    )
+    keys = {line.strip().lower() for line in raw_keys.splitlines() if line.strip()}
+    if not keys.issubset(ALLOWED_LOCAL_GIT_CONFIG_KEYS):
+        raise Refusal("the protected checkout has unapproved local Git settings")
+
+
 def _systemctl_state(action: str, unit: str) -> str:
     if unit not in UNITS or action not in {"is-active", "is-enabled"}:
         raise Refusal("an unapproved systemd unit or query was requested")
@@ -613,7 +670,10 @@ def _verify_archived_deployments(
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != owner_uid
-            or stat.S_IMODE(info.st_mode) != 0o644
+            # Staging strips write bits, while a checkout copied without that
+            # step preserves Git's 0644 mode. Both are safe here: root owns the
+            # single-link file and its bytes are pinned before compilation.
+            or stat.S_IMODE(info.st_mode) not in {0o444, 0o644}
             or info.st_nlink != 1
         ):
             raise Refusal("shared recovery validator metadata is unsafe")
@@ -691,13 +751,35 @@ def _assert_root_owned_tree(
                 info = item.lstat()
                 if item.is_symlink():
                     raise Refusal("the trusted checkout contains a symbolic link")
+                relative_path = item.relative_to(path)
+                is_directory = stat.S_ISDIR(info.st_mode)
+                is_recovery_validator = (
+                    relative_path == Path("deploy/recovery_audit.py")
+                )
+                # Root is the trusted administrator. Root-only directory write
+                # permission (for example 0700) is acceptable, but group/other
+                # writes are not. Regular files stay immutable except for the
+                # exact hash-pinned recovery validator checked before use.
+                unsafe_write_bits = (
+                    bool(info.st_mode & 0o022)
+                    if is_directory
+                    else (
+                        stat.S_IMODE(info.st_mode) not in {0o444, 0o644}
+                        if is_recovery_validator
+                        else bool(info.st_mode & 0o222)
+                    )
+                )
                 if (
                     stat.S_ISLNK(info.st_mode)
                     or info.st_uid != owner_uid
-                    or info.st_mode & 0o222
+                    or unsafe_write_bits
+                    or (
+                        stat.S_ISREG(info.st_mode)
+                        and info.st_nlink != 1
+                    )
                 ):
                     raise Refusal(
-                        "the trusted checkout is not root-owned and write-protected"
+                        "the trusted checkout has unsafe ownership or untrusted write permissions"
                     )
                 if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
                     raise Refusal("the trusted checkout contains a special file")
@@ -709,44 +791,19 @@ def _assert_root_owned_tree(
 
 def _check_checkout() -> None:
     _assert_root_owned_tree(REPO)
+    _check_git_config()
     top = Path(
-        _run((str(GIT), "-C", str(REPO), "rev-parse", "--show-toplevel"), capture=True)
+        _git("rev-parse", "--show-toplevel", capture=True)
     )
-    branch = _run((str(GIT), "-C", str(REPO), "branch", "--show-current"), capture=True)
-    head = _run((str(GIT), "-C", str(REPO), "rev-parse", "HEAD"), capture=True)
-    ref = _run(
-        (str(GIT), "-C", str(REPO), "rev-parse", f"refs/heads/{BRANCH}"),
-        capture=True,
-    )
-    status = _run(
-        (str(GIT), "-C", str(REPO), "status", "--porcelain", "--untracked-files=all"),
-        capture=True,
-    )
+    branch = _git("branch", "--show-current", capture=True)
+    head = _git("rev-parse", "HEAD", capture=True)
+    ref = _git("rev-parse", f"refs/heads/{BRANCH}", capture=True)
+    status = _git("status", "--porcelain", "--untracked-files=all", capture=True)
     if top != REPO or ref != RELEASE_SHA:
         raise Refusal("the protected checkout path or release branch ref is unexpected")
     validate_source_identity(branch, head, status)
-    _run(
-        (
-            str(GIT),
-            "-C",
-            str(REPO),
-            "merge-base",
-            "--is-ancestor",
-            PREVIOUS_SHA,
-            RELEASE_SHA,
-        )
-    )
-    _run(
-        (
-            str(GIT),
-            "-C",
-            str(REPO),
-            "merge-base",
-            "--is-ancestor",
-            BASE_CHECKPOINT_SHA,
-            RELEASE_SHA,
-        )
-    )
+    _git("merge-base", "--is-ancestor", PREVIOUS_SHA, RELEASE_SHA)
+    _git("merge-base", "--is-ancestor", BASE_CHECKPOINT_SHA, RELEASE_SHA)
 
 
 def _assert_managed_file(

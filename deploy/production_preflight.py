@@ -88,6 +88,7 @@ CHILD_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_TERMINAL_PROMPT": "0",
     "PYTHONDONTWRITEBYTECODE": "1",
 }
@@ -184,6 +185,12 @@ class Preflight:
                 "core.fsmonitor=false",
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.symlinks=false",
+                "-c",
+                "core.bare=false",
                 "-C",
                 str(path),
                 *args,
@@ -208,21 +215,24 @@ class Preflight:
         return False
 
     @staticmethod
-    def _trusted_checkout_tree(path: Path) -> bool:
+    def _trusted_checkout_tree(
+        path: Path, *, owner_uid: int = 0, check_parents: bool = True
+    ) -> bool:
         try:
             if not path.is_absolute() or path.resolve(strict=True) != path:
                 return False
             if Preflight._has_python_bytecode_cache(path):
                 return False
-            for parent in path.parents:
-                parent_info = parent.lstat()
-                if (
-                    stat.S_ISLNK(parent_info.st_mode)
-                    or not stat.S_ISDIR(parent_info.st_mode)
-                    or parent_info.st_uid != 0
-                    or parent_info.st_mode & 0o022
-                ):
-                    return False
+            if check_parents:
+                for parent in path.parents:
+                    parent_info = parent.lstat()
+                    if (
+                        stat.S_ISLNK(parent_info.st_mode)
+                        or not stat.S_ISDIR(parent_info.st_mode)
+                        or parent_info.st_uid != owner_uid
+                        or parent_info.st_mode & 0o022
+                    ):
+                        return False
             marker = path / ".git"
             marker_info = marker.lstat()
             if not stat.S_ISDIR(marker_info.st_mode):
@@ -235,13 +245,25 @@ class Preflight:
                     *(Path(directory) / name for name in names + files),
                 ]:
                     info = item.lstat()
+                    is_directory = stat.S_ISDIR(info.st_mode)
+                    is_recovery_validator = (
+                        item.relative_to(path) == Path("deploy/recovery_audit.py")
+                    )
+                    unsafe_write_bits = (
+                        bool(info.st_mode & 0o022)
+                        if is_directory
+                        else (
+                            stat.S_IMODE(info.st_mode) not in {0o444, 0o644}
+                            if is_recovery_validator
+                            else bool(info.st_mode & 0o222)
+                        )
+                    )
                     if (
                         stat.S_ISLNK(info.st_mode)
-                        or info.st_uid != 0
-                        or info.st_mode & 0o222
-                        or not (
-                            stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
-                        )
+                        or info.st_uid != owner_uid
+                        or unsafe_write_bits
+                        or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+                        or not (is_directory or stat.S_ISREG(info.st_mode))
                     ):
                         return False
             return True
@@ -254,20 +276,23 @@ class Preflight:
         )
         if result.returncode != 0:
             return False
-        unsafe_prefixes = ("filter.", "include.", "includeif.")
+        allowed_keys = {
+            "core.repositoryformatversion",
+            "core.filemode",
+            "core.bare",
+            "core.logallrefupdates",
+            "core.hookspath",
+            "core.fsmonitor",
+            "core.symlinks",
+            "credential.helper",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            f"branch.{BRANCH}.remote",
+            f"branch.{BRANCH}.merge",
+        }
         for raw_key in result.stdout.splitlines():
             key = raw_key.strip().lower()
-            if (
-                key.startswith(unsafe_prefixes)
-                or key
-                in {
-                    "core.attributesfile",
-                    "core.excludesfile",
-                    "extensions.worktreeconfig",
-                }
-                or key == "diff.external"
-                or (key.startswith("diff.") and key.endswith(".textconv"))
-            ):
+            if key not in allowed_keys:
                 return False
         return True
 

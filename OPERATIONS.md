@@ -1887,6 +1887,44 @@ TASK 298 candidate hashes:
 | `deploy/production_wrapper.py` | `4cd83e9d6eeab7fd46c210837bf4f61cb6c676b4ea6bd6d965f7d3751c1342b6` |
 | `deploy/systemd/armory-db-preflight.py` | `48c6b711e2518f1086101728412c126812369234735e4758c33eb3a4f981ea8f` |
 
+DEV permission-compatibility correction (not yet a release pin):
+`deploy/production_preflight.py` SHA-256 is
+`51480be1ffa3af663b7a5bf7e0f5e09f45b4e958ba473e07e017ef489a2cf4e7` and
+`deploy/production_wrapper.py` SHA-256 is
+`d62b5eb92d21442f17875b6e211369509a4305af2f9af3a8713f58f80e874b9e`.
+These working-tree hashes are review evidence, not release pins; no existing
+release artifact or deployment pin is updated by this DEV change.
+
+The corrected wrapper and read-only preflight enforce the same checkout trust
+boundary: every parent is root-owned and not group/world-writable; root-owned
+checkout directories may be owner-writable; ordinary files must be non-writable
+and single-link; only `deploy/recovery_audit.py` may be `0444` or `0644`, and it
+must be single-link and pass the pinned SHA-256 check before compilation. All
+other hard-linked files, symlinks, special files, bytecode caches, and
+group/world-writable entries fail closed. Before any Git worktree query, the
+wrapper checks local Git setting names against the staging allowlist and runs
+Git with system/global config disabled, replacement objects disabled, and
+fsmonitor, hooks, credentials, symlink handling, and bare-repository behavior
+overridden to safe values. The release branch, HEAD, clean worktree, and
+required ancestry checks remain mandatory.
+
+For a corrected candidate, the root-owned wrapper at
+`/usr/local/sbin/armory-deploy-v2` must be replaced with the reviewed wrapper
+from that candidate, installed as `root:root` mode `0755`, and checked against
+its recorded SHA-256 before it is invoked. Preserve and record the prior
+wrapper bytes and hash for rollback.
+The deployment checkout at
+`/opt/wow-forever-armory-bot/deployment-checkout` must be replaced by the full,
+clean checkout at the corrected candidate commit using the no-overwrite archive
+procedure above; do not update it in place or run the wrapper during the
+two-rename interval. Recompute the root-owned `0600` deployment pin with the
+corrected release commit, the verified previous PROD release, and the unchanged
+installer hash. The existing installer (`production_install.py`) and installed
+recovery validator do not change for this correction; keep their pinned hashes
+and metadata checks. Rebuild the release bundle, source distribution, wheel,
+standalone preflight and manifests from the corrective commit. No old pin or
+artifact hash authorizes these new bytes.
+
 ## TASK 298 recovery-attestation compatibility duplicate
 
 The observed name `recovery-attestation-f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb.json`

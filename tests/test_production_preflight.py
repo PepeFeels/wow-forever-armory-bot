@@ -675,6 +675,121 @@ class ProductionPreflightTests(unittest.TestCase):
                 production_preflight.Preflight._trusted_checkout_tree(alias)
             )
 
+    def test_checkout_tree_accepts_root_only_directories_and_validator_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            deploy = checkout / "deploy"
+            git_dir.mkdir(parents=True)
+            deploy.mkdir()
+            validator = deploy / "recovery_audit.py"
+            validator.write_text("pinned source\n", encoding="ascii")
+            validator.chmod(0o644)
+            ordinary = checkout / "README.md"
+            ordinary.write_text("release file\n", encoding="ascii")
+            ordinary.chmod(0o444)
+            for directory in (checkout, git_dir, deploy):
+                directory.chmod(0o700)
+
+            check = production_preflight.Preflight._trusted_checkout_tree
+            self.assertTrue(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            validator.chmod(0o444)
+            self.assertTrue(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+
+            validator.chmod(0o664)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            validator.chmod(0o444)
+            ordinary.chmod(0o644)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            ordinary.chmod(0o444)
+            deploy.chmod(0o770)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+
+    def test_checkout_tree_still_rejects_wrong_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            self.assertFalse(
+                production_preflight.Preflight._trusted_checkout_tree(
+                    checkout,
+                    owner_uid=os.getuid() + 1,
+                    check_parents=False,
+                )
+            )
+
+    def test_checkout_tree_rejects_writable_parent_and_hardlinked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "parent"
+            checkout = parent / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            parent.chmod(0o770)
+            try:
+                self.assertFalse(
+                    production_preflight.Preflight._trusted_checkout_tree(
+                        checkout, owner_uid=os.getuid()
+                    )
+                )
+            finally:
+                parent.chmod(0o700)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            file = checkout / "payload"
+            file.write_bytes(b"release bytes")
+            file.chmod(0o444)
+            os.link(file, checkout / "payload-alias")
+            self.assertFalse(
+                production_preflight.Preflight._trusted_checkout_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+            )
+
+    def test_git_config_allowlist_rejects_execution_and_include_settings(self) -> None:
+        checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)
+
+        def result(keys: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, keys, "")
+
+        safe = "\n".join(
+            (
+                "core.repositoryformatversion",
+                "core.filemode",
+                "core.bare",
+                "core.logallrefupdates",
+                "remote.origin.url",
+                "remote.origin.fetch",
+                "core.fsmonitor",
+                "core.hookspath",
+                "core.symlinks",
+                "credential.helper",
+            )
+        )
+        with patch.object(checker, "_git", return_value=result(safe)):
+            self.assertTrue(checker._git_config_is_safe(Path("/unused")))
+
+        for unexpected in (
+            "filter.payload.clean",
+            "include.path",
+            "core.sshCommand",
+            "alias.status",
+        ):
+            with self.subTest(unexpected=unexpected):
+                with patch.object(
+                    checker, "_git", return_value=result(safe + "\n" + unexpected)
+                ):
+                    self.assertFalse(checker._git_config_is_safe(Path("/unused")))
+
     def test_candidate_git_filter_configuration_is_rejected(self) -> None:
         checker = production_preflight.Preflight(
             Path("/trusted/candidate"), EXPECTED_SHA

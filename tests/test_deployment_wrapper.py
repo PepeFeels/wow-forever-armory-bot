@@ -437,6 +437,197 @@ class InstallerDiagnosticTests(unittest.TestCase):
             finally:
                 checkout.chmod(0o755)
 
+    def test_protected_checkout_accepts_root_only_directories_and_validator_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            deploy_dir = checkout / "deploy"
+            git_dir.mkdir(parents=True)
+            deploy_dir.mkdir()
+            validator = deploy_dir / "recovery_audit.py"
+            validator.write_text("def verify_audit_directory(*args, **kwargs): pass\n")
+            validator.chmod(0o644)
+            ordinary = checkout / "README.md"
+            ordinary.write_text("fixture\n", encoding="ascii")
+            ordinary.chmod(0o444)
+            for directory in (checkout, git_dir, deploy_dir):
+                directory.chmod(0o700)
+
+            wrapper._assert_root_owned_tree(
+                checkout, owner_uid=os.getuid(), check_parents=False
+            )
+            validator.chmod(0o444)
+            wrapper._assert_root_owned_tree(
+                checkout, owner_uid=os.getuid(), check_parents=False
+            )
+
+            validator.chmod(0o664)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+            validator.chmod(0o444)
+            ordinary.chmod(0o644)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+
+    def test_protected_checkout_still_rejects_wrong_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid() + 1, check_parents=False
+                )
+
+    def test_protected_checkout_rejects_writable_parent_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "parent"
+            checkout = parent / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            parent.chmod(0o770)
+            try:
+                with self.assertRaises(wrapper.Refusal):
+                    wrapper._assert_root_owned_tree(
+                        checkout, owner_uid=os.getuid()
+                    )
+            finally:
+                parent.chmod(0o700)
+
+    def test_protected_checkout_rejects_hardlinked_regular_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            target = checkout / "payload"
+            target.write_bytes(b"release bytes")
+            target.chmod(0o444)
+            os.link(target, checkout / "payload-alias")
+            with self.assertRaises(wrapper.Refusal):
+                wrapper._assert_root_owned_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+
+    def test_local_git_configuration_is_allowlisted_before_checkout_queries(self):
+        safe_keys = "\n".join(sorted(wrapper.ALLOWED_LOCAL_GIT_CONFIG_KEYS))
+        with patch.object(wrapper, "_git", return_value=safe_keys):
+            wrapper._check_git_config()
+        for unexpected in (
+            "filter.payload.clean",
+            "include.path",
+            "core.sshCommand",
+            "alias.status",
+        ):
+            with self.subTest(unexpected=unexpected):
+                with patch.object(
+                    wrapper, "_git", return_value=safe_keys + "\n" + unexpected
+                ):
+                    with self.assertRaises(wrapper.Refusal):
+                        wrapper._check_git_config()
+
+    def test_git_queries_disable_replace_objects_and_external_helpers(self):
+        self.assertEqual(wrapper.CHILD_ENV["GIT_NO_REPLACE_OBJECTS"], "1")
+        with patch.object(wrapper, "_run", return_value="") as run:
+            wrapper._git("status", "--porcelain")
+        command = run.call_args.args[0]
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertIn("credential.helper=", command)
+        self.assertIn("core.symlinks=false", command)
+        self.assertIn("core.bare=false", command)
+
+    def test_protected_checkout_git_identity_and_ancestry_remain_pinned(self):
+        calls = []
+        outputs = iter(
+            (
+                str(wrapper.REPO),
+                wrapper.BRANCH,
+                wrapper.RELEASE_SHA,
+                wrapper.RELEASE_SHA,
+                "",
+                "",
+                "",
+            )
+        )
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return next(outputs)
+
+        with (
+            patch.object(wrapper, "_assert_root_owned_tree"),
+            patch.object(wrapper, "_check_git_config"),
+            patch.object(wrapper, "_run", side_effect=fake_run),
+        ):
+            wrapper._check_checkout()
+        self.assertEqual(
+            [call[-3:] for call in calls[-2:]],
+            [
+                ("--is-ancestor", wrapper.PREVIOUS_SHA, wrapper.RELEASE_SHA),
+                ("--is-ancestor", wrapper.BASE_CHECKPOINT_SHA, wrapper.RELEASE_SHA),
+            ],
+        )
+
+        bad_ref = iter(
+            (str(wrapper.REPO), wrapper.BRANCH, wrapper.RELEASE_SHA, "f" * 40, "")
+        )
+        with (
+            patch.object(wrapper, "_assert_root_owned_tree"),
+            patch.object(wrapper, "_check_git_config"),
+            patch.object(wrapper, "_run", side_effect=lambda *_a, **_k: next(bad_ref)),
+            self.assertRaises(wrapper.Refusal),
+        ):
+            wrapper._check_checkout()
+
+    def test_recovery_validator_accepts_read_only_modes_and_checks_hash_before_exec(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            deploy = checkout / "deploy"
+            deploy.mkdir(parents=True)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            validator = deploy / "recovery_audit.py"
+            source = (
+                "def verify_audit_directory(directory, **kwargs):\n"
+                "    assert kwargs['preserved_historical_directories'] == "
+                "('reviewed-v2.0.0', 'archive')\n"
+            ).encode("ascii")
+            validator.write_bytes(source)
+
+            with (
+                patch.object(wrapper, "REPO", checkout),
+                patch.object(
+                    wrapper, "RECOVERY_AUDIT_SHA256", hashlib.sha256(source).hexdigest()
+                ),
+            ):
+                for mode in (0o644, 0o444):
+                    validator.chmod(mode)
+                    wrapper._verify_archived_deployments(
+                        audit, owner_uid=os.getuid()
+                    )
+
+                alias = deploy / "validator-alias.py"
+                os.link(validator, alias)
+                with self.assertRaisesRegex(wrapper.Refusal, "metadata is unsafe"):
+                    wrapper._verify_archived_deployments(
+                        audit, owner_uid=os.getuid()
+                    )
+                alias.unlink()
+                with self.assertRaisesRegex(wrapper.Refusal, "metadata is unsafe"):
+                    wrapper._verify_archived_deployments(
+                        audit, owner_uid=os.getuid() + 1
+                    )
+
+                validator.chmod(0o644)
+                validator.write_bytes(source + b"# changed\n")
+                validator.chmod(0o444)
+                with self.assertRaisesRegex(wrapper.Refusal, "hash mismatch"):
+                    wrapper._verify_archived_deployments(
+                        audit, owner_uid=os.getuid()
+                    )
+
     def test_protected_checkout_rejects_python_bytecode_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)
