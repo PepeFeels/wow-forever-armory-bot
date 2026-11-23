@@ -158,6 +158,30 @@ class HistoricalAuditPermissionTests(unittest.TestCase):
             )
         )
 
+    def test_successful_followup_deployment_completes_recovered_lifecycle(self):
+        addendum = {"recovery_release_sha": "b" * 40}
+        journal = {
+            "approved_release_sha": "c" * 40,
+            "previous_release_sha": "b" * 40,
+            "service_state": ["active", "enabled"],
+            "backup_timer_state": ["active", "enabled"],
+        }
+        self.assertTrue(
+            recovery_audit._followup_deployment_establishes_normal_operation(
+                addendum, journal, [{"event": "approved"}, {"event": "success"}]
+            )
+        )
+        self.assertFalse(
+            recovery_audit._followup_deployment_establishes_normal_operation(
+                addendum, journal, [{"event": "failure"}]
+            )
+        )
+        self.assertFalse(
+            recovery_audit._followup_deployment_establishes_normal_operation(
+                {"recovery_release_sha": "d" * 40}, journal, [{"event": "success"}]
+            )
+        )
+
     def test_pinned_preserved_preflight_is_verified_as_read_only_evidence(self) -> None:
         service_uid = 4242
         service_gid = 4343

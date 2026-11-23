@@ -37,12 +37,12 @@ Do not run this command as part of this task turn. After it succeeds, independen
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/production_admin.py` | `9c065401d7de563451983b6d0c0985eeb418176110f1de1d7cab37f418602e58` |
-| `deploy/production_wrapper.py` | `eb79a56e44721b561eb76238e1dfa65f4112b0e54e52ae0e1ec4de23643b6080` |
-| `deploy/production_preflight.py` | `d908181ce8b40e99207e67cac64a846c51a29b1f7e46590c8d2d95187e53b738` |
+| `deploy/production_admin.py` | `e8b9f72bdd2ddc969489339d280234737c7c1180a835f3af484435a2c21151fb` |
+| `deploy/production_wrapper.py` | `8b30dd66b85167b417eb800db294c43afa265fa0c4a55fb358503008adfd19ce` |
+| `deploy/production_preflight.py` | `6a65c804c6e72be0e7e780784f4c4a874ee6eea60666250cd79019eecc6b9c9f` |
 | `deploy/production_install.py` | `347f7c659f939c69ea8e106dcc387dd53a7158fa3c1ae22bb8474e38fa7abb9c` |
-| `deploy/recovery_audit.py` | `00a4eacd84f6fdaba660a5bed9c84da5412d85c243f27df3926f32f76a14da09` |
-| `deploy/systemd/armory-db-preflight.py` | `6106670e27ec9ec235e46078c9fa84a2adb03be5fc95aae7b3ac969607c80f39` |
+| `deploy/recovery_audit.py` | `591d4382c351d3b931fc2e7d4d929c582c3a21551cbfa0109f1dc5adf6caa32b` |
+| `deploy/systemd/armory-db-preflight.py` | `aa2c53adc1feb798f970cba9ea289d6605356504bbd795377f1b1a6207ee54a5` |
 | `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
 | `deploy/task301_readonly_diagnostics.py` | `da23624be35d1353f50a2efdff03e3c464569db84de6608ecc0fe0c3841d654d` |
 

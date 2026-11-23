@@ -655,6 +655,27 @@ def _expected_activation_actions(intended: dict) -> list[dict]:
     return result
 
 
+def _followup_deployment_establishes_normal_operation(
+    addendum: object,
+    archived_journal: dict,
+    activation_records: list[dict],
+) -> bool:
+    """A successful approved deployment from the recovered release completes
+    the lifecycle transition for an older TASK267 addendum.
+    """
+    if not isinstance(addendum, dict) or not activation_records:
+        return False
+    return (
+        addendum.get("recovery_release_sha")
+        == archived_journal.get("previous_release_sha")
+        and archived_journal.get("approved_release_sha")
+        != archived_journal.get("previous_release_sha")
+        and archived_journal.get("service_state") == ["active", "enabled"]
+        and archived_journal.get("backup_timer_state") == ["active", "enabled"]
+        and activation_records[-1].get("event") == "success"
+    )
+
+
 def _valid_utc(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -2020,6 +2041,12 @@ def verify_audit_directory(
                         raise AuditError(
                             "incomplete activation cannot establish normal operation"
                         )
+                elif records[-1].get("event") == "success":
+                    for recovery_journal_sha, addendum in task267_addenda.items():
+                        if _followup_deployment_establishes_normal_operation(
+                            addendum, archived_journal, records
+                        ):
+                            normal_operation_journals.add(recovery_journal_sha)
         if legacy_activation_events:
             _verify_legacy_activation_events(
                 fd,
