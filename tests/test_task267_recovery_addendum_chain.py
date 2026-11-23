@@ -376,6 +376,33 @@ class Task267RecoveryAddendumChainTests(unittest.TestCase):
             with self._patch_live_evidence_paths(db, incident, latest, report):
                 recovery_audit._verify_task267_live_files(addendum)
 
+    def test_recovery_validation_accepts_stable_empty_wal_and_preserves_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, incident, latest, report, addendum, *_ = self._temporary_live_evidence(Path(tmp))
+            wal = Path(f"{db}-wal")
+            shm = Path(f"{db}-shm")
+            wal.write_bytes(b"")
+            shm.write_bytes(b"stable shared-memory evidence".ljust(32768, b"\0"))
+            wal.chmod(0o600)
+            shm.chmod(0o600)
+            before = (db.read_bytes(), wal.read_bytes(), shm.read_bytes())
+            with self._patch_live_evidence_paths(db, incident, latest, report):
+                with patch.object(recovery_audit, "_task267_path_handle_count", return_value=0):
+                    recovery_audit._verify_task267_live_files(addendum)
+            self.assertEqual((db.read_bytes(), wal.read_bytes(), shm.read_bytes()), before)
+
+    def test_recovery_validation_rejects_nonempty_wal_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, incident, latest, report, addendum, *_ = self._temporary_live_evidence(Path(tmp))
+            wal = Path(f"{db}-wal")
+            wal.write_bytes(b"uncheckpointed data")
+            wal.chmod(0o600)
+            before = (db.read_bytes(), wal.read_bytes())
+            with self._patch_live_evidence_paths(db, incident, latest, report):
+                with self.assertRaisesRegex(recovery_audit.AuditError, "nonempty WAL"):
+                    recovery_audit._verify_task267_live_files(addendum)
+            self.assertEqual((db.read_bytes(), wal.read_bytes()), before)
+
     def test_startup_live_file_check_rejects_open_database_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             db, incident, latest, report, addendum, *_ = self._temporary_live_evidence(Path(tmp))

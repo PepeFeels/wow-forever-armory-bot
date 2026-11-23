@@ -329,6 +329,9 @@ def _verify_task267_live_files(
             approved_signature=addendum.get("verified_database_signature"),
         )
     else:
+        sidecars_before = _task267_database_sidecar_snapshot(
+            TASK267_DATABASE_PATH, service_uid=service_uid, service_gid=service_gid
+        )
         database_hash, database_info = _hash_pinned_path(
             TASK267_DATABASE_PATH,
             owner=service_uid,
@@ -354,12 +357,10 @@ def _verify_task267_live_files(
             raise AuditError("current database is missing or changed")
         if _task267_database_handle_count(TASK267_DATABASE_PATH) != 0:
             raise AuditError("a process has the recovery database open")
-        for suffix in ("-wal", "-shm", "-journal", ".restore-in-progress"):
-            try:
-                Path(f"{TASK267_DATABASE_PATH}{suffix}").lstat()
-            except FileNotFoundError:
-                continue
-            raise AuditError("database sidecar or restore marker is present")
+        if sidecars_before != _task267_database_sidecar_snapshot(
+            TASK267_DATABASE_PATH, service_uid=service_uid, service_gid=service_gid
+        ):
+            raise AuditError("database sidecars changed during recovery verification")
     for path, expected in (
         (TASK267_INCIDENT_BACKUP_PATH, TASK267_INCIDENT_BACKUP_SHA256),
         (TASK267_LATEST_BACKUP_PATH, TASK267_LATEST_BACKUP_SHA256),
@@ -516,7 +517,7 @@ def _validate_lifecycle_transition(
         raise AuditError("normal-operation lifecycle transition is invalid")
 
 
-def _task267_database_handle_count(database: Path) -> int:
+def _task267_path_handle_count(database: Path) -> int:
     """Count matching procfs descriptors; incomplete visibility is a NO-GO."""
     if not hasattr(os, "O_NOATIME"):
         raise AuditError("procfs access cannot guarantee atime-safe reads")
@@ -566,6 +567,45 @@ def _task267_database_handle_count(database: Path) -> int:
         finally:
             os.close(process_fd)
     return count
+
+
+def _task267_database_handle_count(database: Path) -> int:
+    return _task267_path_handle_count(database)
+
+
+def _task267_database_sidecar_snapshot(
+    database: Path, *, service_uid: int, service_gid: int
+) -> dict[str, tuple[int, ...] | None]:
+    """Accept only stable private sidecars with no uncheckpointed WAL data."""
+    result: dict[str, tuple[int, ...] | None] = {}
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{database}{suffix}")
+        try:
+            info = sidecar.lstat()
+        except FileNotFoundError:
+            result[suffix] = None
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != service_uid
+            or info.st_gid != service_gid
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or info.st_size > 1_048_576
+        ):
+            raise AuditError("database sidecar metadata is unsafe")
+        if suffix == "-wal" and info.st_size != 0:
+            raise AuditError("nonempty WAL blocks recovery verification")
+        if _task267_path_handle_count(sidecar) != 0:
+            raise AuditError("a process has a database sidecar open")
+        result[suffix] = _identity(info)
+    for suffix in ("-journal", ".restore-in-progress"):
+        try:
+            Path(f"{database}{suffix}").lstat()
+        except FileNotFoundError:
+            continue
+        raise AuditError("database rollback or restore marker is present")
+    return result
 
 
 def _valid_activation_action(action: object) -> bool:

@@ -164,6 +164,7 @@ class HistoricalAuditPermissionTests(unittest.TestCase):
             patch.object(recovery_audit.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=service_uid)),
             patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=service_gid)),
             patch.object(recovery_audit, "_hash_pinned_path", side_effect=fake_hash),
+            patch.object(recovery_audit, "_task267_database_sidecar_snapshot", return_value={}),
             patch.object(recovery_audit, "_verify_task267_normal_database_metadata"),
         ):
             recovery_audit._verify_task267_live_files({}, normal_operation=True)
