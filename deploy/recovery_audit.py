@@ -32,6 +32,9 @@ SERVICE_ACTIVATION = re.compile(
 LEGACY_SERVICE_ACTIVATION = re.compile(
     r"service-activation-([0-9a-f]{64})-([0-9a-f]{32})\.json\Z"
 )
+PRESERVED_HISTORICAL_AUDIT_DIRECTORIES = frozenset(
+    {"reviewed-v2.0.0", "archive"}
+)
 RECOVERY_ADDENDUM = re.compile(r"recovery-addendum-([0-9a-f]{64})\.json\Z")
 TASK267_JOURNAL_SHA256 = "f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb"
 TASK267_MANIFEST_SHA256 = "9628fb0b363b724d9e88349fef9d100aa75297d16bf663a26263e793ac32d116"
@@ -737,6 +740,188 @@ def _audit_snapshot(
     return names, tuple(metadata)
 
 
+def _historical_directory_snapshot(
+    parent_fd: int,
+    directory_name: str,
+    *,
+    owner: int,
+    group: int,
+    root_device: int,
+) -> tuple[tuple[str, str, str, tuple[int, ...]], ...]:
+    """Hash a named historical subtree as untrusted data, never as evidence."""
+    if directory_name not in PRESERVED_HISTORICAL_AUDIT_DIRECTORIES:
+        raise AuditError("historical audit directory name is not approved")
+    root_before = os.stat(directory_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or root_before.st_uid != owner
+        or root_before.st_gid != group
+        or stat.S_IMODE(root_before.st_mode) != 0o700
+        or root_before.st_dev != root_device
+    ):
+        raise AuditError("historical audit directory metadata is unsafe")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOATIME", 0)
+    )
+    try:
+        root_fd = os.open(directory_name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise AuditError("historical audit directory cannot be opened safely") from exc
+
+    records: list[tuple[str, str, str, tuple[int, ...]]] = []
+    total_bytes = 0
+    try:
+        if _identity(root_before) != _identity(os.fstat(root_fd)):
+            raise AuditError("historical audit directory changed while opening")
+
+        def walk(directory_fd: int, prefix: str, depth: int) -> None:
+            nonlocal total_bytes
+            if depth > 32 or len(records) > 100_000:
+                raise AuditError("historical audit tree exceeds inventory limits")
+            before_dir = os.fstat(directory_fd)
+            names_before = tuple(sorted(os.listdir(directory_fd)))
+            for name in names_before:
+                if len(records) >= 100_000:
+                    raise AuditError("historical audit tree exceeds inventory limits")
+                if name in {".", ".."} or "/" in name or "\x00" in name:
+                    raise AuditError("historical audit filename is invalid")
+                relative = f"{prefix}/{name}"
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(before.st_mode):
+                    if (
+                        before.st_uid != owner
+                        or before.st_gid != group
+                        or stat.S_IMODE(before.st_mode) != 0o700
+                        or before.st_dev != root_device
+                    ):
+                        raise AuditError("historical audit subdirectory metadata is unsafe")
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(child_fd)
+                        if _identity(before) != _identity(opened):
+                            raise AuditError("historical audit subdirectory changed while opening")
+                        records.append((relative, "untrusted-directory", "", _identity(opened)))
+                        walk(child_fd, relative, depth + 1)
+                        after = os.fstat(child_fd)
+                        entry_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if _identity(opened) != _identity(after) or _identity(after) != _identity(entry_after):
+                            raise AuditError("historical audit subdirectory changed while reading")
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(before.st_mode):
+                    if (
+                        before.st_uid != owner
+                        or before.st_gid != group
+                        or before.st_nlink != 1
+                        or stat.S_IMODE(before.st_mode) not in {0o600, 0o700}
+                        or before.st_dev != root_device
+                    ):
+                        raise AuditError("historical audit file metadata is unsafe")
+                    file_flags = (
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NONBLOCK", 0)
+                        | getattr(os, "O_NOATIME", 0)
+                    )
+                    file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(file_fd)
+                        if _identity(before) != _identity(opened):
+                            raise AuditError("historical audit file changed while opening")
+                        digest = hashlib.sha256()
+                        size = 0
+                        while block := os.read(file_fd, 1024 * 1024):
+                            digest.update(block)
+                            size += len(block)
+                            total_bytes += len(block)
+                            if total_bytes > 2 * 1024 * 1024 * 1024:
+                                raise AuditError("historical audit data exceeds inventory limit")
+                        after = os.fstat(file_fd)
+                        entry_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if (
+                            _identity(opened) != _identity(after)
+                            or _identity(after) != _identity(entry_after)
+                            or size != after.st_size
+                        ):
+                            raise AuditError("historical audit file changed while hashing")
+                        records.append((relative, "untrusted-file", digest.hexdigest(), _identity(after)))
+                    finally:
+                        os.close(file_fd)
+                else:
+                    raise AuditError("historical audit tree contains a link or special file")
+            names_after = tuple(sorted(os.listdir(directory_fd)))
+            after_dir = os.fstat(directory_fd)
+            if names_before != names_after or _identity(before_dir) != _identity(after_dir):
+                raise AuditError("historical audit directory changed during inventory")
+
+        records.append((directory_name, "untrusted-directory", "", _identity(root_before)))
+        walk(root_fd, directory_name, 1)
+        root_after = os.stat(directory_name, dir_fd=parent_fd, follow_symlinks=False)
+        if _identity(root_before) != _identity(root_after):
+            raise AuditError("historical audit directory changed during inventory")
+        return tuple(records)
+    finally:
+        os.close(root_fd)
+
+
+def inventory_historical_audit_directories(
+    directory: str | Path,
+    *,
+    owner: int = 0,
+    group: int = 0,
+    names: tuple[str, ...] = tuple(sorted(PRESERVED_HISTORICAL_AUDIT_DIRECTORIES)),
+) -> list[tuple[str, str, str]]:
+    """Return hashes for explicitly preserved historical subtrees as untrusted."""
+    if not set(names) <= PRESERVED_HISTORICAL_AUDIT_DIRECTORIES or len(set(names)) != len(names):
+        raise AuditError("historical audit directory allowlist is invalid")
+    path = Path(directory)
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != owner
+            or before.st_gid != group
+            or stat.S_IMODE(before.st_mode) != 0o700
+        ):
+            raise AuditError("audit directory metadata is unsafe")
+        fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOATIME", 0),
+        )
+    except OSError as exc:
+        raise AuditError("audit directory cannot be opened safely") from exc
+    try:
+        opened = os.fstat(fd)
+        if _identity(before) != _identity(opened):
+            raise AuditError("audit directory changed while opening")
+        if not hasattr(os, "O_NOATIME"):
+            raise AuditError("filesystem cannot guarantee atime-safe audit reads")
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        names_before = tuple(sorted(os.listdir(fd)))
+        result = []
+        for name in names:
+            if name in names_before:
+                result.extend(
+                    (relative, kind, digest)
+                    for relative, kind, digest, _identity_value in _historical_directory_snapshot(
+                        fd, name, owner=owner, group=group, root_device=opened.st_dev
+                    )
+                )
+        if names_before != tuple(sorted(os.listdir(fd))) or _identity(opened) != _identity(os.fstat(fd)):
+            raise AuditError("audit directory changed during historical inventory")
+        return result
+    except OSError as exc:
+        raise AuditError("historical audit data could not be read safely") from exc
+    finally:
+        os.close(fd)
+
+
 def verify_audit_directory(
     directory: str | Path,
     *,
@@ -746,6 +931,7 @@ def verify_audit_directory(
     activation_release: str | None = None,
     activation_role: str = "bot",
     activation_in_progress: bool = False,
+    preserved_historical_directories: tuple[str, ...] = (),
 ) -> int:
     """Return acknowledged record count; raise AuditError for every unsafe state.
 
@@ -758,6 +944,11 @@ def verify_audit_directory(
     """
     if not hasattr(os, "O_NOATIME"):
         raise AuditError("filesystem cannot guarantee atime-safe audit reads")
+    if (
+        not set(preserved_historical_directories) <= PRESERVED_HISTORICAL_AUDIT_DIRECTORIES
+        or len(set(preserved_historical_directories)) != len(preserved_historical_directories)
+    ):
+        raise AuditError("historical audit directory allowlist is invalid")
     path = Path(directory)
     try:
         before_path = path.lstat()
@@ -796,10 +987,28 @@ def verify_audit_directory(
                 raise AuditError("audit directory is being modified") from exc
         before_snapshot = _audit_snapshot(fd)
         names = set(before_snapshot[0])
+        historical_snapshot = tuple(
+            item
+            for name in sorted(preserved_historical_directories)
+            if name in names
+            for item in _historical_directory_snapshot(
+                fd, name, owner=owner, group=group, root_device=opened.st_dev
+            )
+        )
         if "deployment-state.json" in names or ".deployment-state.json.tmp" in names:
             raise AuditError("an active or incomplete deployment journal exists")
         for name, identity in before_snapshot[1]:
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if name in preserved_historical_directories:
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != owner
+                    or info.st_gid != group
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                    or _identity(info) != identity
+                ):
+                    raise AuditError("historical audit directory metadata is unsafe")
+                continue
             if (
                 TASK267_ATTESTATION_FILE.fullmatch(name)
                 and name != TASK267_ATTESTATION_PATH.name
@@ -1540,7 +1749,15 @@ def verify_audit_directory(
             )
             if not permitted:
                 raise AuditError("activation state does not authorize this unit")
-        if _audit_snapshot(fd) != before_snapshot:
+        historical_after = tuple(
+            item
+            for name in sorted(preserved_historical_directories)
+            if name in names
+            for item in _historical_directory_snapshot(
+                fd, name, owner=owner, group=group, root_device=opened.st_dev
+            )
+        )
+        if _audit_snapshot(fd) != before_snapshot or historical_after != historical_snapshot:
             raise AuditError("audit directory changed during validation")
         after_path = path.lstat()
         after_fd = os.fstat(fd)

@@ -68,7 +68,7 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e"
+    "3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8"
 )
 COMPLETION_SNAPSHOT_MODULE = COMPLETION_BASE / "bin/production_db_snapshot.py"
 SNAPSHOT_MODULE_SHA256 = (
@@ -2311,6 +2311,7 @@ def finalize_deployment(
                 owner=owner_uid,
                 group=owner_gid,
                 acquire_lock=False,
+                preserved_historical_directories=("reviewed-v2.0.0", "archive"),
             )
         return journal_sha, hashlib.sha256(manifest_raw).hexdigest()
     except OSError as exc:
@@ -2401,6 +2402,7 @@ def activate_services(
                     owner=owner_uid,
                     group=owner_gid,
                     acquire_lock=False,
+                    preserved_historical_directories=("reviewed-v2.0.0", "archive"),
                 )
 
         verify_history()

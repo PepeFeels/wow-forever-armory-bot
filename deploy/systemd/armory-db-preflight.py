@@ -112,7 +112,7 @@ def _read_audit_json(
 
 
 RECOVERY_AUDIT_SHA256 = (
-    "9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e"
+    "3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8"
 )
 
 
@@ -169,6 +169,7 @@ def deployment_recovery_is_clear(
             activation_release=activation_release,
             activation_role=activation_role,
             activation_in_progress=activation_in_progress,
+            preserved_historical_directories=("reviewed-v2.0.0", "archive"),
         )
         return True
     except OSError, ValueError, TypeError, KeyError:

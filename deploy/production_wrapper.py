@@ -51,7 +51,7 @@ INSTALLER = BASE / "bin/production_install.py"
 INSTALLER_SHA256 = "0" * 64
 DEPLOYMENT_PIN_SHA256 = "0" * 64
 RECOVERY_AUDIT_SHA256 = (
-    "9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e"
+    "3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8"
 )
 PYTHON = Path("/usr/bin/python3.14")
 GIT = Path("/usr/bin/git")
@@ -647,6 +647,7 @@ def _verify_archived_deployments(
             owner=owner_uid,
             group=os.lstat(directory).st_gid,
             acquire_lock=not lock_held,
+            preserved_historical_directories=("reviewed-v2.0.0", "archive"),
         )
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise Refusal("deployment audit history is unsafe or unresolved") from exc

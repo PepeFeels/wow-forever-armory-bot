@@ -30,7 +30,7 @@ from typing import Any
 BRANCH = "release/v2.0.0"
 FAILED_V1_RELEASE = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
 APPROVED_PREFLIGHT_SHA256 = (
-    "9567f17e24247470a3e12a5fb8a3d7e617f743ae707de533ff2f9d5ec233b4ec"
+    "71e1675198bb86242021edbed8e23e73659febb382ea9437c78a6d1c42bbc360"
 )
 BASE = Path("/opt/wow-forever-armory-bot")
 REPO = BASE / "deployment-checkout"
@@ -44,7 +44,7 @@ BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
 RECOVERY_AUDIT_SHA256 = (
-    "9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e"
+    "3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8"
 )
 SYSTEM_PYTHON = "/usr/bin/python3.14"
 VENV_SYMLINK_TARGETS = {
@@ -1351,7 +1351,8 @@ class Preflight:
         namespace = {"__file__": str(source), "__name__": "_armory_recovery_audit"}
         exec(compile(data, str(source), "exec", dont_inherit=True), namespace)
         return namespace["verify_audit_directory"](
-            audit, owner=owner, group=os.lstat(audit).st_gid
+            audit, owner=owner, group=os.lstat(audit).st_gid,
+            preserved_historical_directories=("reviewed-v2.0.0", "archive"),
         )
 
     def incident_journal(self) -> None:
