@@ -68,12 +68,24 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d"
+    "9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e"
 )
 COMPLETION_SNAPSHOT_MODULE = COMPLETION_BASE / "bin/production_db_snapshot.py"
 SNAPSHOT_MODULE_SHA256 = (
     "564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8"
 )
+TASK267_REPORT = Path(
+    "/home/nolo-admin/armory-current-db-verification-200f-99da0f81c2e53ff3.json"
+)
+TASK267_REPORT_SHA256 = "8ffae1176165b46c0e06733ac9d34a937ee033a0d6886a3bbcab7575b7cef96a"
+TASK267_JOURNAL_SHA256 = "f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb"
+TASK267_MANIFEST_SHA256 = "9628fb0b363b724d9e88349fef9d100aa75297d16bf663a26263e793ac32d116"
+TASK267_INCIDENT_BACKUP_SHA256 = "e15bd8d7434246f71b4580437c63bd2f79b572c6d104b05b6e2c28f3d05345c9"
+TASK267_LATEST_BACKUP = Path("/var/lib/wow-forever-armory-bot/backups/guild-armory-20261115T001002.517528Z.sqlite3")
+TASK267_LATEST_BACKUP_SHA256 = "bc87d4f26b213fdca1466fffbd6ec5b9c707f6c2fdaa71927574f365b494cbc0"
+TASK267_PREFLIGHT_SHA256 = "c1c4f067fa2b465726d374ecb06acfae82a1ec234dc0f38c4734a6c422089803"
+TASK267_ATTESTATION_SHA256 = "dc82c79862053f64f460e41cc18bca6a90308545d4a4ac56781c09628dde09c4"
+TASK267_REVIEW_SHA256 = "784a8759817045c2c9b59545022e43c4cf23ae7772d26f37f61ebcb69e0c308f"
 ARCHIVE_NAME_RE = re.compile(r"deployment-state-([0-9a-f]{64})\.json\Z")
 ACTIVATION_EVENT_RE = re.compile(
     r"service-activation-([0-9a-f]{64})-([0-9a-f]{32})-([0-9]{4})\.json\Z"
@@ -105,6 +117,8 @@ def _stable_signature(info: os.stat_result) -> tuple[int, ...]:
 
 
 def _open_private_directory(directory: Path, *, owner_uid: int, exact_mode: int) -> int:
+    if not hasattr(os, "O_NOATIME"):
+        raise AdminError("filesystem cannot guarantee atime-safe reads")
     try:
         if not directory.is_absolute() or directory.resolve(strict=True) != directory:
             raise AdminError("administrative directory path is not canonical")
@@ -117,7 +131,10 @@ def _open_private_directory(directory: Path, *, owner_uid: int, exact_mode: int)
             raise AdminError("administrative directory metadata is unsafe")
         fd = os.open(
             directory,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NOATIME", 0),
         )
     except (OSError, RuntimeError) as exc:
         raise AdminError("administrative directory is unavailable") from exc
@@ -185,6 +202,8 @@ def _read_at(
     maximum: int = MAX_JSON_BYTES,
     expected_nlink: int = 1,
 ) -> tuple[bytes, os.stat_result]:
+    if not hasattr(os, "O_NOATIME"):
+        raise AdminError("filesystem cannot guarantee atime-safe reads")
     if not name or name in {".", ".."} or "/" in name:
         raise AdminError("administrative filename is invalid")
     try:
@@ -194,7 +213,8 @@ def _read_at(
             os.O_RDONLY
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_CLOEXEC", 0),
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOATIME", 0),
             dir_fd=directory_fd,
         )
     except OSError as exc:
@@ -563,6 +583,16 @@ def load_reviewed_python_source(
     return module
 
 
+def _validate_task267_addendum_with_module(
+    validator: types.ModuleType, *args: Any, **kwargs: Any
+) -> Any:
+    """Call the hash-reviewed addendum validator exposed by its module."""
+    validate = getattr(validator, "_validate_task267_addendum", None)
+    if not callable(validate):
+        raise AdminError("reviewed recovery validator lacks its addendum check")
+    return validate(*args, **kwargs)
+
+
 def _parse_utc(value: Any) -> datetime:
     if not isinstance(value, str):
         raise AdminError("review record time is missing")
@@ -647,6 +677,7 @@ def _validate_review_record(
     journal: Mapping[str, Any],
     approved_by: str,
     approval_reference: str,
+    allow_timestamp_signature_delta: bool = False,
 ) -> None:
     required = {
         "schema_version",
@@ -725,7 +756,10 @@ def _validate_review_record(
     ):
         raise AdminError("backup or preflight review hash is invalid")
     observed_matches = (
-        observations.get("database_signature") == journal.get("database_signature")
+        (
+            allow_timestamp_signature_delta
+            or observations.get("database_signature") == journal.get("database_signature")
+        )
         and observations.get("backup_path") == journal.get("database_backup")
         and observations.get("backup_sha256") == journal.get("database_backup_sha256")
         and observations.get("saved_preflight_path")
@@ -793,10 +827,32 @@ def _hash_regular_file(
     owner_gid: int,
     mode: int,
     parent_mode: int,
+    locked_directory_fd: int | None = None,
 ) -> str:
-    directory_fd = _open_private_directory(
-        path.parent, owner_uid=owner_uid, exact_mode=parent_mode
-    )
+    if not hasattr(os, "O_NOATIME"):
+        raise AdminError("filesystem cannot guarantee atime-safe hashing")
+    if locked_directory_fd is None:
+        directory_fd = _open_private_directory(
+            path.parent, owner_uid=owner_uid, exact_mode=parent_mode
+        )
+    else:
+        # Reuse the caller's exclusive directory lock. A second open()+flock()
+        # of the same directory conflicts with Linux flock semantics even in
+        # the same process. Validate that the supplied fd is the exact parent,
+        # reaffirm its lock non-blockingly, and duplicate it for local cleanup.
+        _verify_directory_binding(
+            locked_directory_fd,
+            path.parent,
+            owner_uid=owner_uid,
+            exact_mode=parent_mode,
+        )
+        try:
+            fcntl.flock(locked_directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            directory_fd = os.dup(locked_directory_fd)
+        except OSError as exc:
+            raise AdminError(
+                "another administrative operation holds the directory"
+            ) from exc
     try:
         try:
             entry_before = os.stat(
@@ -807,7 +863,8 @@ def _hash_regular_file(
                 os.O_RDONLY
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_NONBLOCK", 0)
-                | getattr(os, "O_CLOEXEC", 0),
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOATIME", 0),
                 dir_fd=directory_fd,
             )
         except OSError as exc:
@@ -1173,6 +1230,7 @@ def _verify_recovery_evidence(
     service_uid: int | None = None,
     service_gid: int | None = None,
     owner_uid: int = 0,
+    locked_directory_fd: int | None = None,
 ) -> None:
     current = base / "current"
     try:
@@ -1291,6 +1349,7 @@ def _verify_recovery_evidence(
         owner_gid=0 if owner_uid == 0 else service_gid,
         mode=0o700,
         parent_mode=0o700,
+        locked_directory_fd=locked_directory_fd,
     )
     if (
         preflight_hash != journal["shared_preflight_sha256"]
@@ -1309,6 +1368,216 @@ def _verify_recovery_evidence(
         or _signature(db_info_after) != _signature(db_info)
     ):
         raise AdminError("release pointer or database changed during verification")
+
+
+_DEFAULT_RECOVERY_EVIDENCE_VERIFIER = _verify_recovery_evidence
+
+
+def _read_task267_report(expected_uid: int) -> tuple[bytes, str]:
+    """Read the single pinned report without following links or changing atime."""
+    if not hasattr(os, "O_NOATIME"):
+        raise AdminError("filesystem cannot guarantee atime-safe report reads")
+    parent = TASK267_REPORT.parent
+    try:
+        if parent.resolve(strict=True) != parent:
+            raise AdminError("verification report directory is not canonical")
+        parent_info = parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != expected_uid
+            or parent_info.st_mode & 0o022
+        ):
+            raise AdminError("verification report directory metadata is unsafe")
+        directory_fd = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOATIME", 0),
+        )
+        try:
+            opened_dir = os.fstat(directory_fd)
+            if (opened_dir.st_dev, opened_dir.st_ino) != (
+                parent_info.st_dev,
+                parent_info.st_ino,
+            ):
+                raise AdminError("verification report directory changed")
+            before = os.stat(TASK267_REPORT.name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != expected_uid
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or before.st_size > 2_000_000
+            ):
+                raise AdminError("verification report metadata is unsafe")
+            fd = os.open(
+                TASK267_REPORT.name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NOATIME", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(fd)
+                if _signature(opened) != _signature(before):
+                    raise AdminError("verification report changed while opening")
+                chunks = []
+                total = 0
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    chunks.append(block)
+                    total += len(block)
+                    if total > 2_000_000:
+                        raise AdminError("verification report exceeds its size limit")
+                raw = b"".join(chunks)
+                after = os.fstat(fd)
+                current = os.stat(TASK267_REPORT.name, dir_fd=directory_fd, follow_symlinks=False)
+                current_parent = parent.lstat()
+                if (
+                    _signature(opened) != _signature(after)
+                    or _signature(after) != _signature(current)
+                    or (opened_dir.st_dev, opened_dir.st_ino)
+                    != (current_parent.st_dev, current_parent.st_ino)
+                    or len(raw) != after.st_size
+                ):
+                    raise AdminError("verification report changed while reading")
+                return raw, hashlib.sha256(raw).hexdigest()
+            finally:
+                os.close(fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise AdminError("verification report cannot be read safely") from exc
+
+
+def _validate_task267_report(
+    report: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    addendum: Mapping[str, Any],
+    *,
+    journal_sha256: str,
+    manifest_sha256: str,
+) -> None:
+    """Check the pinned verifier's semantic claims before applying addendum."""
+    db = report.get("database")
+    refs = report.get("incident_references")
+    if not isinstance(db, Mapping) or not isinstance(refs, Mapping):
+        raise AdminError("fresh verifier report has incomplete evidence")
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+        or report.get("status") != "PASS"
+        or report.get("hostname") != "nololinux-server"
+        or report.get("warnings")
+        != ["Incident journal signature differs from the current database."]
+        or journal_sha256 != TASK267_JOURNAL_SHA256
+        or manifest_sha256 != TASK267_MANIFEST_SHA256
+        or refs.get("phase") != "manual_recovery_required"
+        or refs.get("journal_sha256") != TASK267_JOURNAL_SHA256
+        or refs.get("manifest_sha256") != TASK267_MANIFEST_SHA256
+        or refs.get("backup_sha256") != TASK267_INCIDENT_BACKUP_SHA256
+        or refs.get("latest_backup_sha256") != TASK267_LATEST_BACKUP_SHA256
+        or db.get("integrity_check") != "ok"
+        or db.get("schema") != "PASS"
+        or db.get("source_sha256") != db.get("snapshot_sha256")
+        or db.get("source_sha256") != addendum.get("database_sha256")
+        or db.get("incident_signature_match") is not False
+        or db.get("process_open_count_before_and_after") != 0
+        or db.get("counts") != {"guilds": 1, "members": 4, "characters": 4}
+        or db.get("wal") != {
+            "present": False,
+            "snapshot_sha256": None,
+            "source_sha256": None,
+        }
+        or db.get("shm") != {"present": False, "sha256": None}
+        or report.get("systemd_before") != {
+            "wow-forever-armory-bot.service": {"active": "inactive", "enabled": "disabled"},
+            "wow-forever-armory-backup.timer": {"active": "inactive", "enabled": "disabled"},
+            "wow-forever-armory-backup.service": {"active": "inactive"},
+        }
+        or report.get("systemd_after") != report.get("systemd_before")
+        or not isinstance(db.get("backup_comparison"), Mapping)
+        or not isinstance(db["backup_comparison"].get("incident"), Mapping)
+        or db["backup_comparison"]["incident"].get("status") != "MATCH"
+        or not isinstance(db["backup_comparison"].get("latest_2026_11_15"), Mapping)
+        or db["backup_comparison"]["latest_2026_11_15"].get("status") != "MATCH"
+    ):
+        raise AdminError("fresh verifier report failed addendum requirements")
+    signature = db.get("source_signature")
+    if not isinstance(signature, list) or len(signature) != 9 or signature[3] != 1:
+        raise AdminError("fresh verifier database signature is invalid")
+    converted = [signature[0], signature[1], signature[2], signature[4], signature[5], signature[7], signature[8], signature[6]]
+    if converted != addendum.get("verified_database_signature"):
+        raise AdminError("report signature differs from the approved addendum")
+    historical = journal.get("database_signature")
+    if (
+        addendum.get("historical_database_signature") != historical
+        or not isinstance(historical, list)
+        or len(historical) != 8
+        or any(historical[index] != converted[index] for index in (0, 1, 2, 5, 6, 7))
+        or historical[3:5] == converted[3:5]
+    ):
+        raise AdminError("database signature drift is not limited to mtime/ctime")
+
+
+def _database_open_handle_count(database: Path) -> int:
+    """Passively scan procfs; inability to complete the scan is a hard stop."""
+    if not hasattr(os, "O_NOATIME"):
+        raise AdminError("process scan cannot guarantee atime-safe access")
+    try:
+        target = database.stat()
+        proc_fd = os.open(
+            "/proc",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOATIME", 0),
+        )
+        try:
+            pids = os.listdir(proc_fd)
+        finally:
+            os.close(proc_fd)
+    except OSError as exc:
+        raise AdminError("process handle scan is unavailable") from exc
+    count = 0
+    for pid in pids:
+        if not pid.isdecimal():
+            continue
+        fd_directory = Path("/proc") / pid / "fd"
+        try:
+            fd_dir = os.open(
+                fd_directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOATIME", 0),
+            )
+            try:
+                entries = os.listdir(fd_dir)
+                identities = []
+                for descriptor in entries:
+                    try:
+                        info = os.stat(descriptor, dir_fd=fd_dir, follow_symlinks=True)
+                    except FileNotFoundError:
+                        continue
+                    identities.append((info.st_dev, info.st_ino))
+            finally:
+                os.close(fd_dir)
+        except FileNotFoundError:
+            continue  # Process exited during the passive scan.
+        except OSError as exc:
+            raise AdminError("process handle scan is incomplete") from exc
+        count += sum(identity == (target.st_dev, target.st_ino) for identity in identities)
+    return count
 
 
 def _require_recovery_unit_states(
@@ -1372,6 +1641,7 @@ def _append_activation_event(
     action: Mapping[str, Any] | None = None,
     observed_states: Mapping[str, list[str]] | None = None,
     failure_class: str | None = None,
+    lifecycle_transition: Mapping[str, Any] | None = None,
     owner_uid: int,
     owner_gid: int,
 ) -> dict[str, Any]:
@@ -1383,8 +1653,10 @@ def _append_activation_event(
         "failure",
     }:
         raise AdminError("activation event type is invalid")
+    if lifecycle_transition is not None and event_type != "success":
+        raise AdminError("lifecycle transition is valid only on activation success")
     event = {
-        "schema_version": 1,
+        "schema_version": 2 if lifecycle_transition is not None else 1,
         "journal_sha256": journal_sha256,
         "activation_id": activation_id,
         "attempt_number": attempt_number,
@@ -1406,6 +1678,8 @@ def _append_activation_event(
         "failure_class": failure_class,
         "recorded_at_utc": datetime.now(UTC).isoformat(),
     }
+    if lifecycle_transition is not None:
+        event["lifecycle_transition"] = dict(lifecycle_transition)
     name = f"service-activation-{journal_sha256}-{activation_id}-{sequence:04d}.json"
     raw = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "ascii"
@@ -1454,6 +1728,7 @@ def _verify_completion_evidence(
     manifest_raw: bytes,
     *,
     owner_uid: int = 0,
+    locked_directory_fd: int | None = None,
 ) -> None:
     """Recheck installation evidence and stopped-state conditions before closure."""
     release = journal.get("approved_release_sha")
@@ -1506,11 +1781,6 @@ def _verify_completion_evidence(
         or report.get("installer_sha256")
         != journal.get("deployment_pin_installer_sha256")
         or report.get("deployment_pin_sha256") != journal.get("deployment_pin_sha256")
-        or report.get("intended_service_state") != journal.get("service_state")
-        or report.get("intended_backup_timer_state")
-        != journal.get("backup_timer_state")
-        or journal.get("service_state") != ["active", "enabled"]
-        or journal.get("backup_timer_state") != ["active", "enabled"]
     ):
         raise AdminError("installation result contradicts deployment journal")
     if (
@@ -1634,6 +1904,7 @@ def _verify_completion_evidence(
         owner_gid=owner_uid,
         mode=0o700,
         parent_mode=0o700,
+        locked_directory_fd=locked_directory_fd,
     )
     if backup_hash != journal.get(
         "database_backup_sha256"
@@ -1884,7 +2155,8 @@ def finalize_deployment(
             raise AdminError("installation result manifest hash is invalid")
         verifier = evidence_verifier or (
             lambda j, r, m, d, raw: _verify_completion_evidence(
-                j, r, m, d, raw, owner_uid=owner_uid
+                j, r, m, d, raw, owner_uid=owner_uid,
+                locked_directory_fd=directory_fd,
             )
         )
         verifier(journal, report, manifest, audit_dir, manifest_raw)
@@ -2139,51 +2411,187 @@ def activate_services(
         journal = _json_object(archive_raw)
         if hashlib.sha256(archive_raw).hexdigest() != expected_journal_sha256:
             raise AdminError("completion archive hash is invalid")
-        if journal.get("phase") != "complete":
-            raise AdminError("deployment is not administratively complete")
+        phase = journal.get("phase")
+        manual_recovery = phase == "manual_recovery_required"
+        if phase not in {"complete", "manual_recovery_required"}:
+            raise AdminError("journal is not eligible for controlled activation")
+        if manual_recovery and (
+            validator is not None
+            or owner_uid != 0
+            or owner_gid != 0
+            or state_reader is not _systemd_states
+            or service_action is not None
+            or process_check is not None
+            or database_check is not None
+            or activation_lock != Path("/run/lock/armory-service-activation.lock")
+            or report is not None
+        ):
+            raise AdminError(
+                "recovery activation requires fixed privileged evidence and controls"
+            )
+        if manual_recovery:
+            release, previous = _validate_incident(journal, audit_dir)
+            manifest_name = f"deployment-{release}.json"
+            manifest_raw, _ = _read_at(
+                directory_fd, manifest_name, owner_uid=owner_uid, mode=0o600
+            )
+            manifest = _json_object(manifest_raw)
+            _validate_manifest(journal, manifest, release, previous, audit_dir)
+            manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+            deployment_pin_sha256 = journal.get("deployment_pin_sha256")
+            result_sha = journal.get("installation_result_sha256")
+        else:
+            release = journal.get("approved_release_sha")
+            previous = journal.get("previous_release_sha")
+            if not isinstance(release, str) or not isinstance(previous, str):
+                raise AdminError("completed deployment release identity is invalid")
+            manifest_name = f"deployment-{release}.json"
+            manifest_raw, _ = _read_at(
+                directory_fd, manifest_name, owner_uid=owner_uid, mode=0o600
+            )
+            manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
         ack_name = f"deployment-recovery-ack-{expected_journal_sha256}.json"
         ack_raw, _ = _read_at(directory_fd, ack_name, owner_uid=owner_uid, mode=0o600)
         ack = _json_object(ack_raw)
-        if (
-            ack.get("decision") != "deployment_completion_verified"
+        if manual_recovery:
+            if (
+                ack.get("schema_version") != 2
+                or ack.get("decision") != "manual_recovery_verified_with_addendum"
+                or ack.get("journal_sha256") != expected_journal_sha256
+                or ack.get("manifest_sha256") != manifest_sha
+                or ack.get("approved_release_sha") != release
+                or ack.get("previous_release_sha") != previous
+            ):
+                raise AdminError("recovery acknowledgment is invalid")
+        elif (
+            ack.get("schema_version") != 1
+            or ack.get("decision") != "deployment_completion_verified"
             or ack.get("journal_sha256") != expected_journal_sha256
-            or ack.get("approved_release_sha") != journal.get("approved_release_sha")
+            or ack.get("approved_release_sha") != release
             or ack.get("approved_by") != journal.get("completion_approved_by")
             or ack.get("approval_reference")
             != journal.get("completion_approval_reference")
         ):
             raise AdminError("completion acknowledgment is invalid")
-        release = journal.get("approved_release_sha")
-        previous = journal.get("previous_release_sha")
-        if not isinstance(release, str) or not isinstance(previous, str):
-            raise AdminError("completed deployment release identity is invalid")
-        manifest_name = f"deployment-{release}.json"
-        manifest_raw, manifest_info = _read_at(
-            directory_fd, manifest_name, owner_uid=owner_uid, mode=0o600
-        )
-        result_name = journal.get("installation_result")
-        result_sha = journal.get("installation_result_sha256")
-        if not isinstance(result_name, str) or not isinstance(result_sha, str):
-            raise AdminError("completed installation result is unavailable")
-        result_raw, _ = _read_at(
-            directory_fd, result_name, owner_uid=owner_uid, mode=0o600
-        )
-        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
-        if (
-            hashlib.sha256(result_raw).hexdigest() != result_sha
-            or _json_object(result_raw).get("deployment_pin_sha256")
-            != journal.get("deployment_pin_sha256")
-            or _json_object(result_raw).get("manifest_sha256") != manifest_sha
-        ):
-            raise AdminError("installation report does not match completed deployment")
-        deployment_pin_sha256 = journal.get("deployment_pin_sha256")
-        if (
-            not isinstance(deployment_pin_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", deployment_pin_sha256) is None
-            or _json_object(result_raw).get("deployment_pin_sha256")
-            != deployment_pin_sha256
-        ):
-            raise AdminError("deployment pin identity is invalid")
+        recovery_lifecycle_transition = None
+        activation_release = release
+        if manual_recovery:
+            addendum_name = f"recovery-addendum-{expected_journal_sha256}.json"
+            addendum_raw, _ = _read_at(
+                directory_fd, addendum_name, owner_uid=owner_uid, mode=0o600
+            )
+            addendum = _json_object(addendum_raw)
+            addendum_sha256 = hashlib.sha256(addendum_raw).hexdigest()
+            if (
+                addendum_sha256 != ack.get("recovery_addendum_sha256")
+                or addendum.get("journal_sha256") != expected_journal_sha256
+                or not isinstance(addendum.get("database_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", addendum["database_sha256"])
+                is None
+                or not isinstance(
+                    addendum.get("verification_report_sha256"), str
+                )
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", addendum["verification_report_sha256"]
+                )
+                is None
+            ):
+                raise AdminError("recovery lifecycle evidence is inconsistent")
+            audit_validator = loaded
+            assert audit_validator is not None
+            _validate_task267_addendum_with_module(
+                audit_validator,
+                addendum_raw,
+                addendum,
+                journal_sha256=expected_journal_sha256,
+                manifest_sha256=manifest_sha,
+                approved_release_sha=release,
+                previous_release_sha=previous,
+                journal_database_signature=journal.get("database_signature"),
+            )
+            review_sha = addendum.get("recovery_review_sha256")
+            if not isinstance(review_sha, str) or re.fullmatch(
+                r"[0-9a-f]{64}", review_sha
+            ) is None:
+                raise AdminError("recovery review hash is invalid")
+            bound_review_name = (
+                f"recovery-review-{expected_journal_sha256}-{review_sha}.json"
+            )
+            try:
+                os.stat(bound_review_name, dir_fd=directory_fd, follow_symlinks=False)
+                recovery_review_name = bound_review_name
+            except FileNotFoundError:
+                recovery_review_name = f"recovery-review-{expected_journal_sha256}.json"
+            recovery_review_raw, recovery_review = _read_at(
+                directory_fd,
+                recovery_review_name,
+                owner_uid=owner_uid,
+                mode=0o600,
+            )
+            recovery_review = _json_object(recovery_review_raw)
+            _validate_review_record(
+                recovery_review,
+                journal_sha256=expected_journal_sha256,
+                manifest_sha256=manifest_sha,
+                release_sha=release,
+                previous_sha=previous,
+                journal=journal,
+                approved_by=ack.get("approved_by"),
+                approval_reference=ack.get("approval_reference"),
+                allow_timestamp_signature_delta=True,
+            )
+            if (
+                hashlib.sha256(recovery_review_raw).hexdigest()
+                != addendum.get("recovery_review_sha256")
+                or addendum.get("recovery_release_sha")
+                != Path(
+                    recovery_review["observations"]["release_target"]
+                ).name
+            ):
+                raise AdminError("recovery review is not bound to the addendum")
+            activation_release = addendum["recovery_release_sha"]
+            if activation_release not in {release, previous}:
+                raise AdminError("recovery release is not incident-pinned")
+            recovery_lifecycle_transition = {
+                "schema_version": 1,
+                "from_state": "RECOVERY_APPROVED",
+                "to_state": "NORMAL_OPERATION",
+                "journal_sha256": expected_journal_sha256,
+                "acknowledgment_sha256": hashlib.sha256(ack_raw).hexdigest(),
+                "addendum_sha256": addendum_sha256,
+                "verification_report_sha256": addendum.get(
+                    "verification_report_sha256"
+                ),
+                "database_sha256": addendum.get("database_sha256"),
+                "recovery_approved_by": ack.get("approved_by"),
+                "recovery_approval_reference": ack.get("approval_reference"),
+                "activation_approved_by": approved_by,
+                "activation_approval_reference": approval_reference,
+                "release_sha": activation_release,
+            }
+        else:
+            result_name = journal.get("installation_result")
+            result_sha = journal.get("installation_result_sha256")
+            if not isinstance(result_name, str) or not isinstance(result_sha, str):
+                raise AdminError("completed installation result is unavailable")
+            result_raw, _ = _read_at(
+                directory_fd, result_name, owner_uid=owner_uid, mode=0o600
+            )
+            if (
+                hashlib.sha256(result_raw).hexdigest() != result_sha
+                or _json_object(result_raw).get("deployment_pin_sha256")
+                != journal.get("deployment_pin_sha256")
+                or _json_object(result_raw).get("manifest_sha256") != manifest_sha
+            ):
+                raise AdminError("installation report does not match completed deployment")
+            deployment_pin_sha256 = journal.get("deployment_pin_sha256")
+            if (
+                not isinstance(deployment_pin_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", deployment_pin_sha256) is None
+                or _json_object(result_raw).get("deployment_pin_sha256")
+                != deployment_pin_sha256
+            ):
+                raise AdminError("deployment pin identity is invalid")
         intended = {
             SERVICE_NAME: journal.get("service_state"),
             TIMER_NAME: journal.get("backup_timer_state"),
@@ -2196,6 +2604,8 @@ def activate_services(
             for value in intended.values()
         ):
             raise AdminError("saved service states are invalid")
+        if manual_recovery and intended[SERVICE_NAME] != ["active", "enabled"]:
+            raise AdminError("recovery activation must explicitly enable the bot")
         initial_states = state_reader()
         attempts = _read_activation_attempts(
             directory_fd, expected_journal_sha256, owner_uid=owner_uid
@@ -2205,6 +2615,10 @@ def activate_services(
         events: list[dict[str, Any]]
         if attempts:
             attempt_number, activation_id, events = attempts[-1]
+            lifecycle_already_established = any(
+                event.get("schema_version") == 2 for _, _, prior in attempts
+                for event in prior
+            )
             last_event = events[-1]
             if last_event["event"] == "success":
                 if (
@@ -2216,7 +2630,7 @@ def activate_services(
                     )
                     or (
                         intended[SERVICE_NAME][0] == "active"
-                        and not _running_process_matches_release(release)
+                        and not _running_process_matches_release(activation_release)
                     )
                 ):
                     raise AdminError(
@@ -2238,6 +2652,12 @@ def activate_services(
             attempt_number = 1
             activation_id = secrets.token_hex(16)
             events = []
+            lifecycle_already_established = False
+        if lifecycle_already_established:
+            recovery_lifecycle_transition = None
+        elif recovery_lifecycle_transition is not None:
+            recovery_lifecycle_transition["activation_id"] = activation_id
+            recovery_lifecycle_transition["attempt_number"] = attempt_number
         if not events:
             if initial_states.get(SERVICE_NAME) != [
                 "inactive",
@@ -2249,17 +2669,21 @@ def activate_services(
             if _completion_process_present():
                 raise AdminError("an Armory bot process is already running")
         elif _completion_process_present() and not _running_process_matches_release(
-            release
+            activation_release
         ):
             raise AdminError("an unexpected Armory bot process is already running")
-        current = COMPLETION_BASE / "current"
-        if os.readlink(current) != f"releases/{release}" or current.resolve(
-            strict=True
-        ) != (COMPLETION_BASE / "releases" / str(release)):
-            raise AdminError(
-                "current release pointer differs from completed deployment"
+        release_dir = _verify_current_release_pointer(
+            COMPLETION_BASE, activation_release, owner_uid=owner_uid
+        )
+        if manual_recovery:
+            service_uid = pwd.getpwnam("wow-armory").pw_uid
+            service_gid = grp.getgrnam("wow-armory").gr_gid
+            _verify_release_tree(
+                release_dir,
+                service_uid=service_uid,
+                service_gid=service_gid,
+                owner_uid=owner_uid,
             )
-        release_dir = COMPLETION_BASE / "releases" / str(release)
         release_fd = _open_private_directory(
             release_dir,
             owner_uid=owner_uid,
@@ -2275,8 +2699,8 @@ def activate_services(
             )
         finally:
             os.close(release_fd)
-        if marker.decode("ascii").strip() != release:
-            raise AdminError("installation marker differs from completed release")
+        if marker.decode("ascii").strip() != activation_release:
+            raise AdminError("installation marker differs from approved release")
         if database_check is None:
             preflight = subprocess.run(
                 ["/opt/wow-forever-armory-bot/bin/armory-db-preflight"],
@@ -2322,6 +2746,11 @@ def activate_services(
                 observed_states=details.pop("observed_states", state_reader()),
                 **event_fields,
                 **details,
+                lifecycle_transition=(
+                    recovery_lifecycle_transition
+                    if event_type == "success"
+                    else None
+                ),
             )
             events.append(event)
             return event
@@ -2379,7 +2808,7 @@ def activate_services(
                 ):
                     raise AdminError("systemd action did not reach its approved state")
                 if planned["unit"] == SERVICE_NAME and planned["verb"] == "start":
-                    if not check_process(release):
+                    if not check_process(activation_release):
                         raise AdminError(
                             "running bot process is not from approved release"
                         )
@@ -2548,6 +2977,34 @@ def _running_process_matches_release(release_sha: str) -> bool:
     return found
 
 
+def _verify_current_release_pointer(
+    base: Path, release_sha: str, *, owner_uid: int
+) -> Path:
+    """Accept only the canonical relative or exact absolute release symlink."""
+    current = base / "current"
+    target = base / "releases" / release_sha
+    try:
+        before = current.lstat()
+        link_text = os.readlink(current)
+        if (
+            not stat.S_ISLNK(before.st_mode)
+            or before.st_uid != owner_uid
+            or link_text not in {f"releases/{release_sha}", str(target)}
+            or current.resolve(strict=True) != target
+        ):
+            raise AdminError("current release pointer differs from approved release")
+        after = current.lstat()
+        if (
+            _signature(before) != _signature(after)
+            or os.readlink(current) != link_text
+            or current.resolve(strict=True) != target
+        ):
+            raise AdminError("current release pointer changed during verification")
+    except OSError as exc:
+        raise AdminError("current release pointer cannot be verified") from exc
+    return target
+
+
 def acknowledge_incident(
     audit_dir: Path,
     review_record_path: Path,
@@ -2562,6 +3019,7 @@ def acknowledge_incident(
         [Mapping[str, Any], str, str, Path, Mapping[str, Any]], None
     ] = _verify_recovery_evidence,
     checkpoint: Callable[[str], None] | None = None,
+    recovery_addendum_sha256: str | None = None,
 ) -> tuple[str, str]:
     """Verify and idempotently finish an approved incident acknowledgment."""
     if re.fullmatch(r"[0-9a-f]{64}", expected_journal_sha256) is None:
@@ -2572,6 +3030,21 @@ def acknowledge_incident(
         raise AdminError("approval reference is invalid")
     if review_record_path.parent != audit_dir:
         raise AdminError("recovery review record must be in the audit directory")
+    if recovery_addendum_sha256 is not None and (
+        re.fullmatch(r"[0-9a-f]{64}", recovery_addendum_sha256) is None
+        or expected_journal_sha256 != TASK267_JOURNAL_SHA256
+        or evidence_verifier is not _DEFAULT_RECOVERY_EVIDENCE_VERIFIER
+        or state_reader is not _systemd_states
+        or checkpoint is not None
+        or owner_uid != 0
+        or owner_gid != 0
+        or audit_dir != AUDIT_DIR
+        or not re.fullmatch(
+            rf"recovery-review-{expected_journal_sha256}(?:-[0-9a-f]{{64}})?\.json",
+            review_record_path.name,
+        )
+    ):
+        raise AdminError("addendum recovery parameters are not approved")
 
     directory_fd = _open_private_directory(
         audit_dir, owner_uid=owner_uid, exact_mode=0o700
@@ -2627,8 +3100,72 @@ def acknowledge_incident(
         manifest = _json_object(manifest_raw)
         _validate_manifest(journal, manifest, release_sha, previous_sha, audit_dir)
         manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+        addendum_raw = None
+        addendum = None
+        historical_attestation_raw = None
+        historical_review_raw = None
+        staged_report_raw = None
+        if recovery_addendum_sha256 is not None:
+            if manifest_sha256 != TASK267_MANIFEST_SHA256:
+                raise AdminError("addendum manifest hash differs from its pin")
+            addendum_name = f"recovery-addendum-{journal_sha256}.json"
+            addendum_raw, _ = _read_at(
+                directory_fd, addendum_name, owner_uid=owner_uid, mode=0o600
+            )
+            if hashlib.sha256(addendum_raw).hexdigest() != recovery_addendum_sha256:
+                raise AdminError("recovery addendum hash differs from approval")
+            historical_attestation_raw, _ = _read_at(
+                directory_fd,
+                f"task262-attestation-{TASK267_ATTESTATION_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            historical_review_raw, _ = _read_at(
+                directory_fd,
+                f"task262-review-{TASK267_REVIEW_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            if (
+                hashlib.sha256(historical_attestation_raw).hexdigest()
+                != TASK267_ATTESTATION_SHA256
+                or hashlib.sha256(historical_review_raw).hexdigest()
+                != TASK267_REVIEW_SHA256
+            ):
+                raise AdminError("historical recovery evidence hash differs from pin")
+            addendum = _json_object(addendum_raw)
+            validator = load_reviewed_python_source(
+                COMPLETION_AUDIT_VALIDATOR,
+                expected_sha256=RECOVERY_AUDIT_SHA256,
+                owner_uid=owner_uid,
+            )
+            _validate_task267_addendum_with_module(
+                validator,
+                addendum_raw,
+                addendum,
+                journal_sha256=journal_sha256,
+                manifest_sha256=manifest_sha256,
+                approved_release_sha=release_sha,
+                previous_release_sha=previous_sha,
+                journal_database_signature=journal.get("database_signature"),
+            )
+            if (
+                addendum.get("approved_by") != approved_by
+                or addendum.get("approval_reference") != approval_reference
+            ):
+                raise AdminError("CLI approval does not match addendum approval")
         review_name = review_record_path.name
-        if review_name != f"recovery-review-{journal_sha256}.json":
+        if addendum is None:
+            expected_review_name = f"recovery-review-{journal_sha256}.json"
+        else:
+            expected_review_name = (
+                f"recovery-review-{journal_sha256}-"
+                f"{addendum.get('recovery_review_sha256')}.json"
+            )
+        legacy_review_name = f"recovery-review-{journal_sha256}.json"
+        if review_name not in {expected_review_name, legacy_review_name}:
             raise AdminError("recovery review record filename is invalid")
         review_raw, _ = _read_at(
             directory_fd, review_name, owner_uid=owner_uid, mode=0o600
@@ -2643,8 +3180,137 @@ def acknowledge_incident(
             journal=journal,
             approved_by=approved_by,
             approval_reference=approval_reference,
+            allow_timestamp_signature_delta=addendum is not None,
         )
-        evidence_verifier(journal, release_sha, previous_sha, audit_dir, review)
+        if addendum is not None and (
+            addendum.get("approved_at_utc") != review.get("approved_at_utc")
+            or addendum.get("recovery_review_sha256")
+            != hashlib.sha256(review_raw).hexdigest()
+            or review_name
+            != (
+                f"recovery-review-{journal_sha256}-"
+                f"{addendum.get('recovery_review_sha256')}.json"
+            )
+            and review_name != legacy_review_name
+            or addendum.get("recovery_release_sha")
+            != Path(review["observations"]["release_target"]).name
+        ):
+            raise AdminError("addendum and recovery review bindings differ")
+        if addendum is None:
+            if evidence_verifier is _DEFAULT_RECOVERY_EVIDENCE_VERIFIER:
+                _verify_recovery_evidence(
+                    journal,
+                    release_sha,
+                    previous_sha,
+                    audit_dir,
+                    review,
+                    owner_uid=owner_uid,
+                    locked_directory_fd=directory_fd,
+                )
+            else:
+                evidence_verifier(journal, release_sha, previous_sha, audit_dir, review)
+        else:
+            expected_live_signature = addendum["verified_database_signature"]
+            observations = review["observations"]
+            if observations["database_signature"] != expected_live_signature:
+                raise AdminError("review signature differs from approved addendum")
+            report_uid = pwd.getpwnam("nolo-admin").pw_uid
+            report_raw, report_hash = _read_task267_report(report_uid)
+            if report_hash != TASK267_REPORT_SHA256:
+                raise AdminError("fresh verification report hash differs from pin")
+            staged_report_raw, _ = _read_at(
+                directory_fd,
+                f"task267-verification-{TASK267_REPORT_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            if staged_report_raw != report_raw:
+                raise AdminError("staged verification report differs from its source")
+            report = _json_object(report_raw)
+            _validate_task267_report(
+                report,
+                journal,
+                manifest,
+                addendum,
+                journal_sha256=journal_sha256,
+                manifest_sha256=manifest_sha256,
+            )
+            live_db_info = COMPLETION_DATABASE.lstat()
+            live_signature = [
+                live_db_info.st_dev,
+                live_db_info.st_ino,
+                live_db_info.st_size,
+                live_db_info.st_mtime_ns,
+                live_db_info.st_ctime_ns,
+                live_db_info.st_uid,
+                live_db_info.st_gid,
+                live_db_info.st_mode,
+            ]
+            live_hash = _hash_regular_file(
+                COMPLETION_DATABASE,
+                owner_uid=live_db_info.st_uid,
+                owner_gid=live_db_info.st_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            if live_signature != expected_live_signature or live_hash != addendum["database_sha256"]:
+                raise AdminError("live database differs from approved addendum")
+            for suffix in ("-wal", "-shm", "-journal", ".restore-in-progress"):
+                try:
+                    Path(f"{COMPLETION_DATABASE}{suffix}").lstat()
+                except FileNotFoundError:
+                    continue
+                raise AdminError("database sidecar or restore marker is present")
+            try:
+                wow_uid = pwd.getpwnam("wow-armory").pw_uid
+                wow_gid = grp.getgrnam("wow-armory").gr_gid
+            except KeyError as exc:
+                raise AdminError("Armory service identity is unavailable") from exc
+            latest_backup_hash = _hash_regular_file(
+                TASK267_LATEST_BACKUP,
+                owner_uid=wow_uid,
+                owner_gid=wow_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            preflight_hash = _hash_regular_file(
+                Path(journal["shared_preflight_backup"]),
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o700,
+                parent_mode=0o700,
+                locked_directory_fd=directory_fd,
+            )
+            if (
+                latest_backup_hash != TASK267_LATEST_BACKUP_SHA256
+                or preflight_hash != TASK267_PREFLIGHT_SHA256
+                or addendum.get("backup_sha256") != TASK267_INCIDENT_BACKUP_SHA256
+                or addendum.get("latest_backup_sha256") != latest_backup_hash
+                or addendum.get("saved_preflight_sha256") != preflight_hash
+            ):
+                raise AdminError("backup or saved preflight evidence changed")
+            _require_recovery_unit_states(state_reader())
+            if _database_open_handle_count(COMPLETION_DATABASE) != 0:
+                raise AdminError("a process still has the production database open")
+            proof_journal = dict(journal)
+            proof_journal["database_signature"] = expected_live_signature
+            proof_review = dict(review)
+            proof_observations = dict(observations)
+            proof_review["observations"] = proof_observations
+            _verify_recovery_evidence(
+                proof_journal,
+                release_sha,
+                previous_sha,
+                audit_dir,
+                proof_review,
+                base=COMPLETION_BASE,
+                database=COMPLETION_DATABASE,
+                service_uid=wow_uid,
+                service_gid=wow_gid,
+                owner_uid=owner_uid,
+                locked_directory_fd=directory_fd,
+            )
 
         _verify_directory_binding(
             directory_fd, audit_dir, owner_uid=owner_uid, exact_mode=0o700
@@ -2673,19 +3339,116 @@ def acknowledge_incident(
             or final_review != review_raw
         ):
             raise AdminError("recovery evidence changed before archival")
+        if addendum is not None:
+            final_addendum, _ = _read_at(
+                directory_fd,
+                f"recovery-addendum-{journal_sha256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+            )
+            final_historical_attestation, _ = _read_at(
+                directory_fd,
+                f"task262-attestation-{TASK267_ATTESTATION_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            final_historical_review, _ = _read_at(
+                directory_fd,
+                f"task262-review-{TASK267_REVIEW_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            final_staged_report, _ = _read_at(
+                directory_fd,
+                f"task267-verification-{TASK267_REPORT_SHA256}.json",
+                owner_uid=owner_uid,
+                mode=0o600,
+                maximum=2_000_000,
+            )
+            final_report_raw, final_report_hash = _read_task267_report(
+                pwd.getpwnam("nolo-admin").pw_uid
+            )
+            final_db_info = COMPLETION_DATABASE.lstat()
+            final_db_hash = _hash_regular_file(
+                COMPLETION_DATABASE,
+                owner_uid=final_db_info.st_uid,
+                owner_gid=final_db_info.st_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            final_latest_backup = _hash_regular_file(
+                TASK267_LATEST_BACKUP,
+                owner_uid=wow_uid,
+                owner_gid=wow_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            final_incident_backup = _hash_regular_file(
+                Path(journal["database_backup"]),
+                owner_uid=wow_uid,
+                owner_gid=wow_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            final_preflight_hash = _hash_regular_file(
+                Path(journal["shared_preflight_backup"]),
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o700,
+                parent_mode=0o700,
+                locked_directory_fd=directory_fd,
+            )
+            if (
+                final_addendum != addendum_raw
+                or final_historical_attestation != historical_attestation_raw
+                or final_historical_review != historical_review_raw
+                or final_staged_report != staged_report_raw
+                or final_report_hash != TASK267_REPORT_SHA256
+                or final_report_raw != report_raw
+                or final_db_hash != addendum.get("database_sha256")
+                or final_latest_backup != TASK267_LATEST_BACKUP_SHA256
+                or final_incident_backup != TASK267_INCIDENT_BACKUP_SHA256
+                or final_preflight_hash != TASK267_PREFLIGHT_SHA256
+                or [
+                    final_db_info.st_dev,
+                    final_db_info.st_ino,
+                    final_db_info.st_size,
+                    final_db_info.st_mtime_ns,
+                    final_db_info.st_ctime_ns,
+                    final_db_info.st_uid,
+                    final_db_info.st_gid,
+                    final_db_info.st_mode,
+                ] != addendum.get("verified_database_signature")
+                or _database_open_handle_count(COMPLETION_DATABASE) != 0
+            ):
+                raise AdminError("addendum evidence changed before archival")
+            for suffix in ("-wal", "-shm", "-journal", ".restore-in-progress"):
+                try:
+                    Path(f"{COMPLETION_DATABASE}{suffix}").lstat()
+                except FileNotFoundError:
+                    continue
+                raise AdminError("database sidecar appeared before archival")
         _require_recovery_unit_states(state_reader())
 
         ack = {
-            "schema_version": 1,
+            "schema_version": 2 if addendum is not None else 1,
             "journal_sha256": journal_sha256,
             "manifest_sha256": manifest_sha256,
             "approved_release_sha": release_sha,
             "previous_release_sha": previous_sha,
-            "decision": "manual_recovery_verified",
+            "decision": (
+                "manual_recovery_verified_with_addendum"
+                if addendum is not None
+                else "manual_recovery_verified"
+            ),
             "approved_by": approved_by,
             "approval_reference": approval_reference,
             "approved_at_utc": review["approved_at_utc"],
         }
+        if addendum is not None:
+            ack["recovery_addendum_sha256"] = recovery_addendum_sha256
         ack_raw = (
             json.dumps(ack, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("ascii")
@@ -2693,6 +3456,35 @@ def acknowledge_incident(
         def checkpoint_at(name: str) -> None:
             if checkpoint is not None:
                 checkpoint(name)
+
+        def recheck_addendum_quiescence() -> None:
+            if addendum is None:
+                return
+            _require_recovery_unit_states(state_reader())
+            info = COMPLETION_DATABASE.lstat()
+            signature = [
+                info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                info.st_ctime_ns, info.st_uid, info.st_gid, info.st_mode,
+            ]
+            digest = _hash_regular_file(
+                COMPLETION_DATABASE,
+                owner_uid=info.st_uid,
+                owner_gid=info.st_gid,
+                mode=0o600,
+                parent_mode=0o700,
+            )
+            if (
+                signature != addendum.get("verified_database_signature")
+                or digest != addendum.get("database_sha256")
+                or _database_open_handle_count(COMPLETION_DATABASE) != 0
+            ):
+                raise AdminError("database changed or became active before publication")
+            for suffix in ("-wal", "-shm", "-journal", ".restore-in-progress"):
+                try:
+                    Path(f"{COMPLETION_DATABASE}{suffix}").lstat()
+                except FileNotFoundError:
+                    continue
+                raise AdminError("database sidecar appeared before publication")
 
         try:
             os.stat(archive_name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2725,6 +3517,7 @@ def acknowledge_incident(
         elif not active_present:
             raise AdminError("active journal and its archive are both missing")
         else:
+            recheck_addendum_quiescence()
             checkpoint_at("before_archive")
             try:
                 os.link(
@@ -2755,7 +3548,10 @@ def acknowledge_incident(
             checkpoint_at("archive_verified")
 
         if active_present:
-            _require_recovery_unit_states(state_reader())
+            if addendum is None:
+                _require_recovery_unit_states(state_reader())
+            else:
+                recheck_addendum_quiescence()
             active_raw, active_info = _read_at(
                 directory_fd,
                 "deployment-state.json",
@@ -2790,7 +3586,10 @@ def acknowledge_incident(
             or archived_info.st_nlink != 1
         ):
             raise AdminError("archived journal failed byte-for-byte verification")
-        _require_recovery_unit_states(state_reader())
+        if addendum is None:
+            _require_recovery_unit_states(state_reader())
+        else:
+            recheck_addendum_quiescence()
 
         _clean_ack_temporaries(
             directory_fd,
@@ -2816,6 +3615,7 @@ def acknowledge_incident(
             return journal_sha256, manifest_sha256
 
         checkpoint_at("before_ack_publication")
+        recheck_addendum_quiescence()
         _write_new_at(
             directory_fd,
             ack_name,
@@ -2849,6 +3649,12 @@ def _parser() -> argparse.ArgumentParser:
     ack.add_argument("--review-record", type=Path, required=True)
     ack.add_argument("--approved-by", required=True)
     ack.add_argument("--approval-reference", required=True)
+    ack_addendum = commands.add_parser("acknowledge-recovery-addendum")
+    ack_addendum.add_argument("--journal-sha256", required=True)
+    ack_addendum.add_argument("--review-record", type=Path, required=True)
+    ack_addendum.add_argument("--addendum-sha256", required=True)
+    ack_addendum.add_argument("--approved-by", required=True)
+    ack_addendum.add_argument("--approval-reference", required=True)
     finalize = commands.add_parser("finalize-deployment")
     finalize.add_argument("--journal-sha256", required=True)
     finalize.add_argument("--approved-by", required=True)
@@ -2891,6 +3697,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(
                 "Incident archived and acknowledgment written; "
+                f"journal_sha256={journal_sha}; manifest_sha256={manifest_sha}"
+            )
+            return 0
+        if args.command == "acknowledge-recovery-addendum":
+            journal_sha, manifest_sha = acknowledge_incident(
+                AUDIT_DIR,
+                args.review_record,
+                expected_journal_sha256=args.journal_sha256,
+                approved_by=args.approved_by,
+                approval_reference=args.approval_reference,
+                recovery_addendum_sha256=args.addendum_sha256,
+                owner_uid=0,
+                owner_gid=0,
+            )
+            print(
+                "Incident archived with verified recovery addendum; "
                 f"journal_sha256={journal_sha}; manifest_sha256={manifest_sha}"
             )
             return 0

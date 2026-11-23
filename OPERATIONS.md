@@ -175,7 +175,7 @@ separately approved administrator procedure; this documentation does not
 authorize changing production paths.
 
 For the reviewed source in this checkout, the standalone preflight SHA-256 is
-`4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198`. Compare
+`4d525f3c61cb28467c738b2fc985fe3b242c8366b248a3f47167916fc9407bac`. Compare
 the staged copy's hash with this value before the root-controlled run.
 
 ```bash
@@ -257,7 +257,7 @@ that independently recorded value before allowing the copied bundle into Git.
 
 Then, from a trusted administrator terminal, set `BUNDLE_SHA256` to the
 recorded 64-character bundle hash and `SCRIPT_SHA256` to the reviewed script
-hash (`4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198`).
+hash (`4d525f3c61cb28467c738b2fc985fe3b242c8366b248a3f47167916fc9407bac`).
 If a command fails, stop. Do not remove or reuse the partial staging directory;
 have an administrator inspect it and choose a new unused staging root.
 The new repository starts on a separate `staging-import` branch. The bundle
@@ -269,7 +269,7 @@ set -euo pipefail
 RELEASE_SHA='FINAL_REVIEWED_COMMIT'
 BRANCH='release/v2.0.0'
 BUNDLE_SHA256='RECORDED_BUNDLE_SHA256'
-SCRIPT_SHA256='4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198'
+SCRIPT_SHA256='4d525f3c61cb28467c738b2fc985fe3b242c8366b248a3f47167916fc9407bac'
 SOURCE_BUNDLE='/home/codex-dev/wow-armory-v2.0.0.bundle'
 STAGE_ROOT='/var/lib/armory-preflight-staging'
 STAGE="$STAGE_ROOT/$RELEASE_SHA"
@@ -607,6 +607,12 @@ make their saved signature match the current database.
 
 ### Read-only preflight before manual recovery
 
+**TASK 289:** the recovery text below describes the earlier generic workflow.
+For the archived TASK 267 incident and the v2.0.0 release candidate, follow
+[TASK-289-PROD-DEPLOY-RUNBOOK.md](TASK-289-PROD-DEPLOY-RUNBOOK.md) and its
+hash-bound review, addendum, and Recovery-ACK rules. TASK 289 is DEV-only and
+does not authorize PROD execution.
+
 The wrapper deliberately does not switch `current` back automatically after a
 failure once shutdown has started. It leaves both managed units stopped and
 disabled and records `manual_recovery_required`. Before an administrator
@@ -660,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "1d3ee31732df3d6169d5ef7a621d4d426a7f45663c831d26ba061dec26086c3f"
+ADMIN_SHA256 = "dd8c2b03dd921517b1a2504d819699793f7de33a02688c5fe2ceb60e1fbb2fd8"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1319,7 +1325,7 @@ starts services. Historical `manual_recovery_required` incidents remain on
 the separate recovery path and cannot receive activation authorization.
 
 The reviewed helper uses the pinned shared-validator SHA-256
-`a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` and
+`9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e` and
 snapshot-module SHA-256
 `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` in this
 development revision. The administrator must verify the exact reviewed
@@ -1366,7 +1372,7 @@ operation. TASK-200C changes are recorded separately below.
 | --- | --- |
 | `deploy/production_admin.py` | `ce76868d9310708c27faacaf2c5358118d1423219a0e0e71a9ee1967b54c72f0` |
 | `deploy/production_wrapper.py` | `2cb1b4125bceeca95b883e40b48435f7344f1bcaf25d55d534e0f1679062be86` |
-| `deploy/recovery_audit.py` | `a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` |
+| `deploy/recovery_audit.py` | `9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e` |
 | `deploy/production_preflight.py` | `841dfa37ab55d37cb962afbfd1389fdecec3d49385e37c01581f9544e6c2921b` |
 | `deploy/systemd/armory-db-preflight.py` | `ec03ed66495ed89f5e30b973d6c6aac0f968d1052792c03efb0a09871b64317a` |
 | `deploy/production_db_snapshot.py` | `78c59895f76834dd24d32ca7c744c001cae58b656b208c287da4ee0d27a2b313` |
@@ -1380,13 +1386,13 @@ The administrator loader pin above must match `production_admin.py` exactly.
 | File | SHA-256 |
 | --- | --- |
 | `deploy/production_admin.py` | `50ccda68ca6da1466e06fc299b1f805db866f8730aa1a5fc47b0434e4f83a27a` |
-| `deploy/production_preflight.py` | `4f6af9f5327d0c3b90edae1bb1365b5f16d875c4b2cecf82e1701849c7fe4198` |
-| `deploy/systemd/armory-db-preflight.py` | `537f81a208278de85b37610b6ed7be2ff35b034d45316a140540fcee2ff4cd65` |
+| `deploy/production_preflight.py` | `4d525f3c61cb28467c738b2fc985fe3b242c8366b248a3f47167916fc9407bac` |
+| `deploy/systemd/armory-db-preflight.py` | `9567f17e24247470a3e12a5fb8a3d7e617f743ae707de533ff2f9d5ec233b4ec` |
 | `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
 | `deploy/verify_production_backups.py` | `2125b228628cb2a4460a173a27436e4861b89d1d570ca560541a9942e49b9a0d` |
 | `deploy/production_install.py` | `d5ca3bc5d48b2e9562831e1fa16c20c07c944ff85801b5e9ef987df5a329cca0` |
 | `deploy/production_wrapper.py` | `2cb1b4125bceeca95b883e40b48435f7344f1bcaf25d55d534e0f1679062be86` |
-| `deploy/recovery_audit.py` | `a51f2b85ba2b07bb89cd3c556fe3df66705d596707372ddc254a80bf9f039a4d` |
+| `deploy/recovery_audit.py` | `9201ffc0c36c0ed5119eb0af94a9bd2dadeb49b33525d7ca8162752ec317304e` |
 | `deploy/systemd/wow-forever-armory-bot.service` | `e0b04e08957af6634cbd06bd5b55d621b1cfaced888723ba8a286cd9c38bd890` |
 | `deploy/systemd/wow-forever-armory-backup.service` | `6b56dbb5bd6d47252bb7221f8dda304863a81c092b6f01d6192d2729588129d1` |
 
