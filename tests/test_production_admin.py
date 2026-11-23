@@ -454,6 +454,38 @@ class ProductionAdminTests(unittest.TestCase):
                     journal, report, manifest, audit, manifest_raw, owner_uid=self.owner
                 )
 
+    def test_manifest_accepts_active_backup_directory_but_rejects_other_nesting(
+        self,
+    ):
+        release, previous = "a" * 40, "b" * 40
+        audit = self.root / "audit"
+        audit.mkdir(mode=0o700)
+        backup = (
+            "/var/lib/wow-forever-armory-bot/backups/active/"
+            "guild-armory-test.sqlite3"
+        )
+        preflight = str(audit / f"armory-db-preflight.{previous}.py")
+        journal = {
+            "database_backup": backup,
+            "database_backup_sha256": "c" * 64,
+            "shared_preflight_backup": preflight,
+            "shared_preflight_sha256": "d" * 64,
+        }
+        manifest = {
+            "approved_release_sha": release,
+            "previous_release_sha": previous,
+            **journal,
+        }
+        admin._validate_manifest(journal, manifest, release, previous, audit)
+        unexpected = (
+            "/var/lib/wow-forever-armory-bot/backups/unexpected/"
+            "guild-armory-test.sqlite3"
+        )
+        journal["database_backup"] = unexpected
+        manifest["database_backup"] = unexpected
+        with self.assertRaisesRegex(admin.AdminError, "artifact paths"):
+            admin._validate_manifest(journal, manifest, release, previous, audit)
+
     def test_finalize_deployment_resumes_after_active_name_removal(self):
         audit = self.root / "audit"
         audit.mkdir(mode=0o700)

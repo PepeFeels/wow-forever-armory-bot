@@ -906,7 +906,11 @@ def _validate_manifest(
         saved_preflight.name,
     )
     if (
-        backup.parent != Path("/var/lib/wow-forever-armory-bot/backups")
+        backup.parent
+        not in {
+            Path("/var/lib/wow-forever-armory-bot/backups"),
+            Path("/var/lib/wow-forever-armory-bot/backups/active"),
+        }
         or not backup.name.startswith("guild-armory-")
         or backup.suffix != ".sqlite3"
         or saved_preflight.parent != audit_dir

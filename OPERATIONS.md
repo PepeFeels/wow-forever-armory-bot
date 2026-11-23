@@ -564,6 +564,12 @@ directory and still requires the release marker to match. This matches the
 deployment preflight's existing pointer validation and avoids blocking backup
 or bot startup solely because the symlink uses an absolute target.
 
+Finalization accepts deployment backups only from the two managed inventory
+locations: `backups/` and `backups/active/`. Other nested paths remain rejected.
+The active deployment wrapper writes to `backups/active/`; rejecting that
+documented path would leave a successfully installed release impossible to
+finalize.
+
 The deployment wrapper records the database signature after managed services
 have stopped and before the installer starts. If recovery later finds changed
 `mtime_ns` or `ctime_ns`, preserve the original incident signature; do not edit
@@ -673,7 +679,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "4eab58ec53245af1d0610a1695e796ec132d0795aecc439ef553ce93a9f236ed"
+ADMIN_SHA256 = "8eb1302ddde13d93f5e318207a5be919b15a81c733c3a8b95a08ca8353cca273"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
