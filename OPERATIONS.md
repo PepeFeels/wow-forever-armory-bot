@@ -851,7 +851,7 @@ integrity check against both the live database and the verified backup. Replace
 
 ```bash
 sudo -u wow-armory /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA>/.venv/bin/python -I -B -m wow_forever_armory.operations check --database /var/lib/wow-forever-armory-bot/guild-armory.sqlite3
-sudo -u wow-armory /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA>/.venv/bin/python -I -B -m wow_forever_armory.operations check --database /var/lib/wow-forever-armory-bot/backups/<BACKUP_NAME>
+sudo -u wow-armory /opt/wow-forever-armory-bot/releases/<PREVIOUS_SHA>/.venv/bin/python -I -B -m wow_forever_armory.operations check --database /var/lib/wow-forever-armory-bot/backups/active/<BACKUP_NAME>
 sudo systemctl is-active wow-forever-armory-bot.service
 sudo systemctl is-enabled wow-forever-armory-bot.service
 sudo systemctl is-active wow-forever-armory-backup.timer
@@ -1418,7 +1418,7 @@ Run an explicit manual backup (this writes a backup file):
 
 ```bash
 sudo -u wow-armory env ARMORY_DATABASE_PATH=/var/lib/wow-forever-armory-bot/guild-armory.sqlite3 \
-  ARMORY_BACKUP_DIR=/var/lib/wow-forever-armory-bot/backups \
+  ARMORY_BACKUP_DIR=/var/lib/wow-forever-armory-bot/backups/active \
   /opt/wow-forever-armory-bot/current/.venv/bin/python \
   -m wow_forever_armory.operations backup
 ```
@@ -1463,7 +1463,7 @@ Example command (destructive to the active database; requires separate
 approval and a stopped bot):
 
 ```bash
-BACKUP_FILE='/var/lib/wow-forever-armory-bot/backups/guild-armory-YYYYMMDDTHHMMSS.ffffffZ.sqlite3'
+BACKUP_FILE='/var/lib/wow-forever-armory-bot/backups/active/guild-armory-YYYYMMDDTHHMMSS.ffffffZ.sqlite3'
 sudo -u wow-armory env ARMORY_DATABASE_PATH=/var/lib/wow-forever-armory-bot/guild-armory.sqlite3 \
   /opt/wow-forever-armory-bot/current/.venv/bin/python \
   -m wow_forever_armory.operations restore \

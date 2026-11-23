@@ -12,7 +12,7 @@ WorkingDirectory=/opt/wow-forever-armory-bot/current
 EnvironmentFile=/etc/wow-forever-armory-bot/config
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=ARMORY_DATABASE_PATH=/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
-Environment=ARMORY_BACKUP_DIR=/var/lib/wow-forever-armory-bot/backups
+Environment=ARMORY_BACKUP_DIR=/var/lib/wow-forever-armory-bot/backups/active
 Environment=ARMORY_BACKUP_RETENTION=14
 StateDirectory=wow-forever-armory-bot
 StateDirectoryMode=0700

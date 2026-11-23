@@ -44,6 +44,28 @@ class MemoryJournal:
 
 
 class InstallerDiagnosticTests(unittest.TestCase):
+    def test_active_backup_directory_is_created_beside_preserved_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            history = state / "backups"
+            history.mkdir(mode=0o700, parents=True)
+            history.chmod(0o700)
+            old = history / "armory.sqlite3"
+            old.write_bytes(b"opaque preserved history")
+            old.chmod(0o600)
+            before = (old.read_bytes(), old.stat().st_mode, old.stat().st_mtime_ns)
+            active = history / "active"
+            with patch.object(wrapper, "BACKUPS", active):
+                wrapper._ensure_backup_directory(os.getuid(), os.getgid())
+            info = active.lstat()
+            self.assertTrue(active.is_dir())
+            self.assertEqual(info.st_uid, os.getuid())
+            self.assertEqual(info.st_gid, os.getgid())
+            self.assertEqual(info.st_mode & 0o777, 0o700)
+            self.assertEqual((old.read_bytes(), old.stat().st_mode, old.stat().st_mtime_ns), before)
+            self.assertEqual(sorted(path.name for path in history.iterdir()),
+                             ["active", "armory.sqlite3"])
+
     def test_deployment_accepts_stopped_disabled_baseline_without_starting_units(self):
         stopped = {
             wrapper.SERVICE: ("inactive", "disabled"),

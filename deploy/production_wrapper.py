@@ -39,7 +39,7 @@ REPO = BASE / "deployment-checkout"
 CURRENT = BASE / "current"
 RELEASES = BASE / "releases"
 DB = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3")
-BACKUPS = Path("/var/lib/wow-forever-armory-bot/backups")
+BACKUPS = Path("/var/lib/wow-forever-armory-bot/backups/active")
 AUDIT_DIR = Path("/var/lib/armory-deployment-audit")
 JOURNAL_PATH = AUDIT_DIR / "deployment-state.json"
 JOURNAL_TEMP_PATH = AUDIT_DIR / ".deployment-state.json.tmp"
@@ -1013,6 +1013,34 @@ def _backup_inventory(uid: int, gid: int) -> dict[str, tuple[int, ...]]:
     return inventory
 
 
+def _ensure_backup_directory(uid: int, gid: int) -> None:
+    """Create the new active area without touching the preserved legacy tree."""
+    parent = BACKUPS.parent
+    parent_info = parent.lstat()
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != uid
+        or parent_info.st_gid != gid
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise Refusal("the preserved backup parent has unsafe metadata")
+    try:
+        BACKUPS.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = BACKUPS.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise Refusal("the active backup directory has unsafe metadata")
+    _fsync_directory(parent)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -1061,6 +1089,7 @@ def _preserve_preflight() -> tuple[Path, str]:
 def _backup_database(
     uid: int, gid: int
 ) -> tuple[Path, str, dict[str, tuple[int, ...]]]:
+    _ensure_backup_directory(uid, gid)
     before = _backup_inventory(uid, gid)
     _run_as_armory(
         uid,
