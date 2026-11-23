@@ -30,7 +30,7 @@ from typing import Any
 BRANCH = "release/v2.0.0"
 FAILED_V1_RELEASE = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
 APPROVED_PREFLIGHT_SHA256 = (
-    "3587880b5d5c917624afee3137ef1d235ef62e8dc5b047952b5be61b6ce6db43"
+    "3ab1bf66ba00aee7e269dc1dea5a799fa886d49f1ebb09f56fa99cc3beea6da6"
 )
 BASE = Path("/opt/wow-forever-armory-bot")
 REPO = BASE / "deployment-checkout"

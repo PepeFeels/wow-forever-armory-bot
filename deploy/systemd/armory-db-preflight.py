@@ -202,16 +202,25 @@ def armory_process_present(proc_root: Path = Path("/proc")) -> bool:
     return False
 
 
-def _current_release_sha() -> str | None:
+def _current_release_sha(*, expected_owner: int = 0) -> str | None:
     current = INSTALL_BASE / "current"
     try:
         info = current.lstat()
         raw = os.readlink(current)
-        match = re.fullmatch(r"releases/([0-9a-f]{40})", raw)
-        if not stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or match is None:
+        relative = re.fullmatch(r"releases/([0-9a-f]{40})", raw)
+        absolute = re.fullmatch(
+            re.escape(str(INSTALL_BASE / "releases")) + r"/([0-9a-f]{40})",
+            raw,
+        )
+        match = relative or absolute
+        if (
+            not stat.S_ISLNK(info.st_mode)
+            or info.st_uid != expected_owner
+            or match is None
+        ):
             return None
         release = match.group(1)
-        target = INSTALL_BASE / raw
+        target = INSTALL_BASE / "releases" / release
         if current.resolve(strict=True) != target:
             return None
         release_fd = os.open(
@@ -222,7 +231,7 @@ def _current_release_sha() -> str | None:
             release_info = os.fstat(release_fd)
             if (
                 not stat.S_ISDIR(release_info.st_mode)
-                or release_info.st_uid != 0
+                or release_info.st_uid != expected_owner
                 or release_info.st_mode & 0o022
             ):
                 return None
@@ -236,7 +245,7 @@ def _current_release_sha() -> str | None:
                 marker = os.read(marker_fd, 129)
                 if (
                     not stat.S_ISREG(marker_info.st_mode)
-                    or marker_info.st_uid != 0
+                    or marker_info.st_uid != expected_owner
                     or stat.S_IMODE(marker_info.st_mode) != 0o444
                     or marker_info.st_nlink != 1
                     or marker != release.encode("ascii")

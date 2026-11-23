@@ -557,6 +557,13 @@ or backup files. Resolve an unknown result with a separately reviewed
 read-only procedure; do not change service or database state as part of this
 preflight.
 
+The startup database preflight accepts both canonical `releases/<sha>` and
+canonical absolute `/opt/wow-forever-armory-bot/releases/<sha>` values for the
+managed `current` symlink. It resolves both forms to the same exact release
+directory and still requires the release marker to match. This matches the
+deployment preflight's existing pointer validation and avoids blocking backup
+or bot startup solely because the symlink uses an absolute target.
+
 The deployment wrapper records the database signature after managed services
 have stopped and before the installer starts. If recovery later finds changed
 `mtime_ns` or `ctime_ns`, preserve the original incident signature; do not edit
@@ -1994,4 +2001,4 @@ administrative acknowledgment. It does not require a deployment manifest and
 does not modify the database or backup. See `TASK-301-RECOVERY.md` for the
 exact journal identity, command invocation, test evidence, and current GO/NO-GO.
 The corrected deployment preflight source SHA-256 is
-`6d80c03bb1aecb6ef0c117f41974ec59355f6bc47da91fb9d4c527c2263cb8ef`.
+`4b6b664e5c19e3ce1284f722713618ca38de8e24fce431e697a6036492e33ea4`.
