@@ -2999,16 +2999,7 @@ def activate_services(
         if marker.decode("ascii").strip() != activation_release:
             raise AdminError("installation marker differs from approved release")
         if database_check is None:
-            preflight = subprocess.run(
-                ["/opt/wow-forever-armory-bot/bin/armory-db-preflight"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={"PATH": "/usr/bin:/bin", "LANG": "C"},
-                timeout=60,
-                check=False,
-            )
-            if preflight.returncode != 0:
+            if not _activation_database_preflight():
                 raise AdminError(
                     "database/startup preflight refused service activation"
                 )
@@ -3222,6 +3213,23 @@ def _activation_systemctl(action: str, unit: str) -> None:
     )
     if completed.returncode != 0:
         raise AdminError("systemd rejected a service activation action")
+
+
+def _activation_database_preflight() -> bool:
+    completed = subprocess.run(
+        ["/opt/wow-forever-armory-bot/bin/armory-db-preflight"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C",
+            "ARMORY_DATABASE_PATH": str(COMPLETION_DATABASE),
+        },
+        timeout=60,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
 def _emit_activation_report(payload: str) -> None:

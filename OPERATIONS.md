@@ -679,7 +679,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "8eb1302ddde13d93f5e318207a5be919b15a81c733c3a8b95a08ca8353cca273"
+ADMIN_SHA256 = "99ffe29ed335494e8277e5d18f74adff6afb2c4ec32effacdd0e41cd8dd7dafe"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path

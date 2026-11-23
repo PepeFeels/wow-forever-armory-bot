@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 import py_compile
 import tempfile
 import unittest
@@ -50,6 +51,31 @@ class ProductionAdminTests(unittest.TestCase):
             owner_uid=self.owner,
             owner_gid=self.group,
             parent_mode=0o700,
+        )
+
+    def test_activation_database_preflight_receives_explicit_database_path(self):
+        observed = {}
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            observed["environment"] = kwargs["env"]
+            return subprocess.CompletedProcess(argv, 0)
+
+        database = self.root / "guild-armory.sqlite3"
+        with (
+            patch.object(admin, "COMPLETION_DATABASE", database),
+            patch.object(admin.subprocess, "run", side_effect=fake_run),
+        ):
+            self.assertTrue(admin._activation_database_preflight())
+        self.assertEqual(
+            observed["argv"],
+            ["/opt/wow-forever-armory-bot/bin/armory-db-preflight"],
+        )
+        self.assertEqual(
+            observed["environment"]["ARMORY_DATABASE_PATH"], str(database)
+        )
+        self.assertEqual(
+            set(observed["environment"]), {"PATH", "LANG", "ARMORY_DATABASE_PATH"}
         )
 
     def _make_release(self, root: Path) -> Path:
