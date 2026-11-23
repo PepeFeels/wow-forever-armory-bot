@@ -1994,4 +1994,4 @@ administrative acknowledgment. It does not require a deployment manifest and
 does not modify the database or backup. See `TASK-301-RECOVERY.md` for the
 exact journal identity, command invocation, test evidence, and current GO/NO-GO.
 The corrected deployment preflight source SHA-256 is
-`cdcd22a19d2df221a149f594c0f93819da0abe9c28de083127d782f4f48941f7`.
+`ae9782d1f2c9fe4769d3788553f4583fdd0cf467dd248d59540ca9e72b97af1b`.

@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from deploy import production_preflight
+from deploy import production_db_snapshot, production_preflight
 
 EXPECTED_SHA = "d" * 40
 
@@ -355,14 +355,17 @@ class ProductionPreflightTests(unittest.TestCase):
             self.assertIn("read-only", detail)
             self.assertEqual(after, before)
 
-    def test_database_with_wal_is_unknown_without_checkpoint_or_sidecar_changes(
+    def test_database_with_wal_uses_isolated_snapshot_without_sidecar_changes(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "guild-armory.sqlite3"
+            snapshot_root = Path(temporary) / "private-snapshots"
+            snapshot_root.mkdir(mode=0o700)
             connection = sqlite3.connect(database)
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("CREATE TABLE guilds (id INTEGER PRIMARY KEY)")
+            for table in ("guilds", "members", "characters", "flows"):
+                connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
             connection.commit()
             database.chmod(0o600)
             sidecars = [Path(str(database) + suffix) for suffix in ("-wal", "-shm")]
@@ -376,11 +379,21 @@ class ProductionPreflightTests(unittest.TestCase):
             checker.unit_states = {
                 production_preflight.SERVICE: ("inactive", "disabled")
             }
-            status, detail = checker.database(database, "production_database")
+            with (
+                patch.object(
+                    checker,
+                    "_load_snapshot_verifier",
+                    return_value=production_db_snapshot.verify_database_snapshot,
+                ),
+                patch.object(
+                    production_db_snapshot, "SNAPSHOT_ROOT", snapshot_root
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
             after = {item.name: item.read_bytes() for item in sidecars if item.exists()}
             connection.close()
-            self.assertEqual(status, "UNKNOWN")
-            self.assertIn("sidecars", detail)
+            self.assertEqual(status, "PASS", detail)
+            self.assertIn("isolated read-only snapshot", detail)
             self.assertEqual(after, before)
 
     def test_active_service_makes_live_database_check_unknown(self) -> None:

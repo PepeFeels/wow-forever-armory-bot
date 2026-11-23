@@ -39,7 +39,7 @@ Do not run this command as part of this task turn. After it succeeds, independen
 | --- | --- |
 | `deploy/production_admin.py` | `4eab58ec53245af1d0610a1695e796ec132d0795aecc439ef553ce93a9f236ed` |
 | `deploy/production_wrapper.py` | `f8a67bb81e88883c2bc989553720ad5c678083fb6e4378e641669f3aee70672c` |
-| `deploy/production_preflight.py` | `cdcd22a19d2df221a149f594c0f93819da0abe9c28de083127d782f4f48941f7` |
+| `deploy/production_preflight.py` | `ae9782d1f2c9fe4769d3788553f4583fdd0cf467dd248d59540ca9e72b97af1b` |
 | `deploy/recovery_audit.py` | `02465785fa96cf13fce668e8df59d35dfa0bd2d7eb227153ff74f6b7697de5fc` |
 | `deploy/systemd/armory-db-preflight.py` | `3587880b5d5c917624afee3137ef1d235ef62e8dc5b047952b5be61b6ce6db43` |
 | `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |

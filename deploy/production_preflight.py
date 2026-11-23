@@ -2,10 +2,10 @@
 """Read-only checks for a proposed WoW Forever Armory production deployment.
 
 Run with the system Python 3.14 using ``-I -B``. This tool reports findings
-only: it never repairs state, changes files, operates services, or writes to a
-SQLite database. Database checks use SQLite's immutable read-only mode; if
-sidecar files are present, the result is UNKNOWN because they cannot safely be
-included without creating SQLite shared-memory files.
+only: it never repairs state, changes services, or writes to a SQLite source
+database. When SQLite sidecars exist, it uses the hash-pinned snapshot verifier,
+which reads source files without following links and uses a private temporary
+copy under /tmp.
 """
 
 from __future__ import annotations
@@ -45,6 +45,9 @@ UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
 RECOVERY_AUDIT_SHA256 = (
     "02465785fa96cf13fce668e8df59d35dfa0bd2d7eb227153ff74f6b7697de5fc"
+)
+SNAPSHOT_MODULE_SHA256 = (
+    "564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8"
 )
 SYSTEM_PYTHON = "/usr/bin/python3.14"
 VENV_SYMLINK_TARGETS = {
@@ -1192,10 +1195,41 @@ class Preflight:
             if not self._database_path_matches(path, before):
                 return "UNKNOWN", "database path changed while it was being opened"
             if self._sqlite_sidecars_exist(path):
+                try:
+                    snapshot_verifier = self._load_snapshot_verifier()
+                    counts = snapshot_verifier(
+                        path,
+                        expected_owner=self.service_uid,
+                        expected_group=self.service_gid,
+                    )
+                except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                    return (
+                        "UNKNOWN",
+                        "isolated SQLite snapshot could not safely include the "
+                        "database sidecars",
+                    )
+                after = os.fstat(descriptor)
+                if self._file_signature(before) != self._file_signature(after):
+                    return "UNKNOWN", "database changed during snapshot verification"
+                if not self._database_path_matches(path, after):
+                    return "UNKNOWN", "database path changed during snapshot verification"
+                if os.geteuid() == 0:
+                    writer_state = self._run(
+                        ["/usr/bin/systemctl", "is-active", active_unit]
+                    )
+                    if (
+                        writer_state.returncode != 3
+                        or writer_state.stdout.strip() != "inactive"
+                    ):
+                        return (
+                            "UNKNOWN",
+                            "writer state changed or could not be rechecked during "
+                            "SQLite snapshot verification",
+                        )
                 return (
-                    "UNKNOWN",
-                    "SQLite sidecars exist; immutable read-only validation cannot "
-                    "safely include them",
+                    "PASS",
+                    "SQLite integrity and required Armory tables verified from "
+                    f"an isolated read-only snapshot (counts {tuple(counts)})",
                 )
             if os.geteuid() == 0:
                 result = subprocess.run(
@@ -1288,6 +1322,49 @@ class Preflight:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    def _load_snapshot_verifier(self):
+        source = REPO / "deploy/production_db_snapshot.py"
+        parent = source.parent
+        self._metadata(parent, owner=0, directory=True)
+        if not parent.resolve(strict=True) == parent:
+            raise ValueError("snapshot module directory is not canonical")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NOATIME", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(source, flags)
+        try:
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != 0
+                or before.st_gid != 0
+                or stat.S_IMODE(before.st_mode) not in {0o444, 0o644}
+                or before.st_nlink != 1
+                or before.st_size > 1_048_576
+            ):
+                raise ValueError("snapshot module metadata is unsafe")
+            chunks = []
+            while block := os.read(fd, 65536):
+                chunks.append(block)
+            data = b"".join(chunks)
+            after = os.fstat(fd)
+            path_info = source.lstat()
+            if (
+                self._file_signature(before) != self._file_signature(after)
+                or self._file_signature(after) != self._file_signature(path_info)
+                or len(data) != after.st_size
+                or hashlib.sha256(data).hexdigest() != SNAPSHOT_MODULE_SHA256
+            ):
+                raise ValueError("snapshot module changed or hash did not match")
+        finally:
+            os.close(fd)
+        namespace = {"__file__": str(source), "__name__": "_armory_db_snapshot"}
+        exec(compile(data, str(source), "exec", dont_inherit=True), namespace)
+        return namespace["verify_database_snapshot"]
 
     @staticmethod
     def _file_signature(info: os.stat_result) -> tuple[int, ...]:

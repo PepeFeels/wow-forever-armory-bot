@@ -317,7 +317,10 @@ class InstallerDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit"
             audit.mkdir(mode=0o700)
-            wrapper.DeploymentJournal(audit, owner_uid=os.getuid()).assert_no_pending()
+            with patch.object(wrapper, "REPO", Path(__file__).parents[1]):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
             with self.assertRaises(wrapper.Refusal):
                 wrapper.DeploymentJournal(
                     audit / "missing", owner_uid=os.getuid()
@@ -413,7 +416,10 @@ class InstallerDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary)
             self._archive_fixture(audit)
-            wrapper.DeploymentJournal(audit, owner_uid=os.getuid()).assert_no_pending()
+            with patch.object(wrapper, "REPO", Path(__file__).parents[1]):
+                wrapper.DeploymentJournal(
+                    audit, owner_uid=os.getuid()
+                ).assert_no_pending()
 
     def test_deployment_journal_rejects_tampered_hashes_and_missing_approval(self):
         for changes in (
