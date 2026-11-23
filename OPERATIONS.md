@@ -1883,6 +1883,6 @@ TASK 298 candidate hashes:
 | --- | --- |
 | `deploy/recovery_audit.py` | `756155878fb49f902c0ebf15cdb5c18900da6e7715d21188e84c4aa39ace51fb` |
 | `deploy/production_admin.py` | `c3d04a7e4ee3a032b149869dc35f98f415fc0a414293b90806773e1c83052e1d` |
-| `deploy/production_preflight.py` | `0a9a893603701e0fffd3eb2b1b5d6decfe02ba224e9acd4d067bd4d245a1fcaf` |
+| `deploy/production_preflight.py` | `f29967ec9570f3686d486484283973c6b3511a3d5112c51eb91602810597381b` |
 | `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
 | `deploy/systemd/armory-db-preflight.py` | `916b5d57f07bde1b4fe6f45d4617a5aec4053d7733c97db31cc0a80529820014` |
