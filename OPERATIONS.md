@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "13927791d3955978317e3972553153293c0409f5b3aa16f2995091ae39fa5267"
+ADMIN_SHA256 = "c3d04a7e4ee3a032b149869dc35f98f415fc0a414293b90806773e1c83052e1d"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1882,7 +1882,7 @@ TASK 298 candidate hashes:
 | File | SHA-256 |
 | --- | --- |
 | `deploy/recovery_audit.py` | `756155878fb49f902c0ebf15cdb5c18900da6e7715d21188e84c4aa39ace51fb` |
-| `deploy/production_admin.py` | `13927791d3955978317e3972553153293c0409f5b3aa16f2995091ae39fa5267` |
-| `deploy/production_preflight.py` | `a8015be899effb6cf800652fd9abc4ad3a23037e383bc90a4b58584606d37cf0` |
+| `deploy/production_admin.py` | `c3d04a7e4ee3a032b149869dc35f98f415fc0a414293b90806773e1c83052e1d` |
+| `deploy/production_preflight.py` | `0a9a893603701e0fffd3eb2b1b5d6decfe02ba224e9acd4d067bd4d245a1fcaf` |
 | `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
-| `deploy/systemd/armory-db-preflight.py` | `b3ef6962a4f1a08a9dffd2540fd856be7832b66c9876a411f71ff4e0099e9933` |
+| `deploy/systemd/armory-db-preflight.py` | `916b5d57f07bde1b4fe6f45d4617a5aec4053d7733c97db31cc0a80529820014` |
