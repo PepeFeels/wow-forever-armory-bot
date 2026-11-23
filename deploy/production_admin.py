@@ -68,7 +68,7 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8"
+    "7c2e8ab3d60fbc920e945caf595c0cf80b2879462dc01c48d718ee99c1f6d630"
 )
 COMPLETION_SNAPSHOT_MODULE = COMPLETION_BASE / "bin/production_db_snapshot.py"
 SNAPSHOT_MODULE_SHA256 = (

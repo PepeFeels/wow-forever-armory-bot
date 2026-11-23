@@ -35,6 +35,34 @@ LEGACY_SERVICE_ACTIVATION = re.compile(
 PRESERVED_HISTORICAL_AUDIT_DIRECTORIES = frozenset(
     {"reviewed-v2.0.0", "archive"}
 )
+REVIEWED_HISTORY_FILE_MODES = {
+    "production_db_snapshot.py": 0o400,
+    "production_admin.py": 0o400,
+}
+
+
+def _historical_root_mode(name: str) -> int:
+    if name == "reviewed-v2.0.0":
+        return 0o500
+    if name == "archive":
+        return 0o700
+    raise AuditError("historical audit directory name is not approved")
+
+
+def _historical_file_mode(directory_name: str, relative: str, mode: int) -> None:
+    """Accept only the observed read-only historical file classes."""
+    if mode & 0o111:
+        raise AuditError("historical audit executable file is not approved")
+    if mode & 0o022:
+        raise AuditError("historical audit file is group- or world-writable")
+    if directory_name == "reviewed-v2.0.0":
+        filename = relative.removeprefix("reviewed-v2.0.0/")
+        expected = REVIEWED_HISTORY_FILE_MODES.get(filename)
+        if expected is None or relative.count("/") != 1 or mode != expected:
+            raise AuditError("reviewed history file name or read-only mode is not approved")
+        return
+    if not relative.endswith(".json") or mode != 0o600:
+        raise AuditError("historical archive accepts only read-only JSON files")
 RECOVERY_ADDENDUM = re.compile(r"recovery-addendum-([0-9a-f]{64})\.json\Z")
 TASK267_JOURNAL_SHA256 = "f16dd8394724b6e15797d9ac7a7f6f39241cb58dadf86b05347e2372b874e6cb"
 TASK267_MANIFEST_SHA256 = "9628fb0b363b724d9e88349fef9d100aa75297d16bf663a26263e793ac32d116"
@@ -756,7 +784,7 @@ def _historical_directory_snapshot(
         not stat.S_ISDIR(root_before.st_mode)
         or root_before.st_uid != owner
         or root_before.st_gid != group
-        or stat.S_IMODE(root_before.st_mode) != 0o700
+        or stat.S_IMODE(root_before.st_mode) != _historical_root_mode(directory_name)
         or root_before.st_dev != root_device
     ):
         raise AuditError("historical audit directory metadata is unsafe")
@@ -793,6 +821,8 @@ def _historical_directory_snapshot(
                 before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISDIR(before.st_mode):
                     if (
+                        directory_name == "reviewed-v2.0.0"
+                        or
                         before.st_uid != owner
                         or before.st_gid != group
                         or stat.S_IMODE(before.st_mode) != 0o700
@@ -813,11 +843,13 @@ def _historical_directory_snapshot(
                     finally:
                         os.close(child_fd)
                 elif stat.S_ISREG(before.st_mode):
+                    _historical_file_mode(
+                        directory_name, relative, stat.S_IMODE(before.st_mode)
+                    )
                     if (
                         before.st_uid != owner
                         or before.st_gid != group
                         or before.st_nlink != 1
-                        or stat.S_IMODE(before.st_mode) not in {0o600, 0o700}
                         or before.st_dev != root_device
                     ):
                         raise AuditError("historical audit file metadata is unsafe")
@@ -1004,7 +1036,7 @@ def verify_audit_directory(
                     not stat.S_ISDIR(info.st_mode)
                     or info.st_uid != owner
                     or info.st_gid != group
-                    or stat.S_IMODE(info.st_mode) != 0o700
+                    or stat.S_IMODE(info.st_mode) != _historical_root_mode(name)
                     or _identity(info) != identity
                 ):
                     raise AuditError("historical audit directory metadata is unsafe")

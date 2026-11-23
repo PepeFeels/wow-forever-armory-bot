@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "39c6131e4ff215e3dde3948ed510bc36731d310c50c7e659d4747e8a3ce6d3fd"
+ADMIN_SHA256 = "13927791d3955978317e3972553153293c0409f5b3aa16f2995091ae39fa5267"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1842,13 +1842,23 @@ startup preflight.
 The reviewed read-only preflight preserves the existing recovery records and
 uses the exact hash-pinned release validator. The validator accepts only the
 explicit historical directory names `reviewed-v2.0.0/` and `archive/` when the
-caller opts in. It inventories their ordinary files as untrusted hashes; it
-never parses them as recovery evidence. Directory/file ownership, private
-permissions, single-link regular files, same-filesystem traversal, stable
-metadata and before/after snapshots are required. Links, special files,
-unsafe metadata, unrecognized audit-root entries, invalid active evidence,
-or changes during validation still fail closed. Calls that do not opt in retain
-the original strict behavior.
+caller opts in. `reviewed-v2.0.0/` must be root-owned mode `0500` and contain
+only `production_db_snapshot.py` and `production_admin.py`, each root-owned
+mode `0400`. `archive/` and its nested directories must be root-owned mode
+`0700`; its regular JSON files must be root-owned mode `0600`. Their bytes are
+hashed and reported as untrusted history, never parsed as recovery evidence.
+Single-link checks, same-filesystem traversal, stable identities and
+before/after snapshots remain required. Links, special files, unknown review
+files, non-JSON archive files, unsafe permissions, unrecognized audit-root
+entries, invalid active evidence, or changes during validation still fail
+closed. Calls that do not opt in retain the original strict behavior.
+
+The observed regular file `armory-deploy-a1a6a2a` has mode `0750`. The
+validator rejects it: owner execute and group read/execute permissions are not
+needed to inventory untrusted history, and group members could execute that
+file. It is never run or hashed by this path. Its presence therefore keeps the
+read-only preflight at NO-GO until its owner separately establishes a safe
+read-only mode and provenance. No permission change is part of this procedure.
 
 The installed PROD validator remains pinned to its prior SHA until a separately
 approved release is installed. TASK 298 preflight verifies that installed hash,
@@ -1860,8 +1870,8 @@ TASK 298 candidate hashes:
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/recovery_audit.py` | `3142e7160c7a5f45c6a574c4529b61f5a7cdd1b7b88c6e0ebaaf86212a1e36a8` |
-| `deploy/production_admin.py` | `39c6131e4ff215e3dde3948ed510bc36731d310c50c7e659d4747e8a3ce6d3fd` |
-| `deploy/production_preflight.py` | `fd32ac3888ea8d2bda16a403f42c6e14f65be95ad872b6d7184eb288cecf0a33` |
-| `deploy/production_wrapper.py` | `8d951caa75d7f1b3ec9f645e2b7b281b7f6ca76d01ffcf8d15f411b22544ec5a` |
-| `deploy/systemd/armory-db-preflight.py` | `71e1675198bb86242021edbed8e23e73659febb382ea9437c78a6d1c42bbc360` |
+| `deploy/recovery_audit.py` | `7c2e8ab3d60fbc920e945caf595c0cf80b2879462dc01c48d718ee99c1f6d630` |
+| `deploy/production_admin.py` | `13927791d3955978317e3972553153293c0409f5b3aa16f2995091ae39fa5267` |
+| `deploy/production_preflight.py` | `a8015be899effb6cf800652fd9abc4ad3a23037e383bc90a4b58584606d37cf0` |
+| `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
+| `deploy/systemd/armory-db-preflight.py` | `b3ef6962a4f1a08a9dffd2540fd856be7832b66c9876a411f71ff4e0099e9933` |
