@@ -44,7 +44,7 @@ BACKUP_SERVICE = "wow-forever-armory-backup.service"
 UNITS = (SERVICE, BACKUP_TIMER, BACKUP_SERVICE)
 REQUIRED_TABLES = {"guilds", "members", "characters", "flows"}
 RECOVERY_AUDIT_SHA256 = (
-    "7c2e8ab3d60fbc920e945caf595c0cf80b2879462dc01c48d718ee99c1f6d630"
+    "756155878fb49f902c0ebf15cdb5c18900da6e7715d21188e84c4aa39ace51fb"
 )
 SYSTEM_PYTHON = "/usr/bin/python3.14"
 VENV_SYMLINK_TARGETS = {

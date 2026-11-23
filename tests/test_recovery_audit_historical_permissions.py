@@ -142,6 +142,86 @@ def as_root_owned_metadata(audit: Path, callback):
 
 
 class HistoricalAuditPermissionTests(unittest.TestCase):
+    def observed_executable(self, audit: Path, *, payload: bytes = b"x" * 43_813) -> Path:
+        target = audit / "archive" / "pre-wrapper-fix-20261114T184045Z" / "armory-deploy-a1a6a2a"
+        target.parent.mkdir(mode=0o700)
+        target.parent.chmod(0o700)
+        target.write_bytes(payload)
+        target.chmod(0o750)
+        os.utime(target, ns=(1_794_676_808_459_758_687, 1_794_676_808_459_758_687))
+        return target
+
+    def test_exact_task280_file_with_wrong_content_hash_is_rejected_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            make_active_chain(audit)
+            add_observed_safe_history(audit)
+            target = self.observed_executable(audit)
+            before = snapshot(audit)
+            with self.assertRaisesRegex(
+                recovery_audit.AuditError,
+                "TASK 280 historical observation hash does not match",
+            ):
+                as_root_owned_metadata(
+                    audit,
+                    lambda: recovery_audit.verify_audit_directory(
+                        audit, owner=0, group=0, preserved_historical_directories=HISTORICAL
+                    ),
+                )
+            self.assertEqual(snapshot(audit), before)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o750)
+
+    def test_exact_task280_file_rejects_metadata_and_hardlink_deviations(self):
+        for deviation in ("mode", "size", "mtime", "hardlink"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as temporary:
+                audit = Path(temporary) / "audit"
+                make_active_chain(audit)
+                add_observed_safe_history(audit)
+                target = self.observed_executable(audit)
+                if deviation == "mode":
+                    target.chmod(0o740)
+                elif deviation == "size":
+                    target.write_bytes(b"x" * 43_812)
+                    target.chmod(0o750)
+                    os.utime(target, ns=(1_794_676_808_459_758_687,) * 2)
+                elif deviation == "mtime":
+                    os.utime(target, ns=(1_794_676_808_459_758_686,) * 2)
+                else:
+                    os.link(target, target.parent / "second-link")
+                with self.assertRaises(recovery_audit.AuditError):
+                    as_root_owned_metadata(
+                        audit,
+                        lambda: recovery_audit.inventory_historical_audit_directories(
+                            audit, owner=0, group=0, names=HISTORICAL
+                        ),
+                    )
+
+    def test_other_executable_and_symlink_at_history_path_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "audit"
+            make_active_chain(audit)
+            add_observed_safe_history(audit)
+            other = audit / "archive" / "other-executable.json"
+            other.write_bytes(b"not the approved object")
+            other.chmod(0o750)
+            with self.assertRaisesRegex(
+                recovery_audit.AuditError, "historical audit executable file is not approved"
+            ):
+                recovery_audit.verify_audit_directory(
+                    audit, owner=os.getuid(), group=os.getgid(),
+                    preserved_historical_directories=HISTORICAL,
+                )
+            other.unlink()
+            target = audit / "archive" / "pre-wrapper-fix-20261114T184045Z"
+            target.mkdir(mode=0o700)
+            target.chmod(0o700)
+            (target / "armory-deploy-a1a6a2a").symlink_to("/dev/null")
+            with self.assertRaises(recovery_audit.AuditError):
+                recovery_audit.verify_audit_directory(
+                    audit, owner=os.getuid(), group=os.getgid(),
+                    preserved_historical_directories=HISTORICAL,
+                )
+
     def test_exact_observed_structure_rejects_group_executable_0750_file_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit"

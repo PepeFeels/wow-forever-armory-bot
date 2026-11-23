@@ -39,6 +39,10 @@ REVIEWED_HISTORY_FILE_MODES = {
     "production_db_snapshot.py": 0o400,
     "production_admin.py": 0o400,
 }
+TASK280_OBSERVED_HISTORICAL_FILE = "archive/pre-wrapper-fix-20261114T184045Z/armory-deploy-a1a6a2a"
+TASK280_OBSERVED_HISTORICAL_SHA256 = "cf4c6c4cc9219c9f6f84142502b0a4007b0d82c4812252dba9ab2f7ab0342a24"
+TASK280_OBSERVED_HISTORICAL_SIZE = 43_813
+TASK280_OBSERVED_HISTORICAL_MTIME_NS = 1_794_676_808_459_758_687
 
 
 def _historical_root_mode(name: str) -> int:
@@ -51,6 +55,12 @@ def _historical_root_mode(name: str) -> int:
 
 def _historical_file_mode(directory_name: str, relative: str, mode: int) -> None:
     """Accept only the observed read-only historical file classes."""
+    if (
+        directory_name == "archive"
+        and relative == TASK280_OBSERVED_HISTORICAL_FILE
+        and mode == 0o750
+    ):
+        return
     if mode & 0o111:
         raise AuditError("historical audit executable file is not approved")
     if mode & 0o022:
@@ -853,6 +863,16 @@ def _historical_directory_snapshot(
                         or before.st_dev != root_device
                     ):
                         raise AuditError("historical audit file metadata is unsafe")
+                    is_task280_observation = relative == TASK280_OBSERVED_HISTORICAL_FILE
+                    if is_task280_observation and (
+                        before.st_uid != 0
+                        or before.st_gid != 0
+                        or stat.S_IMODE(before.st_mode) != 0o750
+                        or before.st_nlink != 1
+                        or before.st_size != TASK280_OBSERVED_HISTORICAL_SIZE
+                        or before.st_mtime_ns != TASK280_OBSERVED_HISTORICAL_MTIME_NS
+                    ):
+                        raise AuditError("TASK 280 historical observation metadata does not match")
                     file_flags = (
                         os.O_RDONLY
                         | getattr(os, "O_NOFOLLOW", 0)
@@ -881,6 +901,11 @@ def _historical_directory_snapshot(
                             or size != after.st_size
                         ):
                             raise AuditError("historical audit file changed while hashing")
+                        if is_task280_observation and (
+                            size != TASK280_OBSERVED_HISTORICAL_SIZE
+                            or digest.hexdigest() != TASK280_OBSERVED_HISTORICAL_SHA256
+                        ):
+                            raise AuditError("TASK 280 historical observation hash does not match")
                         records.append((relative, "untrusted-file", digest.hexdigest(), _identity(after)))
                     finally:
                         os.close(file_fd)

@@ -1853,12 +1853,23 @@ files, non-JSON archive files, unsafe permissions, unrecognized audit-root
 entries, invalid active evidence, or changes during validation still fail
 closed. Calls that do not opt in retain the original strict behavior.
 
-The observed regular file `armory-deploy-a1a6a2a` has mode `0750`. The
-validator rejects it: owner execute and group read/execute permissions are not
-needed to inventory untrusted history, and group members could execute that
-file. It is never run or hashed by this path. Its presence therefore keeps the
-read-only preflight at NO-GO until its owner separately establishes a safe
-read-only mode and provenance. No permission change is part of this procedure.
+TASK 280's earlier production inventory identifies one exact historical file
+as `prod_observation_only`: `archive/pre-wrapper-fix-20261114T184045Z/armory-deploy-a1a6a2a`,
+SHA-256 `cf4c6c4cc9219c9f6f84142502b0a4007b0d82c4812252dba9ab2f7ab0342a24`,
+root:root, mode `0750`, one link, 43,813 bytes, mtime
+`1794676808459758687` ns. The validator accepts this single exact historical
+entry only if every recorded attribute and its content hash match. It opens
+the object as a regular file with no-follow flags solely to hash and inventory
+it as `untrusted-file`; it never executes, imports, parses or uses it as
+recovery evidence. All other executable historical files remain rejected.
+
+Mode `0750` still grants the owner execute permission and grants the group
+read and execute permission. Group members could execute these bytes outside
+the validator. The exception does not remove that underlying access risk; it
+is narrowly constrained by the independently recorded TASK 280 identity,
+content hash and metadata, and the data remains explicitly untrusted. Any
+metadata, path, size, hash or link-count deviation fails closed. No permission
+change is part of this procedure.
 
 The installed PROD validator remains pinned to its prior SHA until a separately
 approved release is installed. TASK 298 preflight verifies that installed hash,
@@ -1870,7 +1881,7 @@ TASK 298 candidate hashes:
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/recovery_audit.py` | `7c2e8ab3d60fbc920e945caf595c0cf80b2879462dc01c48d718ee99c1f6d630` |
+| `deploy/recovery_audit.py` | `756155878fb49f902c0ebf15cdb5c18900da6e7715d21188e84c4aa39ace51fb` |
 | `deploy/production_admin.py` | `13927791d3955978317e3972553153293c0409f5b3aa16f2995091ae39fa5267` |
 | `deploy/production_preflight.py` | `a8015be899effb6cf800652fd9abc4ad3a23037e383bc90a4b58584606d37cf0` |
 | `deploy/production_wrapper.py` | `684a36b9e8ff37af7daea66c7a519bd5b9e76b02b6180575443f6cf3683f0178` |
