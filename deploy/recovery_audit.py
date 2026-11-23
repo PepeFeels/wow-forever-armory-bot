@@ -655,6 +655,24 @@ def _expected_activation_actions(intended: dict) -> list[dict]:
     return result
 
 
+def _activation_manifest_sha256(
+    directory_fd: int,
+    manifests: dict[str, str],
+    approved_release_sha: object,
+    *,
+    owner: int,
+    group: int,
+) -> str:
+    """Return the manifest hash belonging to this archived release."""
+    if not isinstance(approved_release_sha, str):
+        raise AuditError("service activation release identity is invalid")
+    name = manifests.get(approved_release_sha)
+    if name is None:
+        raise AuditError("service activation has no matching deployment manifest")
+    raw, _ = _read_json(directory_fd, name, owner=owner, group=group)
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _followup_deployment_establishes_normal_operation(
     addendum: object,
     archived_journal: dict,
@@ -1822,6 +1840,13 @@ def verify_audit_directory(
                     "backup_timer_state"
                 ),
             }
+            activation_manifest_sha256 = _activation_manifest_sha256(
+                fd,
+                manifests,
+                archived_journal.get("approved_release_sha"),
+                owner=owner,
+                group=group,
+            )
             grouped: dict[str, list[tuple[int, str, dict]]] = {}
             event_fields = {
                 "schema_version",
@@ -1899,7 +1924,7 @@ def verify_audit_directory(
                     or event.get("completion_ack_sha256")
                     != hashlib.sha256(acknowledgment_raw).hexdigest()
                     or event.get("manifest_sha256")
-                    != hashlib.sha256(manifest_raw).hexdigest()
+                    != activation_manifest_sha256
                     or event.get("installation_result_sha256")
                     != archived_journal.get("installation_result_sha256")
                     or (

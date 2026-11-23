@@ -51,7 +51,7 @@ INSTALLER = BASE / "bin/production_install.py"
 INSTALLER_SHA256 = "0" * 64
 DEPLOYMENT_PIN_SHA256 = "0" * 64
 RECOVERY_AUDIT_SHA256 = (
-    "591d4382c351d3b931fc2e7d4d929c582c3a21551cbfa0109f1dc5adf6caa32b"
+    "337a179787a799fd67ec8d6f9f1e298e1b55e5b0accc21472289cd24dd159dbc"
 )
 PYTHON = Path("/usr/bin/python3.14")
 GIT = Path("/usr/bin/git")

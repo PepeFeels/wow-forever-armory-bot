@@ -424,7 +424,19 @@ class Task267RecoveryAddendumChainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db, incident, latest, report, addendum, *_ = self._temporary_live_evidence(Path(tmp))
             with self._patch_live_evidence_paths(db, incident, latest, report):
-                db.write_bytes(b"normal-runtime-update")
+                import sqlite3
+
+                db.write_bytes(b"")
+                with sqlite3.connect(db) as connection:
+                    connection.execute("CREATE TABLE characters (name TEXT NOT NULL)")
+                    connection.executemany(
+                        "INSERT INTO characters (name) VALUES (?)",
+                        [(f"Character {number}",) for number in range(1, 6)],
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM characters").fetchone()[0],
+                        5,
+                    )
                 with self.assertRaisesRegex(recovery_audit.AuditError, "database is missing or changed"):
                     recovery_audit._verify_task267_live_files(addendum)
                 recovery_audit._verify_task267_live_files(
@@ -818,6 +830,35 @@ class Task267RecoveryAddendumChainTests(unittest.TestCase):
         raw = json.dumps(self.addendum, sort_keys=True).encode("ascii")
         changed = raw + b" "
         self.assertNotEqual(hashlib.sha256(raw).digest(), hashlib.sha256(changed).digest())
+
+    def test_activation_manifest_hash_is_bound_to_its_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first_release = "1" * 40
+            second_release = "2" * 40
+            first_raw = b'{"approved_release_sha":"' + first_release.encode() + b'"}\n'
+            second_raw = b'{"approved_release_sha":"' + second_release.encode() + b'"}\n'
+            first = directory / f"deployment-{first_release}.json"
+            second = directory / f"deployment-{second_release}.json"
+            first.write_bytes(first_raw)
+            second.write_bytes(second_raw)
+            first.chmod(0o600)
+            second.chmod(0o600)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                actual = recovery_audit._activation_manifest_sha256(
+                    directory_fd,
+                    {
+                        first_release: first.name,
+                        second_release: second.name,
+                    },
+                    second_release,
+                    owner=os.geteuid(),
+                    group=os.getegid(),
+                )
+            finally:
+                os.close(directory_fd)
+            self.assertEqual(actual, hashlib.sha256(second_raw).hexdigest())
 
 
 if __name__ == "__main__":
