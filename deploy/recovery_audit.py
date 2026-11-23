@@ -12,6 +12,7 @@ import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 
 class AuditError(ValueError):
@@ -168,6 +169,20 @@ def _identity(info: os.stat_result) -> tuple[int, ...]:
         info.st_size,
         info.st_mtime_ns,
         info.st_ctime_ns,
+    )
+
+
+def _valid_sidecar_evidence(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"-wal", "-shm", "-journal"}:
+        return False
+    return all(
+        item is None
+        or (
+            isinstance(item, list)
+            and len(item) == 8
+            and all(type(number) is int and number >= 0 for number in item)
+        )
+        for item in value.values()
     )
 
 
@@ -1308,8 +1323,9 @@ def verify_audit_directory(
                 expected_evidence_keys = {
                     "release_target", "installation_marker", "database_signature",
                     "database_sha256", "database_integrity", "database_counts",
+                    "database_sidecars",
                     "backup_path", "backup_sha256", "backup_integrity",
-                    "backup_counts", "historical_preflight_path",
+                    "backup_counts", "backup_sidecars", "historical_preflight_path",
                     "historical_preflight_sha256", "systemd_states",
                     "armory_process_count",
                 }
@@ -1326,10 +1342,12 @@ def verify_audit_directory(
                     or evidence.get("database_sha256") != TASK301_DATABASE_SHA256
                     or evidence.get("database_integrity") != "ok"
                     or evidence.get("database_counts") != [1, 4, 4]
+                    or not _valid_sidecar_evidence(evidence.get("database_sidecars"))
                     or evidence.get("backup_path") != str(TASK301_BACKUP_PATH)
                     or evidence.get("backup_sha256") != TASK301_BACKUP_SHA256
                     or evidence.get("backup_integrity") != "ok"
                     or evidence.get("backup_counts") != [1, 4, 4]
+                    or not _valid_sidecar_evidence(evidence.get("backup_sidecars"))
                     or evidence.get("historical_preflight_path")
                     != str(TASK301_HISTORICAL_PREFLIGHT_PATH)
                     or evidence.get("historical_preflight_sha256")

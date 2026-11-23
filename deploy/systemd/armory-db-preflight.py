@@ -112,7 +112,7 @@ def _read_audit_json(
 
 
 RECOVERY_AUDIT_SHA256 = (
-    "5146e2fa401a07883fdafd63d280865c34fccc388ef578a98bc0c3473ef5c23d"
+    "990cc8b5d8631d192766210b4fbf418ea2831b96ba05d81399adbc845ddca778"
 )
 
 

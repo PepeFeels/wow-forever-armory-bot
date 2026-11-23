@@ -81,7 +81,7 @@ COMPLETION_DATABASE = Path("/var/lib/wow-forever-armory-bot/guild-armory.sqlite3
 COMPLETION_INSTALLER = COMPLETION_BASE / "bin/production_install.py"
 COMPLETION_AUDIT_VALIDATOR = COMPLETION_BASE / "bin/recovery_audit.py"
 RECOVERY_AUDIT_SHA256 = (
-    "5146e2fa401a07883fdafd63d280865c34fccc388ef578a98bc0c3473ef5c23d"
+    "990cc8b5d8631d192766210b4fbf418ea2831b96ba05d81399adbc845ddca778"
 )
 TASK301_JOURNAL_SHA256 = "b957b1735570ad821ddbc5f4f8bcaa82ca635e1393394a439879bef531a7f4ca"
 TASK301_RELEASE_SHA = "fa15f4e3095fad60ff48a059f7ce07414633d07d"
@@ -3725,6 +3725,37 @@ def _task301_database_signature(path: Path) -> list[int]:
     ]
 
 
+def _task301_sqlite_sidecars(path: Path, *, owner_uid: int, owner_gid: int) -> dict[str, Any]:
+    """Capture stable, read-only identities for SQLite sidecar files."""
+    result: dict[str, Any] = {}
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            info = sidecar.lstat()
+        except FileNotFoundError:
+            result[suffix] = None
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != owner_uid
+            or info.st_gid != owner_gid
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise AdminError("SQLite sidecar metadata is unsafe")
+        result[suffix] = [
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_uid,
+            info.st_gid,
+            info.st_mode,
+        ]
+    return result
+
+
 def _task301_pre_shutdown_evidence(
     journal: Mapping[str, Any],
     *,
@@ -3787,6 +3818,9 @@ def _task301_pre_shutdown_evidence(
         or stat.S_IMODE(db_info.st_mode) != 0o600
     ):
         raise AdminError("production database ownership or mode is unsafe")
+    db_sidecars = _task301_sqlite_sidecars(
+        database, owner_uid=service_uid, owner_gid=service_gid
+    )
     db_hash = _hash_regular_file(
         database,
         owner_uid=service_uid,
@@ -3804,6 +3838,14 @@ def _task301_pre_shutdown_evidence(
     )
     if tuple(db_counts) != (1, 4, 4):
         raise AdminError("production database contents differ from reviewed evidence")
+    if (
+        _task301_database_signature(database) != db_signature
+        or _task301_sqlite_sidecars(
+            database, owner_uid=service_uid, owner_gid=service_gid
+        )
+        != db_sidecars
+    ):
+        raise AdminError("production database or sidecars changed during snapshot")
 
     if (
         journal.get("database_backup") != str(backup)
@@ -3822,6 +3864,9 @@ def _task301_pre_shutdown_evidence(
     )
     if backup_hash != TASK301_BACKUP_SHA256:
         raise AdminError("registered backup hash differs from reviewed evidence")
+    backup_sidecars = _task301_sqlite_sidecars(
+        backup, owner_uid=service_uid, owner_gid=service_gid
+    )
     backup_counts = snapshot_verifier(
         backup,
         expected_owner=service_uid,
@@ -3830,6 +3875,10 @@ def _task301_pre_shutdown_evidence(
     )
     if tuple(backup_counts) != (1, 4, 4):
         raise AdminError("registered backup contents differ from reviewed evidence")
+    if _task301_sqlite_sidecars(
+        backup, owner_uid=service_uid, owner_gid=service_gid
+    ) != backup_sidecars:
+        raise AdminError("registered backup sidecars changed during snapshot")
 
     historical_hash = _hash_regular_file(
         historical_preflight,
@@ -3862,10 +3911,12 @@ def _task301_pre_shutdown_evidence(
         "database_sha256": db_hash,
         "database_integrity": "ok",
         "database_counts": list(db_counts),
+        "database_sidecars": db_sidecars,
         "backup_path": str(backup),
         "backup_sha256": backup_hash,
         "backup_integrity": "ok",
         "backup_counts": list(backup_counts),
+        "backup_sidecars": backup_sidecars,
         "historical_preflight_path": str(historical_preflight),
         "historical_preflight_sha256": historical_hash,
         "systemd_states": states,

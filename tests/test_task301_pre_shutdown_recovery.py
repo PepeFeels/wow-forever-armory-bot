@@ -178,6 +178,27 @@ class Task301PreShutdownRecoveryTests(unittest.TestCase):
         self.assertEqual(args.command, "acknowledge-pre-shutdown-recovery")
         self.assertEqual(args.journal_sha256, self.journal_hash)
 
+    def test_sqlite_sidecars_are_metadata_bound_and_unsafe_files_fail_closed(self):
+        wal = Path(f"{self.database}-wal")
+        wal.write_bytes(b"stable sidecar bytes")
+        wal.chmod(0o600)
+        first = admin._task301_sqlite_sidecars(
+            self.database, owner_uid=self.uid, owner_gid=self.gid
+        )
+        self.assertIsInstance(first["-wal"], list)
+        self.assertIsNone(first["-shm"])
+        wal.write_bytes(b"changed sidecar bytes")
+        wal.chmod(0o600)
+        second = admin._task301_sqlite_sidecars(
+            self.database, owner_uid=self.uid, owner_gid=self.gid
+        )
+        self.assertNotEqual(first["-wal"], second["-wal"])
+        wal.chmod(0o644)
+        with self.assertRaisesRegex(admin.AdminError, "sidecar metadata"):
+            admin._task301_sqlite_sidecars(
+                self.database, owner_uid=self.uid, owner_gid=self.gid
+            )
+
     def test_retry_after_success_is_idempotent(self):
         first = self._run()
         second = self._run(

@@ -666,7 +666,7 @@ legacy_installer = base / "bin/production_install.py"
 reviewed_candidate = Path(
     "/var/lib/armory-preflight-staging/<FINAL_REVIEWED_SHA>/candidate"
 )
-ADMIN_SHA256 = "6c95fa1171fa431acbd7a1e6cdfd5eed7a97ae7f5fec2b83a38cb22e8c11ba38"
+ADMIN_SHA256 = "62bd1730486c09cf58e03fc33cbd6af39f593549bc479668ba9df4caf87d598f"
 
 def load_source(path, expected_sha256):
     assert path.is_absolute() and path.resolve(strict=True) == path
@@ -1994,4 +1994,4 @@ administrative acknowledgment. It does not require a deployment manifest and
 does not modify the database or backup. See `TASK-301-RECOVERY.md` for the
 exact journal identity, command invocation, test evidence, and current GO/NO-GO.
 The corrected deployment preflight source SHA-256 is
-`6ff1b97b8cc35829daf88c1ab853c31b8e251346215001eb667eedfe55d55e93`.
+`924fb91f89785d0b063c16f3e1cfcd1761bae8693ae0634178383759b16b6e8e`.

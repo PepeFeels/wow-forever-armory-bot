@@ -10,7 +10,7 @@ Before the correction, a pre-shutdown failure after `backup_verified` could not 
 
 ## Tests
 
-The deployment/recovery and release-metadata suite passed: **334 passed, 75 subtests passed**. The full repository suite passed: **519 passed, 142 subtests passed**. Tests ran with `PYTHONPATH=src` so they import this candidate checkout. Earlier missing-module and Discord setup/sync errors came from the shared virtual environment importing an older, separate checkout; this candidate contains `wow_forever_armory.command_sync`, and no Discord code changes were needed. The test run reported only upstream `asyncio.iscoroutinefunction` deprecation warnings.
+The deployment/recovery and release-metadata suite passed: **335 passed, 75 subtests passed**. The full repository suite passed: **520 passed, 142 subtests passed**. Tests ran with `PYTHONPATH=src` so they import this candidate checkout. Earlier missing-module and Discord setup/sync errors came from the shared virtual environment importing an older, separate checkout; this candidate contains `wow_forever_armory.command_sync`, and no Discord code changes were needed. The test run reported only upstream `asyncio.iscoroutinefunction` deprecation warnings.
 
 ## Production evidence and exact safe next action
 
@@ -18,7 +18,7 @@ The administrator's read-only diagnostic output confirms current release `dcceeb
 
 ## Recovery decision
 
-The ordinary `acknowledge-recovery` path requires a manifest and cannot process this interrupted phase. This commit adds the narrowly pinned command `acknowledge-pre-shutdown-recovery`. It accepts only the exact journal SHA above and rechecks the current release pointer/marker, production DB SHA and isolated SQLite snapshot, registered backup SHA and snapshot, historical preflight SHA, all three systemd states, and zero Armory processes. It repeats the checks around acknowledgment publication to detect changes during the operation. Any mismatch stops before removing the active journal name. On success, it hard-links the exact journal bytes to `deployment-state-<sha>.json`, writes a schema 3 acknowledgment with fresh evidence and administrator approval, then removes only the active journal name; the original journal remains byte-identical in the archive. Both `recovery_audit.py` and startup preflight verify the archive/ack pair without a deployment manifest. The database and backup are read-only.
+The ordinary `acknowledge-recovery` path requires a manifest and cannot process this interrupted phase. This commit adds the narrowly pinned command `acknowledge-pre-shutdown-recovery`. It accepts only the exact journal SHA above and rechecks the current release pointer/marker, production DB SHA and isolated SQLite snapshot, registered backup SHA and snapshot, historical preflight SHA, all three systemd states, and zero Armory processes. It also binds SQLite WAL/SHM/journal sidecar identities across the repeated snapshots. Any mismatch stops before removing the active journal name. On success, it hard-links the exact journal bytes to `deployment-state-<sha>.json`, writes a schema 3 acknowledgment with fresh evidence and administrator approval, then removes only the active journal name; the original journal remains byte-identical in the archive. Both `recovery_audit.py` and startup preflight verify the archive/ack pair without a deployment manifest. The database and backup are read-only.
 
 After the corrected candidate and root-owned admin tool have been staged and independently hash-checked, the administrator recovery invocation is:
 
@@ -37,11 +37,11 @@ Do not run this command as part of this task turn. After it succeeds, independen
 
 | File | SHA-256 |
 | --- | --- |
-| `deploy/production_admin.py` | `6c95fa1171fa431acbd7a1e6cdfd5eed7a97ae7f5fec2b83a38cb22e8c11ba38` |
-| `deploy/production_wrapper.py` | `b67ce47220c7f002d9cb6111fa6ce6bb8c4a570e2b1250756c720e2c7866920c` |
-| `deploy/production_preflight.py` | `6ff1b97b8cc35829daf88c1ab853c31b8e251346215001eb667eedfe55d55e93` |
-| `deploy/recovery_audit.py` | `5146e2fa401a07883fdafd63d280865c34fccc388ef578a98bc0c3473ef5c23d` |
-| `deploy/systemd/armory-db-preflight.py` | `bf93b4973b6df18cb80161e95db268e74e7f301a46d5c5e33c37eed8404fc70b` |
+| `deploy/production_admin.py` | `62bd1730486c09cf58e03fc33cbd6af39f593549bc479668ba9df4caf87d598f` |
+| `deploy/production_wrapper.py` | `450d8e15b7e3731f93df08b8452a97c16e1ddb3b392fdd92dabb95b728790591` |
+| `deploy/production_preflight.py` | `924fb91f89785d0b063c16f3e1cfcd1761bae8693ae0634178383759b16b6e8e` |
+| `deploy/recovery_audit.py` | `990cc8b5d8631d192766210b4fbf418ea2831b96ba05d81399adbc845ddca778` |
+| `deploy/systemd/armory-db-preflight.py` | `fa920864ea21e9c3152f0999455984a8ff9d6100fc50b269e0b8c40144e6ff1f` |
 | `deploy/production_db_snapshot.py` | `564fb40f430c9f96434ab03a3e008a631a7cb7e556f1f63b16f4e9357c2111c8` |
 | `deploy/task301_readonly_diagnostics.py` | `da23624be35d1353f50a2efdff03e3c464569db84de6608ecc0fe0c3841d654d` |
 
