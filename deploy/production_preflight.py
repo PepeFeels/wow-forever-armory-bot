@@ -1477,7 +1477,9 @@ class Preflight:
 
     @classmethod
     def _verify_archived_deployments(cls, audit: Path, *, owner: int) -> int:
-        source = Path(__file__).with_name("recovery_audit.py")
+        # The standalone preflight is copied next to the staging root, while
+        # the reviewed validator remains in the protected production checkout.
+        source = REPO / "deploy/recovery_audit.py"
         fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
             info = os.fstat(fd)

@@ -1082,6 +1082,25 @@ class ProductionPreflightTests(unittest.TestCase):
                 checker._verify_archived_deployments(audit, owner=os.getuid()), 0
             )
 
+    def test_archived_audit_uses_validator_from_protected_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            (checkout / "deploy").mkdir(parents=True)
+            source = Path(__file__).parents[1] / "deploy/recovery_audit.py"
+            validator = checkout / "deploy/recovery_audit.py"
+            validator.write_bytes(source.read_bytes())
+            validator.chmod(0o444)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            with patch.object(production_preflight, "REPO", checkout):
+                self.assertEqual(
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    ),
+                    0,
+                )
+
     def test_preflight_rejects_manifest_without_prior_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary)
