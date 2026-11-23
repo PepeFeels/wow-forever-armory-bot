@@ -303,17 +303,19 @@ def _verify_task267_live_files(
     )
     if report_hash != TASK267_REPORT_SHA256:
         raise AuditError("fresh verification report is missing or changed")
+    # Preserved shared preflights are immutable audit evidence and are
+    # installed read-only (0444), not executable helper files.
     static_files = (
-        (TASK267_PREFLIGHT_PATH, TASK267_PREFLIGHT_SHA256, True),
-        (TASK267_ATTESTATION_PATH, TASK267_ATTESTATION_SHA256, False),
-        (TASK267_REVIEW_PATH, TASK267_REVIEW_SHA256, False),
+        (TASK267_PREFLIGHT_PATH, TASK267_PREFLIGHT_SHA256, 0o444),
+        (TASK267_ATTESTATION_PATH, TASK267_ATTESTATION_SHA256, 0o600),
+        (TASK267_REVIEW_PATH, TASK267_REVIEW_SHA256, 0o600),
     )
-    for path, expected, executable in static_files:
+    for path, expected, mode in static_files:
         actual, _ = _hash_pinned_path(
             path,
             owner=TASK267_ADMIN_UID,
             group=TASK267_ADMIN_GID,
-            mode=0o700 if executable else 0o600,
+            mode=mode,
             parent_owner=TASK267_ADMIN_UID,
             parent_mode=0o700,
             maximum=2_000_000,

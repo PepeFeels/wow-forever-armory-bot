@@ -91,7 +91,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_preflight_documented_hash_matches_committed_source(self) -> None:
         root = Path(__file__).parents[1]
         operations = (root / "OPERATIONS.md").read_text(encoding="utf-8")
-        expected = "58d1292fa948822cfd53797471e8778ab046dbe024cb830493cbe5d486ba5ecd"
+        expected = "e4029e9982d07cac54bac0fc011391de70fc36c0fcac617a747ff3260849a9fa"
         actual = hashlib.sha256(
             (root / "deploy/production_preflight.py").read_bytes()
         ).hexdigest()

@@ -322,7 +322,7 @@ class Task267RecoveryAddendumChainTests(unittest.TestCase):
         audit_dir.mkdir(mode=0o700)
         preflight = audit_dir / "preflight.py"
         preflight.write_bytes(b"synthetic preflight")
-        preflight.chmod(0o700)
+        preflight.chmod(0o444)
         attestation = audit_dir / "attestation.json"
         attestation.write_bytes(b"synthetic attestation")
         attestation.chmod(0o600)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import grp
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -142,6 +143,34 @@ def as_root_owned_metadata(audit: Path, callback):
 
 
 class HistoricalAuditPermissionTests(unittest.TestCase):
+    def test_pinned_preserved_preflight_is_verified_as_read_only_evidence(self) -> None:
+        service_uid = 4242
+        service_gid = 4343
+        expected_by_path = {
+            recovery_audit.TASK267_REPORT_PATH: recovery_audit.TASK267_REPORT_SHA256,
+            recovery_audit.TASK267_PREFLIGHT_PATH: recovery_audit.TASK267_PREFLIGHT_SHA256,
+            recovery_audit.TASK267_ATTESTATION_PATH: recovery_audit.TASK267_ATTESTATION_SHA256,
+            recovery_audit.TASK267_REVIEW_PATH: recovery_audit.TASK267_REVIEW_SHA256,
+            recovery_audit.TASK267_INCIDENT_BACKUP_PATH: recovery_audit.TASK267_INCIDENT_BACKUP_SHA256,
+            recovery_audit.TASK267_LATEST_BACKUP_PATH: recovery_audit.TASK267_LATEST_BACKUP_SHA256,
+        }
+        observed_modes = {}
+
+        def fake_hash(path, **kwargs):
+            observed_modes[path] = kwargs["mode"]
+            return expected_by_path[path], None
+
+        with (
+            patch.object(recovery_audit.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=service_uid)),
+            patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=service_gid)),
+            patch.object(recovery_audit, "_hash_pinned_path", side_effect=fake_hash),
+            patch.object(recovery_audit, "_verify_task267_normal_database_metadata"),
+        ):
+            recovery_audit._verify_task267_live_files({}, normal_operation=True)
+
+        self.assertEqual(observed_modes[recovery_audit.TASK267_PREFLIGHT_PATH], 0o444)
+        self.assertEqual(observed_modes[recovery_audit.TASK267_ATTESTATION_PATH], 0o600)
+
     def _write_attestation_pair(self, audit: Path, canonical: bytes, duplicate: bytes) -> tuple[Path, Path]:
         canonical_path = audit / recovery_audit.TASK267_ATTESTATION_PATH.name
         duplicate_path = audit / recovery_audit.RECOVERY_ATTESTATION_DUPLICATE_NAME
