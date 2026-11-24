@@ -22,21 +22,42 @@ import sys
 import tarfile
 from pathlib import Path
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from deploy.production_db_snapshot import verify_database_snapshot
+APPROVED_REPO = Path("/opt/wow-forever-armory-bot/deployment-checkout")
+INSTALLED_HELPER = Path("/opt/wow-forever-armory-bot/bin/production_install.py")
+SYSTEM_PYTHON = Path("/usr/bin/python3.14")
+VENV_SYMLINK_TARGETS = {
+    ".venv/lib64": "lib",
+    ".venv/bin/python": "python3.14",
+    ".venv/bin/python3": "python3.14",
+    ".venv/bin/python3.14": "/usr/bin/python3.14",
+    ".venv/bin/𝜋thon": "python3.14",
+}
 
-BASE_CHECKPOINT_SHA = "c99e21f9afc6b9e4d5df0a8668a31f9ab9031dce"
-BRANCH = "release/v1.1.4"
+# Importing the snapshot helper must not dirty the trusted source checkout.
+sys.dont_write_bytecode = True
+
+if not __package__:
+    script_path = Path(__file__).resolve()
+    import_root = (
+        APPROVED_REPO if script_path == INSTALLED_HELPER else script_path.parent.parent
+    )
+    sys.path.insert(0, str(import_root))
+from deploy.production_db_snapshot import verify_database_snapshot  # noqa: E402
+
+BASE_CHECKPOINT_SHA = "a1a6a2ad95302f7e3c4900f18e91691f43631e18"
+BRANCH = "release/v2.0.0"
 SERVICE_USER = "wow-armory"
 BASE = Path("/opt/wow-forever-armory-bot")
 ETC = Path("/etc/wow-forever-armory-bot")
 STATE = Path("/var/lib/wow-forever-armory-bot")
+SYSTEMD_DIRECTORY = Path("/etc/systemd/system")
 UNIT_FILES = (
     "wow-forever-armory-bot.service",
     "wow-forever-armory-backup.service",
     "wow-forever-armory-backup.timer",
 )
+PREVIOUS_BACKUP_UNIT_SHA256 = "e5c4497e36a31c93e4418472e390db9e45e3590a726df6f10b7ef41a3eb72b70"
+RELEASE_BACKUP_UNIT_SHA256 = "4d2358635efbc02394ed99f7cbaf84b8a1620188399aee0b3185bcb23bfe97b0"
 ENABLEABLE_UNITS = (
     "wow-forever-armory-bot.service",
     "wow-forever-armory-backup.timer",
@@ -52,6 +73,12 @@ CONFIG_KEYS = {
 class InstallError(RuntimeError):
     """Safe installation failure with no credential data in the message."""
 
+    diagnostic_category = "installer_rejected"
+
+    def __init__(self, message: str, *, category: str = "installer_rejected") -> None:
+        self.diagnostic_category = category
+        super().__init__(message)
+
 
 def _read_regular_file(
     path: str | Path,
@@ -64,7 +91,9 @@ def _read_regular_file(
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise InstallError("input file is unavailable") from exc
+        raise InstallError(
+            "input file is unavailable", category="input_rejected"
+        ) from exc
     try:
         info = os.fstat(descriptor)
         mode = stat.S_IMODE(info.st_mode)
@@ -77,10 +106,15 @@ def _read_regular_file(
                 else bool(mode & 0o027) or mode & 0o600 != 0o600
             )
         ):
-            raise InstallError("input file ownership or permissions are unsafe")
+            raise InstallError(
+                "input file ownership or permissions are unsafe",
+                category="input_rejected",
+            )
         data = os.read(descriptor, maximum_bytes + 1)
         if len(data) > maximum_bytes:
-            raise InstallError("input file is larger than permitted")
+            raise InstallError(
+                "input file is larger than permitted", category="input_rejected"
+            )
         return data
     finally:
         os.close(descriptor)
@@ -93,7 +127,9 @@ def validate_config(config: str | Path, *, expected_owner: int = 0) -> None:
             config, expected_owner=expected_owner, maximum_bytes=65536
         ).decode("utf-8")
     except UnicodeError as exc:
-        raise InstallError("configuration file is unavailable") from exc
+        raise InstallError(
+            "configuration file is unavailable", category="input_rejected"
+        ) from exc
     settings: dict[str, str] = {}
     for line in content.splitlines():
         stripped = line.strip()
@@ -102,23 +138,33 @@ def validate_config(config: str | Path, *, expected_owner: int = 0) -> None:
         key, separator, value = stripped.partition("=")
         if not separator or key not in CONFIG_KEYS or key in settings:
             raise InstallError(
-                "configuration contains unsupported or duplicate settings"
+                "configuration contains unsupported or duplicate settings",
+                category="input_rejected",
             )
         settings[key] = value
     log_level = settings.get("ARMORY_LOG_LEVEL", "INFO")
     log_format = settings.get("ARMORY_LOG_FORMAT", "text")
     retention = settings.get("ARMORY_BACKUP_RETENTION", "14")
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-        raise InstallError("configuration has an invalid log level")
+        raise InstallError(
+            "configuration has an invalid log level", category="input_rejected"
+        )
     if log_format not in {"text", "json"}:
-        raise InstallError("configuration has an invalid log format")
+        raise InstallError(
+            "configuration has an invalid log format", category="input_rejected"
+        )
     if not retention.isdecimal() or int(retention) < 1:
-        raise InstallError("configuration has an invalid backup retention")
+        raise InstallError(
+            "configuration has an invalid backup retention", category="input_rejected"
+        )
     logo_path = settings.get("ARMORY_LOGO_PATH")
     if "ARMORY_LOGO_PATH" in settings and logo_path != (
         "/etc/wow-forever-armory-bot/wow_forever_logo.png"
     ):
-        raise InstallError("configuration has an unsupported local logo path")
+        raise InstallError(
+            "configuration has an unsupported local logo path",
+            category="input_rejected",
+        )
 
 
 def validate_inputs(
@@ -143,7 +189,10 @@ def validate_inputs(
         or not token.isascii()
         or any(byte < 0x21 or byte > 0x7E for byte in token)
     ):
-        raise InstallError("credential source must contain one non-empty token line")
+        raise InstallError(
+            "credential source must contain one non-empty token line",
+            category="input_rejected",
+        )
 
 
 def _run(
@@ -154,11 +203,24 @@ def _run(
             command,
             check=True,
             text=True,
-            capture_output=capture,
+            # Always capture child output so an unexpected error cannot print
+            # config-derived secrets or host paths to the install journal.
+            capture_output=True,
             env=env,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise InstallError(f"installation command failed: {command[0]}") from exc
+        executable = Path(command[0]).name or "command"
+        exit_code = (
+            f" (exit {exc.returncode})"
+            if isinstance(exc, subprocess.CalledProcessError)
+            else " (could not start)"
+        )
+        # Child stderr can contain local paths or data copied from config files.
+        # Keep the safe, actionable facts and omit raw output entirely.
+        raise InstallError(
+            f"installation command failed: {executable}{exit_code}",
+            category="command_failed",
+        ) from exc
 
 
 def _assert_units_stopped_and_disabled(*, upgrade_existing: bool) -> None:
@@ -171,7 +233,10 @@ def _assert_units_stopped_and_disabled(*, upgrade_existing: bool) -> None:
                 capture_output=True,
             )
             if result.stdout.strip() not in {"inactive", "failed", "unknown"}:
-                raise InstallError("could not verify that target units are stopped")
+                raise InstallError(
+                    "could not verify that target units are stopped",
+                    category="unit_state_rejected",
+                )
         for unit in ENABLEABLE_UNITS:
             result = subprocess.run(
                 ["systemctl", "is-enabled", unit],
@@ -181,10 +246,13 @@ def _assert_units_stopped_and_disabled(*, upgrade_existing: bool) -> None:
             accepted = {"disabled"} if upgrade_existing else {"disabled", "not-found"}
             if result.stdout.strip() not in accepted:
                 raise InstallError(
-                    "target service or backup timer is enabled or unknown"
+                    "target service or backup timer is enabled or unknown",
+                    category="unit_state_rejected",
                 )
     except OSError as exc:
-        raise InstallError("could not verify systemd unit state") from exc
+        raise InstallError(
+            "could not verify systemd unit state", category="unit_state_rejected"
+        ) from exc
 
 
 def _assert_no_armory_process(proc_root: Path = Path("/proc")) -> None:
@@ -210,7 +278,10 @@ def _assert_no_armory_process(proc_root: Path = Path("/proc")) -> None:
             len(arguments) >= 3
             and arguments[1:3] == ["-m", "wow_forever_armory.discord_bot"]
         ) or any(Path(argument).name == "discord_bot.py" for argument in arguments):
-            raise InstallError("an Armory bot process is still running")
+            raise InstallError(
+                "an Armory bot process is still running",
+                category="process_state_rejected",
+            )
 
 
 def _verify_upgrade_database(database: Path, *, uid: int, gid: int) -> None:
@@ -220,7 +291,8 @@ def _verify_upgrade_database(database: Path, *, uid: int, gid: int) -> None:
     except Exception as exc:
         # Surface no source paths, SQL details, or data values in installer output.
         raise InstallError(
-            "isolated production database snapshot verification failed"
+            "isolated production database snapshot verification failed",
+            category="database_snapshot_rejected",
         ) from exc
 
 
@@ -241,9 +313,15 @@ def _require_supported_runtime(interpreter: Path) -> None:
             capture_output=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise InstallError("could not verify the release Python runtime") from exc
+        raise InstallError(
+            "could not verify the release Python runtime",
+            category="python_runtime_rejected",
+        ) from exc
     if version != "3.14:x86_64:linux":
-        raise InstallError("release lock supports CPython 3.14 on Linux x86_64")
+        raise InstallError(
+            "release lock supports CPython 3.14 on Linux x86_64",
+            category="python_runtime_rejected",
+        )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -255,11 +333,20 @@ def _check_repository(repo: Path, release_sha: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", release_sha):
         raise InstallError("release SHA must be a full lowercase commit hash")
     if _git(repo, "branch", "--show-current") != BRANCH:
-        raise InstallError("repository is not on the approved release branch")
+        raise InstallError(
+            "repository is not on the approved release branch",
+            category="repository_rejected",
+        )
     if _git(repo, "status", "--porcelain"):
-        raise InstallError("repository must be clean before installation")
+        raise InstallError(
+            "repository must be clean before installation",
+            category="repository_rejected",
+        )
     if _git(repo, "rev-parse", "HEAD") != release_sha:
-        raise InstallError("checkout HEAD does not match the approved release SHA")
+        raise InstallError(
+            "checkout HEAD does not match the approved release SHA",
+            category="repository_rejected",
+        )
     try:
         _run(
             [
@@ -274,7 +361,8 @@ def _check_repository(repo: Path, release_sha: str) -> None:
         )
     except InstallError as exc:
         raise InstallError(
-            "approved release is not based on the reviewed checkpoint"
+            "approved release is not based on the reviewed checkpoint",
+            category="repository_rejected",
         ) from exc
 
 
@@ -303,7 +391,10 @@ def _account() -> tuple[int, int]:
         )
         user = pwd.getpwnam(SERVICE_USER)
     if user.pw_gid != group.gr_gid or user.pw_dir != "/nonexistent":
-        raise InstallError("existing service account does not match expected isolation")
+        raise InstallError(
+            "existing service account does not match expected isolation",
+            category="service_account_rejected",
+        )
     return user.pw_uid, group.gr_gid
 
 
@@ -324,30 +415,194 @@ def _permits(info: os.stat_result, uid: int, gid: int, bit: int) -> bool:
     return bool(mode & bit)
 
 
-def _verify_release_readable(release: Path, uid: int, gid: int) -> None:
+def _trusted_directory_chain(path: Path, *, owner_uid: int) -> bool:
+    try:
+        for directory in reversed((path, *path.parents)):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _verify_release_symlink(
+    release: Path,
+    path: Path,
+    uid: int,
+    gid: int,
+    *,
+    owner_uid: int = 0,
+    system_python: Path = SYSTEM_PYTHON,
+) -> None:
+    relative_name = path.relative_to(release).as_posix()
+    expected_target = VENV_SYMLINK_TARGETS.get(relative_name)
+    if relative_name == ".venv/bin/python3.14":
+        expected_target = str(system_python)
+    try:
+        info = path.lstat()
+        target_text = os.readlink(path)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallError(
+            "release symbolic link is unavailable",
+            category="release_symlink_rejected",
+        ) from exc
+    if (
+        not stat.S_ISLNK(info.st_mode)
+        or info.st_uid != owner_uid
+        or expected_target is None
+        or target_text != expected_target
+    ):
+        raise InstallError(
+            "release contains an unapproved symbolic link",
+            category="release_symlink_rejected",
+        )
+
+    if relative_name == ".venv/lib64":
+        expected_resolved = release / ".venv/lib"
+        target_info = resolved.stat()
+        valid_target = stat.S_ISDIR(target_info.st_mode)
+    else:
+        try:
+            expected_resolved = system_python.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InstallError(
+                "trusted system Python is unavailable",
+                category="release_symlink_rejected",
+            ) from exc
+        target_info = resolved.stat()
+        valid_target = _trusted_directory_chain(
+            expected_resolved.parent, owner_uid=owner_uid
+        ) and stat.S_ISREG(target_info.st_mode)
+
+    required_bit = 0o1 if stat.S_ISDIR(target_info.st_mode) else 0o4
+    if (
+        resolved != expected_resolved
+        or not valid_target
+        or target_info.st_uid != owner_uid
+        or target_info.st_mode & 0o022
+        or not _permits(target_info, uid, gid, required_bit)
+        or stat.S_ISREG(target_info.st_mode)
+        and not _permits(target_info, uid, gid, 0o1)
+    ):
+        raise InstallError(
+            "release symbolic link target is not a verified venv target",
+            category="release_symlink_rejected",
+        )
+
+
+def _verify_release_readable(
+    release: Path,
+    uid: int,
+    gid: int,
+    *,
+    owner_uid: int = 0,
+    system_python: Path = SYSTEM_PYTHON,
+) -> None:
     if release.is_symlink():
-        raise InstallError("release path must not be a symbolic link")
-    for directory, child_directories, files in os.walk(release, followlinks=False):
+        raise InstallError(
+            "release path must not be a symbolic link",
+            category="release_marker_rejected",
+        )
+
+    def walk_error(_error: OSError) -> None:
+        raise InstallError(
+            "release tree could not be fully inspected",
+            category="release_permissions_rejected",
+        )
+
+    for directory, child_directories, files in os.walk(
+        release, followlinks=False, onerror=walk_error
+    ):
         for path in (
             Path(directory),
             *(Path(directory) / name for name in child_directories),
         ):
             if path.is_symlink():
+                _verify_release_symlink(
+                    release,
+                    path,
+                    uid,
+                    gid,
+                    owner_uid=owner_uid,
+                    system_python=system_python,
+                )
                 continue
             info = path.stat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
-                raise InstallError("release directory ownership or mode is unsafe")
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
+                raise InstallError(
+                    "release directory ownership or mode is unsafe",
+                    category="release_permissions_rejected",
+                )
             if not _permits(info, uid, gid, 0o1):
-                raise InstallError("service account cannot traverse release directory")
+                raise InstallError(
+                    "service account cannot traverse release directory",
+                    category="release_permissions_rejected",
+                )
         for name in files:
             path = Path(directory) / name
+            if path.is_symlink():
+                _verify_release_symlink(
+                    release,
+                    path,
+                    uid,
+                    gid,
+                    owner_uid=owner_uid,
+                    system_python=system_python,
+                )
+                continue
             info = path.stat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
-                raise InstallError("release file ownership or mode is unsafe")
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_mode & 0o022
+            ):
+                raise InstallError(
+                    "release file ownership or mode is unsafe",
+                    category="release_permissions_rejected",
+                )
             if not _permits(info, uid, gid, 0o4):
-                raise InstallError("service account cannot read release file")
+                raise InstallError(
+                    "service account cannot read release file",
+                    category="release_permissions_rejected",
+                )
             if info.st_mode & 0o111 and not _permits(info, uid, gid, 0o1):
-                raise InstallError("service account cannot execute release file")
+                raise InstallError(
+                    "service account cannot execute release file",
+                    category="release_permissions_rejected",
+                )
+
+    # The generic walk only requires execute permission when a file already
+    # carries an execute bit. Explicitly validate the venv interpreter so a
+    # completed marker cannot make a non-executable Python pass reuse checks.
+    interpreter = release / ".venv/bin/python"
+    try:
+        info = interpreter.stat()
+    except OSError as exc:
+        raise InstallError(
+            "release Python interpreter is unavailable",
+            category="release_permissions_rejected",
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != owner_uid
+        or info.st_mode & 0o022
+        or not _permits(info, uid, gid, 0o4)
+        or not _permits(info, uid, gid, 0o1)
+    ):
+        raise InstallError(
+            "service account cannot read and execute release Python",
+            category="release_permissions_rejected",
+        )
 
 
 def _validate_logo_asset(path: Path, service_uid: int, service_gid: int) -> None:
@@ -392,7 +647,7 @@ def _copy_secret(source: Path, destination: Path) -> None:
         raise
 
 
-def _install_release(
+def _install_release_impl(
     repo: Path, release: Path, uid: int, gid: int, release_sha: str
 ) -> None:
     _require_supported_runtime(Path(sys.executable))
@@ -408,7 +663,8 @@ def _install_release(
         ):
             raise InstallError(
                 "release path is incomplete or has a mismatched marker; "
-                "preserve it for operator review"
+                "preserve it for operator review",
+                category="release_marker_rejected",
             )
         else:
             _verify_release_readable(release, uid, gid)
@@ -422,12 +678,18 @@ def _install_release(
             capture_output=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise InstallError("could not read approved source release") from exc
+        raise InstallError(
+            "could not read approved source release",
+            category="release_build_failed",
+        ) from exc
     try:
         with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as bundle:
             bundle.extractall(release, filter="data")
     except (OSError, tarfile.TarError) as exc:
-        raise InstallError("could not extract the approved source release") from exc
+        raise InstallError(
+            "could not extract the approved source release",
+            category="release_build_failed",
+        ) from exc
     interpreter = Path(sys.executable)
     _run([str(interpreter), "-m", "venv", str(release / ".venv")])
     python = release / ".venv" / "bin" / "python"
@@ -468,7 +730,19 @@ def _install_release(
         ]
     )
     _run([str(python), "-m", "pip", "check"])
-    _run([str(python), "-m", "compileall", "-q", str(release / "src")])
+    # Parse each source file without creating __pycache__ in the immutable release.
+    _run(
+        [
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            "import ast, pathlib, sys; root = pathlib.Path(sys.argv[1]); "
+            "[ast.parse(path.read_text(encoding='utf-8'), filename=str(path)) "
+            "for path in root.rglob('*.py')]",
+            str(release / "src"),
+        ]
+    )
     for directory, subdirectories, files in os.walk(release, followlinks=False):
         os.chown(directory, 0, 0)
         for name in subdirectories:
@@ -487,6 +761,17 @@ def _install_release(
     _verify_release_readable(release, uid, gid)
 
 
+def _install_release(
+    repo: Path, release: Path, uid: int, gid: int, release_sha: str
+) -> None:
+    """Build readable release files, then restore the caller's restrictive mask."""
+    previous_umask = os.umask(0o022)
+    try:
+        _install_release_impl(repo, release, uid, gid, release_sha)
+    finally:
+        os.umask(previous_umask)
+
+
 def _install_current_link(
     release: Path,
     *,
@@ -495,18 +780,38 @@ def _install_current_link(
 ) -> None:
     current = BASE / "current"
     if current.is_symlink():
-        previous = current.resolve()
+        raw_target = os.readlink(current)
+        relative = re.fullmatch(r"releases/([0-9a-f]{40})", raw_target)
+        absolute = re.fullmatch(
+            re.escape(str(BASE / "releases")) + r"/([0-9a-f]{40})", raw_target
+        )
+        match = relative or absolute
+        if match is None:
+            raise InstallError(
+                "current has a non-canonical release link",
+                category="current_pointer_rejected",
+            )
+        previous = BASE / "releases" / match.group(1)
+        if current.resolve() != previous:
+            raise InstallError(
+                "current release link does not resolve to its declared target",
+                category="current_pointer_rejected",
+            )
         if previous == release.resolve():
             return
         if not upgrade_existing or repo is None:
             raise InstallError(
-                "current points to another release; refusing to replace it"
+                "current points to another release; refusing to replace it",
+                category="current_pointer_rejected",
             )
         releases_root = (BASE / "releases").resolve()
         try:
             previous.relative_to(releases_root)
         except ValueError as exc:
-            raise InstallError("current points outside the managed releases") from exc
+            raise InstallError(
+                "current points outside the managed releases",
+                category="current_pointer_rejected",
+            ) from exc
         previous_sha = previous.name
         marker = previous / ".installation-complete"
         if (
@@ -516,7 +821,10 @@ def _install_current_link(
             or marker.is_symlink()
             or marker.read_text(encoding="ascii") != previous_sha
         ):
-            raise InstallError("current release is incomplete; refusing upgrade")
+            raise InstallError(
+                "current release is incomplete; refusing upgrade",
+                category="current_pointer_rejected",
+            )
         try:
             _run(
                 [
@@ -531,7 +839,8 @@ def _install_current_link(
             )
         except InstallError as exc:
             raise InstallError(
-                "upgrade must descend from the installed release"
+                "upgrade must descend from the installed release",
+                category="current_pointer_rejected",
             ) from exc
     elif current.exists():
         raise InstallError("current exists and is not the approved release symlink")
@@ -542,7 +851,7 @@ def _install_current_link(
         raise InstallError(
             "temporary current symlink already exists; inspect it manually"
         )
-    temporary.symlink_to(release)
+    temporary.symlink_to(Path("releases") / release.name)
     os.replace(temporary, current)
 
 
@@ -554,6 +863,67 @@ def _copy_unit(source: Path, destination: Path, mode: int = 0o644) -> None:
     os.replace(temporary, destination)
 
 
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(131072), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_previous_backup_unit(path: Path, expected_release_unit: Path) -> None:
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o644
+        or info.st_nlink != 1
+    ):
+        raise InstallError("installed backup unit is not the pinned previous version")
+    installed_hash = _sha256_file(path)
+    previous_release_hash = _sha256_file(expected_release_unit)
+    if (
+        (installed_hash, previous_release_hash)
+        not in {
+            (PREVIOUS_BACKUP_UNIT_SHA256, PREVIOUS_BACKUP_UNIT_SHA256),
+            (RELEASE_BACKUP_UNIT_SHA256, RELEASE_BACKUP_UNIT_SHA256),
+        }
+    ):
+        raise InstallError("installed backup unit is not the pinned previous version")
+
+
+def _upgrade_backup_unit(source: Path, destination: Path, previous_release: Path) -> None:
+    """Apply only the pinned old-to-new backup unit transition, without activation."""
+    try:
+        old_release_unit = previous_release / "deploy/systemd/wow-forever-armory-backup.service"
+        candidate_hash = _sha256_file(source)
+        _verify_previous_backup_unit(destination, old_release_unit)
+    except OSError as exc:
+        raise InstallError("backup unit transition evidence is unavailable") from exc
+    if (
+        candidate_hash != RELEASE_BACKUP_UNIT_SHA256
+    ):
+        raise InstallError("backup unit does not match the exact approved transition")
+    if _sha256_file(destination) == candidate_hash:
+        return
+    _run(["systemd-analyze", "verify", str(source)])
+    try:
+        _copy_unit(source, destination, 0o644)
+        _run(["systemctl", "daemon-reload"])
+    except BaseException as exc:
+        try:
+            _copy_unit(old_release_unit, destination, 0o644)
+            _run(["systemctl", "daemon-reload"])
+        except BaseException as rollback_exc:
+            raise InstallError(
+                "backup unit update and automatic restoration failed; manual recovery required"
+            ) from rollback_exc
+        raise InstallError("backup unit update failed and previous version was restored") from exc
+
+
 def install(
     repo: Path,
     config_source: Path,
@@ -563,7 +933,10 @@ def install(
     upgrade_existing: bool = False,
 ) -> None:
     if os.geteuid() != 0:
-        raise InstallError("run this installation script as an administrator")
+        raise InstallError(
+            "run this installation script as an administrator",
+            category="service_account_rejected",
+        )
     _check_repository(repo, release_sha)
     if upgrade_existing and (
         config_source != ETC / "config"
@@ -597,23 +970,42 @@ def install(
     if configured_logo is not None:
         _validate_logo_asset(configured_logo, uid, gid)
     deploy = repo / "deploy"
-    systemd_directory = Path("/etc/systemd/system")
+    systemd_directory = SYSTEMD_DIRECTORY
     runtime_files = (
         (deploy / "systemd/armory-launch", BASE / "bin/armory-launch"),
         (
             deploy / "systemd/armory-db-preflight.py",
             BASE / "bin/armory-db-preflight",
         ),
+        (deploy / "recovery_audit.py", BASE / "bin/recovery_audit.py"),
         *((deploy / "systemd" / name, systemd_directory / name) for name in UNIT_FILES),
     )
     if upgrade_existing:
+        previous_release = (BASE / "current").resolve(strict=True)
         for source, destination in runtime_files:
+            if source.name == "recovery_audit.py":
+                try:
+                    destination.lstat()
+                except FileNotFoundError:
+                    continue
+                _read_regular_file(
+                    destination,
+                    expected_owner=0,
+                    maximum_bytes=262144,
+                    exact_mode=0o644,
+                )
+                continue
             if source.name == "armory-db-preflight.py":
                 _read_regular_file(
                     destination,
                     expected_owner=0,
                     maximum_bytes=262144,
                     exact_mode=0o755,
+                )
+                continue
+            if source.name == "wow-forever-armory-backup.service" and _sha256_file(source) == RELEASE_BACKUP_UNIT_SHA256:
+                _verify_previous_backup_unit(
+                    destination, previous_release / "deploy/systemd" / source.name
                 )
                 continue
             if (
@@ -644,11 +1036,32 @@ def install(
         preflight_source = deploy / "systemd/armory-db-preflight.py"
         preflight_destination = BASE / "bin/armory-db-preflight"
         _copy_unit(preflight_source, preflight_destination, 0o755)
+        _copy_unit(deploy / "recovery_audit.py", BASE / "bin/recovery_audit.py", 0o644)
+    previous_release = (BASE / "current").resolve(strict=True) if upgrade_existing else None
     _install_current_link(
         release,
         upgrade_existing=upgrade_existing,
         repo=repo if upgrade_existing else None,
     )
+    if upgrade_existing and "wow-forever-armory-backup.service" in UNIT_FILES:
+        try:
+            _upgrade_backup_unit(
+                deploy / "systemd/wow-forever-armory-backup.service",
+                systemd_directory / "wow-forever-armory-backup.service",
+                previous_release,
+            )
+        except BaseException:
+            rollback_link = BASE / ".current.rollback"
+            try:
+                if rollback_link.exists() or rollback_link.is_symlink():
+                    raise InstallError("temporary rollback link already exists")
+                rollback_link.symlink_to(Path("releases") / previous_release.name)
+                os.replace(rollback_link, BASE / "current")
+            except BaseException as rollback_exc:
+                raise InstallError(
+                    "backup unit transition failed and release pointer restoration failed; manual recovery required"
+                ) from rollback_exc
+            raise
 
     config = ETC / "config"
     if not upgrade_existing:
@@ -680,6 +1093,13 @@ def install(
     # Intentionally no enable, start, or restart commands in this installer.
 
 
+def _repository_for_installer(script_path: Path) -> Path:
+    """Use the protected source checkout when running the installed helper."""
+    if script_path.resolve() == INSTALLED_HELPER:
+        return APPROVED_REPO
+    return script_path.resolve().parent.parent
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-sha", required=True)
@@ -694,7 +1114,7 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
-    repo = Path(__file__).resolve().parents[1]
+    repo = _repository_for_installer(Path(__file__).resolve())
     if args.upgrade_existing:
         config_source = args.config_source or ETC / "config"
         credential_source = args.credential_source or ETC / "discord-token"
@@ -712,7 +1132,24 @@ def main() -> int:
             upgrade_existing=args.upgrade_existing,
         )
     except InstallError as exc:
+        diagnostic_fd = os.environ.get("ARMORY_INSTALL_DIAGNOSTIC_FD")
+        if diagnostic_fd is not None:
+            try:
+                os.write(
+                    int(diagnostic_fd),
+                    f"{exc.diagnostic_category}\n".encode("ascii"),
+                )
+            except OSError, ValueError:
+                pass
         print(f"Installation stopped safely: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # Avoid a traceback that could expose local paths or child data.
+        print(
+            "Installation failed unexpectedly "
+            f"({type(exc).__name__}); preserve the install journal for review.",
+            file=sys.stderr,
+        )
         return 1
     print("Release installed; units remain disabled and stopped.")
     return 0

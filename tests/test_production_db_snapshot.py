@@ -61,12 +61,46 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_context.cleanup()
 
-    def verify(self, database: Path) -> tuple[int, int, int]:
+    def verify(
+        self, database: Path, *, expected_sha256: str | None = None
+    ) -> tuple[int, int, int]:
         return snapshot.verify_database_snapshot(
             database,
             expected_owner=os.getuid(),
             expected_group=os.getgid(),
+            expected_sha256=expected_sha256,
         )
+
+    def test_missing_backup_fails_without_creating_a_snapshot(self) -> None:
+        missing = self.root / "missing-backup.sqlite3"
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaises(snapshot.SnapshotVerificationError):
+                self.verify(missing)
+        self.assertFalse(missing.exists())
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_expected_copy_hash_is_enforced_before_sqlite_open(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        with (
+            patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root),
+            patch.object(snapshot.sqlite3, "connect") as connect,
+        ):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError, "copy hash differs"
+            ):
+                self.verify(database, expected_sha256="0" * 64)
+        connect.assert_not_called()
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_expected_copy_hash_matches_verified_snapshot(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        original = sha256(database)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            self.assertEqual(self.verify(database, expected_sha256=original), (1, 1, 3))
+        self.assertEqual(sha256(database), original)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
 
     def test_empty_guild_member_and_character_state_is_accepted(self) -> None:
         database = self.root / "empty-guild-armory.sqlite3"
@@ -103,6 +137,57 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual(database.read_bytes(), original_bytes)
         self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_source_file_descriptors_require_no_atime_and_no_follow(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        self.assertTrue(hasattr(os, "O_NOATIME"))
+        with patch.object(snapshot.os, "open", wraps=os.open) as open_file:
+            descriptor = snapshot._open_readonly(database)
+            os.close(descriptor)
+        flags = open_file.call_args.args[1]
+        self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_NOATIME)
+
+    def test_snapshot_refuses_platform_without_no_atime_support(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        with patch.object(snapshot.os, "O_NOATIME", None):
+            with self.assertRaisesRegex(snapshot.SnapshotVerificationError, "no-atime"):
+                snapshot._open_readonly(database)
+
+    def test_no_atime_open_error_fails_without_retrying_without_flag(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        real_open = os.open
+        calls = []
+
+        def deny_noatime(path, flags, *args, **kwargs):
+            calls.append((path, flags))
+            if flags & os.O_NOATIME:
+                raise PermissionError("synthetic O_NOATIME denial")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(snapshot.os, "open", side_effect=deny_noatime):
+            with self.assertRaises(PermissionError):
+                snapshot._open_readonly(database)
+        file_calls = [call for call in calls if call[0] == database.name]
+        self.assertEqual(len(file_calls), 1)
+        self.assertTrue(file_calls[0][1] & os.O_NOATIME)
+
+    def test_snapshot_preserves_source_atime_when_filesystem_supports_noatime(
+        self,
+    ) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        old_atime_ns = 1_000_000_000
+        os.utime(database, ns=(old_atime_ns, database.stat().st_mtime_ns))
+        before = database.stat()
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            self.assertEqual(self.verify(database), (1, 1, 3))
+        after = database.stat()
+        self.assertEqual(after.st_atime_ns, before.st_atime_ns)
 
     def test_wal_committed_rows_are_verified_and_original_sidecars_unchanged(
         self,
@@ -200,6 +285,60 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
         verify_snapshot.assert_not_called()
         self.assertEqual(list(self.snapshot_root.iterdir()), [])
 
+    def test_source_change_during_integrity_check_is_detected(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        original_hash = sha256(database)
+        original_verify = snapshot._verify_snapshot
+
+        def verify_then_change(copy: Path) -> tuple[int, int, int]:
+            result = original_verify(copy)
+            database.write_bytes(database.read_bytes() + b"external-change")
+            return result
+
+        with (
+            patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root),
+            patch.object(snapshot, "_verify_snapshot", side_effect=verify_then_change),
+        ):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError,
+                "changed during isolated integrity check",
+            ):
+                self.verify(database)
+        self.assertNotEqual(sha256(database), original_hash)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_interrupted_copy_cleans_snapshot_and_preserves_source(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        before_hash = sha256(database)
+        before_metadata = database.stat()
+        with (
+            patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root),
+            patch.object(
+                snapshot,
+                "_copy_readonly_source",
+                side_effect=OSError("synthetic interrupted copy"),
+            ),
+        ):
+            with self.assertRaises(snapshot.SnapshotVerificationError):
+                self.verify(database)
+        after_metadata = database.stat()
+        self.assertEqual(sha256(database), before_hash)
+        self.assertEqual(
+            (
+                after_metadata.st_size,
+                after_metadata.st_mtime_ns,
+                after_metadata.st_mode,
+            ),
+            (
+                before_metadata.st_size,
+                before_metadata.st_mtime_ns,
+                before_metadata.st_mode,
+            ),
+        )
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
     def test_snapshot_cleanup_runs_when_sqlite_check_fails(self) -> None:
         database = self.root / "armory.sqlite3"
         create_database(database)
@@ -225,6 +364,40 @@ class ProductionDatabaseSnapshotTests(unittest.TestCase):
                 self.verify(link)
             database.chmod(0o644)
             with self.assertRaises(snapshot.SnapshotVerificationError):
+                self.verify(database)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_symlinked_parent_directory_is_rejected(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(self.root, target_is_directory=True)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaises(snapshot.SnapshotVerificationError):
+                self.verify(linked_parent / database.name)
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
+
+    def test_database_and_wal_hardlinks_are_rejected(self) -> None:
+        database = self.root / "armory.sqlite3"
+        create_database(database)
+        alias = self.root / "database-alias.sqlite3"
+        os.link(database, alias)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError, "unsafe hardlink"
+            ):
+                self.verify(database)
+        alias.unlink()
+
+        wal = Path(f"{database}-wal")
+        wal.write_bytes(b"")
+        wal.chmod(0o600)
+        wal_alias = self.root / "wal-alias"
+        os.link(wal, wal_alias)
+        with patch.object(snapshot, "SNAPSHOT_ROOT", self.snapshot_root):
+            with self.assertRaisesRegex(
+                snapshot.SnapshotVerificationError, "unsafe hardlink"
+            ):
                 self.verify(database)
         self.assertEqual(list(self.snapshot_root.iterdir()), [])
 

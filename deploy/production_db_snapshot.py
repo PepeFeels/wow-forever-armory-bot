@@ -6,6 +6,7 @@ descriptors. SQLite is run exclusively against a private temporary copy.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import stat
@@ -27,6 +28,7 @@ def _signature(info: os.stat_result) -> tuple[int, ...]:
         info.st_dev,
         info.st_ino,
         info.st_size,
+        info.st_nlink,
         info.st_mtime_ns,
         info.st_ctime_ns,
         info.st_mode,
@@ -35,19 +37,65 @@ def _signature(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _open_parent_directory(path: Path) -> int:
+    """Open each absolute parent component without following symlinks."""
+    if not path.is_absolute():
+        raise SnapshotVerificationError("snapshot source path must be absolute")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _lstat_nofollow(path: Path) -> os.stat_result:
+    parent_fd = _open_parent_directory(path.parent)
+    try:
+        return os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    finally:
+        os.close(parent_fd)
+
+
 def _source_signature(path: Path) -> tuple[int, ...] | None:
     try:
-        info = path.lstat()
+        info = _lstat_nofollow(path)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode):
         raise SnapshotVerificationError("database or sidecar is not a regular file")
+    if info.st_nlink != 1:
+        raise SnapshotVerificationError("database or sidecar has an unsafe hardlink")
     return _signature(info)
 
 
 def _open_readonly(path: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    return os.open(path, flags)
+    noatime = getattr(os, "O_NOATIME", None)
+    if noatime is None:
+        raise SnapshotVerificationError(
+            "the platform cannot guarantee a no-atime source open"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | noatime
+    )
+    parent_fd = _open_parent_directory(path.parent)
+    try:
+        return os.open(path.name, flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _wal_checksum(
@@ -122,7 +170,7 @@ def _validate_sources(
     database: Path, *, expected_owner: int, expected_group: int
 ) -> tuple[dict[Path, tuple[int, ...] | None], bool]:
     try:
-        info = database.lstat()
+        info = _lstat_nofollow(database)
     except OSError as exc:
         raise SnapshotVerificationError("production database is unavailable") from exc
     if (
@@ -133,11 +181,17 @@ def _validate_sources(
         or info.st_size == 0
     ):
         raise SnapshotVerificationError("production database metadata is unsafe")
+    if info.st_nlink != 1:
+        raise SnapshotVerificationError("production database has an unsafe hardlink")
 
     wal = Path(f"{database}-wal")
     shm = Path(f"{database}-shm")
     journal = Path(f"{database}-journal")
-    if os.path.lexists(journal):
+    try:
+        _lstat_nofollow(journal)
+    except FileNotFoundError:
+        pass
+    else:
         raise SnapshotVerificationError(
             "SQLite rollback journal is present; snapshot verification deferred"
         )
@@ -151,7 +205,7 @@ def _validate_sources(
         signatures[sidecar] = signature
         if signature is None:
             continue
-        side_info = sidecar.lstat()
+        side_info = _lstat_nofollow(sidecar)
         side_mode = stat.S_IMODE(side_info.st_mode)
         if (
             side_info.st_uid not in {expected_owner, 0}
@@ -171,7 +225,11 @@ def _validate_sources(
 
 
 def _copy_readonly_source(
-    source: Path, destination: Path, expected_signature: tuple[int, ...]
+    source: Path,
+    destination: Path,
+    expected_signature: tuple[int, ...],
+    *,
+    expected_sha256: str | None = None,
 ) -> None:
     source_fd = _open_readonly(source)
     target_fd = -1
@@ -189,11 +247,13 @@ def _copy_readonly_source(
             0o600,
         )
         os.fchmod(target_fd, 0o600)
+        digest = hashlib.sha256()
         copied = 0
         while True:
             block = os.read(source_fd, 1024 * 1024)
             if not block:
                 break
+            digest.update(block)
             view = memoryview(block)
             while view:
                 written = os.write(target_fd, view)
@@ -202,8 +262,15 @@ def _copy_readonly_source(
                 view = view[written:]
             copied += len(block)
         after = os.fstat(source_fd)
-        if copied != before.st_size or _signature(after) != expected_signature:
+        entry_after = _lstat_nofollow(source)
+        if (
+            copied != before.st_size
+            or _signature(after) != expected_signature
+            or _signature(entry_after) != expected_signature
+        ):
             raise SnapshotVerificationError("source changed during snapshot copy")
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise SnapshotVerificationError("snapshot copy hash differs from expected")
         os.fsync(target_fd)
     finally:
         os.close(source_fd)
@@ -238,7 +305,11 @@ def _verify_snapshot(snapshot: Path) -> tuple[int, int, int]:
 
 
 def verify_database_snapshot(
-    database: str | Path, *, expected_owner: int, expected_group: int
+    database: str | Path,
+    *,
+    expected_owner: int,
+    expected_group: int,
+    expected_sha256: str | None = None,
 ) -> tuple[int, int, int]:
     """Return aggregate counts after verifying a private DB+WAL snapshot.
 
@@ -275,7 +346,15 @@ def verify_database_snapshot(
             database_signature = signatures[source]
             if database_signature is None:
                 raise SnapshotVerificationError("database disappeared before copy")
-            _copy_readonly_source(source, snapshot, database_signature)
+            if expected_sha256 is None:
+                _copy_readonly_source(source, snapshot, database_signature)
+            else:
+                _copy_readonly_source(
+                    source,
+                    snapshot,
+                    database_signature,
+                    expected_sha256=expected_sha256,
+                )
             wal = Path(f"{source}-wal")
             if wal_present:
                 wal_signature = signatures[wal]
@@ -289,7 +368,13 @@ def verify_database_snapshot(
                 raise SnapshotVerificationError(
                     "source changed during snapshot creation"
                 )
-            return _verify_snapshot(snapshot)
+            result = _verify_snapshot(snapshot)
+            current = {path: _source_signature(path) for path in signatures}
+            if current != signatures:
+                raise SnapshotVerificationError(
+                    "source changed during isolated integrity check"
+                )
+            return result
     except (OSError, sqlite3.Error, ValueError, struct.error) as exc:
         raise SnapshotVerificationError(
             "isolated database snapshot verification failed"

@@ -1,0 +1,1212 @@
+"""Safety checks for the administrator read-only production preflight."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from deploy import production_db_snapshot, production_preflight
+
+EXPECTED_SHA = "d" * 40
+
+
+class ProductionPreflightTests(unittest.TestCase):
+    def test_reviewed_startup_preflight_hash_matches_source(self) -> None:
+        source = Path(__file__).parents[1] / "deploy/systemd/armory-db-preflight.py"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            production_preflight.APPROVED_PREFLIGHT_SHA256,
+        )
+
+    def test_secure_json_hash_matches_same_validated_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            raw = b'{"decision":"verified"}\n'
+            record.write_bytes(raw)
+            record.chmod(0o600)
+            value, digest = production_preflight.Preflight._secure_json_with_hash(
+                record, owner=os.getuid(), mode=0o600
+            )
+            self.assertEqual(value, {"decision": "verified"})
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+
+    def test_secure_json_rejects_symlink_hardlink_and_unsafe_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="ascii")
+            target.chmod(0o600)
+            alias = root / "record.json"
+            alias.symlink_to(target)
+            with self.assertRaises(OSError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    alias, owner=os.getuid(), mode=0o600
+                )
+            alias.unlink()
+            os.link(target, alias)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid(), mode=0o600
+                )
+            target.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid() + 1, mode=0o600
+                )
+            target.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid() + 1, mode=0o600
+                )
+            alias.unlink()
+            target.chmod(0o640)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._secure_json_with_hash(
+                    target, owner=os.getuid(), mode=0o600
+                )
+
+    def test_secure_json_rejects_path_swap_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            replacement = Path(temporary) / "replacement.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            replacement.write_text('{"value":"new"}\n', encoding="ascii")
+            replacement.chmod(0o600)
+            real_read = os.read
+            swapped = False
+
+            def swap_after_read(fd, size):
+                nonlocal swapped
+                block = real_read(fd, size)
+                if not swapped:
+                    swapped = True
+                    os.replace(replacement, record)
+                return block
+
+            with patch.object(os, "read", side_effect=swap_after_read):
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    def test_secure_json_rejects_in_place_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text('{"value":"old"}\n', encoding="ascii")
+            record.chmod(0o600)
+            real_read = os.read
+            changed = False
+
+            def change_after_read(fd, size):
+                nonlocal changed
+                block = real_read(fd, size)
+                if not changed:
+                    changed = True
+                    record.write_text('{"value":"new"}\n', encoding="ascii")
+                    record.chmod(0o600)
+                return block
+
+            with patch.object(os, "read", side_effect=change_after_read):
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    def test_secure_json_rejects_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "record.json"
+            record.write_text("{}\n", encoding="ascii")
+            record.chmod(0o600)
+            with patch.object(os, "read", side_effect=PermissionError):
+                with self.assertRaises(OSError):
+                    production_preflight.Preflight._secure_json_with_hash(
+                        record, owner=os.getuid(), mode=0o600
+                    )
+
+    @staticmethod
+    def _recovery_fixture(audit: Path, *, ack_changes=None, fail_closed=True):
+        release_sha = "a" * 40
+        previous_sha = "b" * 40
+        manifest_path = audit / f"deployment-{release_sha}.json"
+        manifest = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "database_backup": "/backup/test.sqlite3",
+            "database_backup_sha256": "c" * 64,
+            "shared_preflight_backup": "/audit/preflight.py",
+            "shared_preflight_sha256": "d" * 64,
+            "created_at_utc": "2026-11-15T12:00:00+00:00",
+        }
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode() + b"\n"
+        manifest_path.write_bytes(manifest_bytes)
+        manifest_path.chmod(0o600)
+        journal = {
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "phase": "manual_recovery_required",
+            "fail_closed_verified": fail_closed,
+            "fail_closed_error": None,
+            "database_backup": manifest["database_backup"],
+            "database_backup_sha256": manifest["database_backup_sha256"],
+            "shared_preflight_backup": manifest["shared_preflight_backup"],
+            "shared_preflight_sha256": manifest["shared_preflight_sha256"],
+            "manifest": str(manifest_path),
+        }
+        journal_bytes = json.dumps(journal, sort_keys=True).encode() + b"\n"
+        journal_sha = hashlib.sha256(journal_bytes).hexdigest()
+        archive = audit / f"deployment-state-{journal_sha}.json"
+        archive.write_bytes(journal_bytes)
+        archive.chmod(0o600)
+        ack = {
+            "schema_version": 1,
+            "journal_sha256": journal_sha,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "approved_release_sha": release_sha,
+            "previous_release_sha": previous_sha,
+            "decision": "manual_recovery_verified",
+            "approved_by": "admin-example",
+            "approval_reference": "CHANGE-185",
+            "approved_at_utc": "2026-11-15T12:30:00+00:00",
+        }
+        ack.update(ack_changes or {})
+        ack_path = audit / f"deployment-recovery-ack-{journal_sha}.json"
+        ack_path.write_text(json.dumps(ack, sort_keys=True) + "\n", encoding="ascii")
+        ack_path.chmod(0o600)
+        return archive, manifest_path, ack_path
+
+    def test_current_link_accepts_canonical_absolute_and_relative_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            release_sha = "a" * 40
+            release = base / "releases" / release_sha
+            release.mkdir(parents=True)
+            current = base / "current"
+            with patch.object(production_preflight, "BASE", base):
+                current.symlink_to(release)
+                self.assertEqual(
+                    production_preflight.Preflight._managed_release_target(current),
+                    release,
+                )
+                current.unlink()
+                current.symlink_to(Path("releases") / release_sha)
+                self.assertEqual(
+                    production_preflight.Preflight._managed_release_target(current),
+                    release,
+                )
+                current.unlink()
+                rejected = (
+                    f"releases//{release_sha}",
+                    f"releases/./{release_sha}",
+                    f"releases/../releases/{release_sha}",
+                    f"{base}/releases//{release_sha}",
+                    f"{base}/releases/./{release_sha}",
+                    f"{base}/releases/../releases/{release_sha}",
+                    str(base / "outside" / release_sha),
+                )
+                for raw_target in rejected:
+                    with self.subTest(raw_target=raw_target):
+                        current.symlink_to(raw_target)
+                        with self.assertRaises(ValueError):
+                            production_preflight.Preflight._managed_release_target(
+                                current
+                            )
+                        current.unlink()
+
+    def test_checkout_tree_rejects_python_bytecode_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            cache = checkout / "deploy/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "module.cpython-314.pyc").write_bytes(b"cache")
+            self.assertTrue(
+                production_preflight.Preflight._has_python_bytecode_cache(checkout)
+            )
+
+    def _release_tree(self, root: Path, system_python: Path) -> Path:
+        release = root / "release"
+        bin_dir = release / ".venv/bin"
+        bin_dir.mkdir(parents=True)
+        (release / ".venv/lib").mkdir()
+        (release / ".venv/lib64").symlink_to("lib", target_is_directory=True)
+        (release / "app.py").write_text("pass\n", encoding="ascii")
+        (release / "app.py").chmod(0o644)
+        system_python.write_text("#!/bin/sh\n", encoding="ascii")
+        system_python.chmod(0o755)
+        (bin_dir / "python3.14").symlink_to(system_python)
+        for name in ("python", "python3", "𝜋thon"):
+            (bin_dir / name).symlink_to("python3.14")
+        return release
+
+    def _release_is_safe(self, release: Path, system_python: Path) -> bool:
+        with (
+            patch.object(production_preflight, "SYSTEM_PYTHON", str(system_python)),
+            patch.object(
+                production_preflight.Preflight,
+                "_trusted_directory_chain",
+                return_value=True,
+            ),
+        ):
+            return production_preflight.Preflight._release_tree_is_safe(
+                release,
+                os.getuid(),
+                os.getgid(),
+                owner=os.getuid(),
+            )
+
+    def test_release_accepts_venv_interpreter_link_to_system_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            self.assertTrue(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_unlisted_internal_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "app-alias.py").symlink_to("app.py")
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_wrong_python314_venv_link_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            pi_link = release / ".venv/bin/𝜋thon"
+            pi_link.unlink()
+            pi_link.symlink_to(system_python)
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_symlink_escaping_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            outside = root / "outside-data"
+            outside.write_text("private\n", encoding="ascii")
+            outside.chmod(0o644)
+            (release / "unexpected-link").symlink_to(outside)
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_broken_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "broken-link").symlink_to(root / "missing")
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def test_release_rejects_unexpected_file_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            self.assertFalse(
+                production_preflight.Preflight._release_tree_is_safe(
+                    release,
+                    os.getuid(),
+                    os.getgid(),
+                    owner=os.getuid() + 1,
+                )
+            )
+
+    def test_release_rejects_unsafe_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            system_python = root / "system-python"
+            release = self._release_tree(root, system_python)
+            (release / "app.py").chmod(0o666)
+            self.assertFalse(self._release_is_safe(release, system_python))
+
+    def _database(self, path: Path) -> None:
+        with sqlite3.connect(path) as connection:
+            for table in ("guilds", "members", "characters", "flows"):
+                connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+        path.chmod(0o600)
+
+    def test_database_integrity_uses_read_only_connection_without_new_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "guild-armory.sqlite3"
+            self._database(database)
+            before = {item.name for item in database.parent.iterdir()}
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            status, detail = checker.database(database, "production_database")
+            after = {item.name for item in database.parent.iterdir()}
+            self.assertEqual(status, "PASS")
+            self.assertIn("read-only", detail)
+            self.assertEqual(after, before)
+
+    def test_database_with_wal_uses_isolated_snapshot_without_sidecar_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "guild-armory.sqlite3"
+            snapshot_root = Path(temporary) / "private-snapshots"
+            snapshot_root.mkdir(mode=0o700)
+            connection = sqlite3.connect(database)
+            connection.execute("PRAGMA journal_mode=WAL")
+            for table in ("guilds", "members", "characters", "flows"):
+                connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+            connection.commit()
+            database.chmod(0o600)
+            sidecars = [Path(str(database) + suffix) for suffix in ("-wal", "-shm")]
+            before = {
+                item.name: item.read_bytes() for item in sidecars if item.exists()
+            }
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            with (
+                patch.object(
+                    checker,
+                    "_load_snapshot_verifier",
+                    return_value=production_db_snapshot.verify_database_snapshot,
+                ),
+                patch.object(
+                    production_db_snapshot, "SNAPSHOT_ROOT", snapshot_root
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
+            after = {item.name: item.read_bytes() for item in sidecars if item.exists()}
+            connection.close()
+            self.assertEqual(status, "PASS", detail)
+            self.assertIn("isolated read-only snapshot", detail)
+            self.assertEqual(after, before)
+
+    def test_active_service_makes_live_database_check_unknown(self) -> None:
+        checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)
+        checker.service_uid = os.getuid()
+        checker.service_gid = os.getgid()
+        checker.unit_states_checked = True
+        checker.unit_states = {production_preflight.SERVICE: ("active", "enabled")}
+        with patch.object(sqlite3, "connect") as connect:
+            status, detail = checker.database(
+                Path("/not-opened"), "production_database"
+            )
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("active writer", detail)
+        connect.assert_not_called()
+
+    def test_database_check_rejects_unknown_check_name(self) -> None:
+        checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)
+        status, detail = checker.database(Path("/unused.sqlite3"), "typo")
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("identifier", detail)
+
+    def test_corrupt_database_is_reported_as_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "corrupt.sqlite3"
+            database.write_bytes(b"not a sqlite database")
+            database.chmod(0o600)
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            status, _detail = checker.database(database, "production_database")
+            self.assertEqual(status, "FAIL")
+
+    def test_root_sqlite_worker_drops_to_the_service_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "database.sqlite3"
+            self._database(database)
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            process_result = subprocess.CompletedProcess([], 0, "PASS", "")
+            with (
+                patch.object(os, "geteuid", return_value=0),
+                patch.object(
+                    subprocess,
+                    "run",
+                    return_value=process_result,
+                ) as run,
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 3, "inactive", ""),
+                ),
+            ):
+                status, _detail = checker.database(database, "production_database")
+            self.assertEqual(status, "PASS")
+            kwargs = run.call_args.kwargs
+            self.assertEqual(kwargs["user"], os.getuid())
+            self.assertEqual(kwargs["group"], os.getgid())
+            self.assertEqual(kwargs["extra_groups"], ())
+            self.assertTrue(kwargs["pass_fds"])
+            self.assertIn("immutable=1", run.call_args.args[0][4])
+
+    def test_root_sqlite_check_rejects_database_path_replacement_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "database.sqlite3"
+            self._database(database)
+            checker = production_preflight.Preflight(root, EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            old_database = root / "replaced.sqlite3"
+
+            def replace_path(
+                *_args: object, **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                database.rename(old_database)
+                self._database(database)
+                return subprocess.CompletedProcess([], 0, "PASS", "")
+
+            with (
+                patch.object(os, "geteuid", return_value=0),
+                patch.object(subprocess, "run", side_effect=replace_path),
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 3, "inactive", ""),
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("changed", detail)
+
+    def test_root_sqlite_check_rechecks_writer_state_after_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "database.sqlite3"
+            self._database(database)
+            checker = production_preflight.Preflight(root, EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("inactive", "disabled")
+            }
+            with (
+                patch.object(os, "geteuid", return_value=0),
+                patch.object(
+                    subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "PASS", ""),
+                ),
+                patch.object(
+                    checker,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 0, "active", ""),
+                ),
+            ):
+                status, detail = checker.database(database, "production_database")
+            self.assertEqual(status, "UNKNOWN")
+            self.assertIn("writer state changed", detail)
+
+    def test_complete_backup_check_path_validates_backup_without_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            backup_dir = state / "backups"
+            backup_dir.mkdir(parents=True, mode=0o700)
+            database = state / "guild-armory.sqlite3"
+            backup = backup_dir / "guild-armory-20261114.sqlite3"
+            self._database(database)
+            self._database(backup)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            before = {
+                path.name: (
+                    path.read_bytes(),
+                    path.stat().st_mode,
+                    path.stat().st_size,
+                    path.stat().st_mtime_ns,
+                    path.stat().st_ctime_ns,
+                )
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            checker = production_preflight.Preflight(root, EXPECTED_SHA)
+            checker.service_uid = os.getuid()
+            checker.service_gid = os.getgid()
+            checker.unit_states_checked = True
+            checker.unit_states = {
+                production_preflight.SERVICE: ("active", "enabled"),
+                production_preflight.BACKUP_SERVICE: ("inactive", "static"),
+            }
+            with (
+                patch.object(production_preflight, "STATE", state),
+                patch.object(production_preflight, "AUDIT", audit),
+            ):
+                checker.database_checks()
+            after = {
+                path.name: (
+                    path.read_bytes(),
+                    path.stat().st_mode,
+                    path.stat().st_size,
+                    path.stat().st_mtime_ns,
+                    path.stat().st_ctime_ns,
+                )
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(checker.checks["production_database"].status, "UNKNOWN")
+            self.assertEqual(checker.checks["latest_backup"].status, "PASS")
+            self.assertEqual(after, before)
+            self.assertFalse(Path(str(backup) + "-wal").exists())
+            self.assertFalse(Path(str(backup) + "-shm").exists())
+
+    def test_missing_v2_pin_and_target_are_expected_unknowns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            with patch.object(
+                production_preflight, "PIN", Path(temporary) / "missing-pin"
+            ):
+                checker.deployment_pin()
+            checker.installed_artifacts()
+            self.assertEqual(checker.checks["deployment_pin"].status, "UNKNOWN")
+            self.assertIn(
+                "not been provisioned", checker.checks["deployment_pin"].detail
+            )
+            self.assertEqual(checker.checks["v2_target_release"].status, "UNKNOWN")
+
+    def test_missing_production_checkout_is_unknown_not_current_health_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "not-provisioned"
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.checkout(path)
+            result = checker.checks["production_checkout"]
+            self.assertEqual(result.status, "UNKNOWN")
+            self.assertEqual(result.group, "v2.0.0 deployment prerequisites")
+
+    def test_clean_old_production_checkout_is_unknown_without_v2_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            old_sha = "a" * 40
+            checker = production_preflight.Preflight(path, EXPECTED_SHA)
+
+            def fake_git(_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                if args == ("rev-parse", "--show-toplevel"):
+                    output = str(path)
+                elif args == ("branch", "--show-current"):
+                    output = "release/v1.1.4"
+                elif args == ("rev-parse", "HEAD"):
+                    output = old_sha
+                elif args == ("rev-parse", "refs/heads/release/v1.1.4"):
+                    output = old_sha
+                else:
+                    output = ""
+                return subprocess.CompletedProcess(args, 0, output, "")
+
+            with (
+                patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_validate_git_metadata", return_value=True),
+                patch.object(checker, "_git", side_effect=fake_git),
+            ):
+                checker.checkout(path)
+            result = checker.checks["production_checkout"]
+            self.assertEqual(result.status, "UNKNOWN")
+            self.assertIn("pin is not provisioned", result.detail)
+
+    def test_candidate_git_requires_exact_expected_commit_sha(self) -> None:
+        checker = production_preflight.Preflight(
+            Path("/trusted/candidate"), EXPECTED_SHA
+        )
+
+        def fake_git(_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if args == ("branch", "--show-current"):
+                output = production_preflight.BRANCH
+            elif args == ("rev-parse", "HEAD"):
+                output = EXPECTED_SHA
+            elif args == ("rev-parse", f"refs/heads/{production_preflight.BRANCH}"):
+                output = EXPECTED_SHA
+            else:
+                output = ""
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        with (
+            patch.object(checker, "_trusted_checkout_tree", return_value=True),
+            patch.object(checker, "_validate_git_metadata", return_value=True),
+            patch.object(checker, "_git", side_effect=fake_git),
+        ):
+            checker.candidate_git()
+        self.assertEqual(checker.checks["candidate_git"].status, "PASS")
+
+        wrong = production_preflight.Preflight(Path("/trusted/candidate"), "e" * 40)
+        with (
+            patch.object(wrong, "_trusted_checkout_tree", return_value=True),
+            patch.object(wrong, "_git", side_effect=fake_git),
+        ):
+            wrong.candidate_git()
+        self.assertEqual(wrong.checks["candidate_git"].status, "FAIL")
+
+    def test_mutable_candidate_path_is_rejected_before_git_subprocess(self) -> None:
+        checker = production_preflight.Preflight(
+            Path("/developer/checkout"), EXPECTED_SHA
+        )
+        with (
+            patch.object(checker, "_trusted_checkout_tree", return_value=False),
+            patch.object(checker, "_git") as git,
+        ):
+            checker.candidate_git()
+        self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+        git.assert_not_called()
+
+    def test_checkout_tree_rejects_symbolic_link_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            alias = root / "checkout-alias"
+            alias.symlink_to(checkout, target_is_directory=True)
+            self.assertFalse(
+                production_preflight.Preflight._trusted_checkout_tree(alias)
+            )
+
+    def test_checkout_tree_accepts_root_only_directories_and_validator_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            deploy = checkout / "deploy"
+            git_dir.mkdir(parents=True)
+            deploy.mkdir()
+            validator = deploy / "recovery_audit.py"
+            validator.write_text("pinned source\n", encoding="ascii")
+            validator.chmod(0o644)
+            ordinary = checkout / "README.md"
+            ordinary.write_text("release file\n", encoding="ascii")
+            ordinary.chmod(0o444)
+            for directory in (checkout, git_dir, deploy):
+                directory.chmod(0o700)
+
+            check = production_preflight.Preflight._trusted_checkout_tree
+            self.assertTrue(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            validator.chmod(0o444)
+            self.assertTrue(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+
+            validator.chmod(0o664)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            validator.chmod(0o444)
+            ordinary.chmod(0o644)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+            ordinary.chmod(0o444)
+            deploy.chmod(0o770)
+            self.assertFalse(
+                check(checkout, owner_uid=os.getuid(), check_parents=False)
+            )
+
+    def test_checkout_tree_still_rejects_wrong_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            self.assertFalse(
+                production_preflight.Preflight._trusted_checkout_tree(
+                    checkout,
+                    owner_uid=os.getuid() + 1,
+                    check_parents=False,
+                )
+            )
+
+    def test_checkout_tree_rejects_writable_parent_and_hardlinked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "parent"
+            checkout = parent / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            parent.chmod(0o770)
+            try:
+                self.assertFalse(
+                    production_preflight.Preflight._trusted_checkout_tree(
+                        checkout, owner_uid=os.getuid()
+                    )
+                )
+            finally:
+                parent.chmod(0o700)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            file = checkout / "payload"
+            file.write_bytes(b"release bytes")
+            file.chmod(0o444)
+            os.link(file, checkout / "payload-alias")
+            self.assertFalse(
+                production_preflight.Preflight._trusted_checkout_tree(
+                    checkout, owner_uid=os.getuid(), check_parents=False
+                )
+            )
+
+    def test_git_config_allowlist_rejects_execution_and_include_settings(self) -> None:
+        checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)
+
+        def result(keys: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, keys, "")
+
+        safe = "\n".join(
+            (
+                "core.repositoryformatversion",
+                "core.filemode",
+                "core.bare",
+                "core.logallrefupdates",
+                "remote.origin.url",
+                "remote.origin.fetch",
+                "core.fsmonitor",
+                "core.hookspath",
+                "core.symlinks",
+                "credential.helper",
+            )
+        )
+        with patch.object(checker, "_git", return_value=result(safe)):
+            self.assertTrue(checker._git_config_is_safe(Path("/unused")))
+
+        for unexpected in (
+            "filter.payload.clean",
+            "include.path",
+            "core.sshCommand",
+            "alias.status",
+        ):
+            with self.subTest(unexpected=unexpected):
+                with patch.object(
+                    checker, "_git", return_value=result(safe + "\n" + unexpected)
+                ):
+                    self.assertFalse(checker._git_config_is_safe(Path("/unused")))
+
+    def test_git_metadata_accepts_clean_repository_and_rejects_redirectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            (git_dir / "packed-refs").write_text("# pack-refs with: peeled\n")
+            check = production_preflight.Preflight._validate_git_metadata
+            self.assertTrue(check(checkout, owner_uid=os.getuid()))
+            for relative in ("objects/info/alternates", "info/grafts", "shallow"):
+                item = git_dir / relative
+                item.parent.mkdir(parents=True, exist_ok=True)
+                item.write_text("redirect\n")
+                self.assertFalse(check(checkout, owner_uid=os.getuid()))
+                item.unlink()
+            (git_dir / "refs/replace").mkdir()
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+            (git_dir / "refs/replace").rmdir()
+            (git_dir / "packed-refs").write_text("a" * 40 + " refs/replace/" + "b" * 40 + "\n")
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+
+    def test_git_metadata_rejects_symlinked_metadata_and_git_directory(self) -> None:
+        check = production_preflight.Preflight._validate_git_metadata
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            git_dir = checkout / ".git"
+            (git_dir / "objects/info").mkdir(parents=True)
+            (git_dir / "info").mkdir()
+            (git_dir / "refs").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (git_dir / "objects/info/alternates").symlink_to(outside)
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "real").mkdir()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            (checkout / ".git").symlink_to(root / "real", target_is_directory=True)
+            self.assertFalse(check(checkout, owner_uid=os.getuid()))
+        for relative in (
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+            "shallow",
+            "refs/replace",
+            "packed-refs",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout = root / "checkout"
+                git_dir = checkout / ".git"
+                (git_dir / "objects/info").mkdir(parents=True)
+                (git_dir / "info").mkdir()
+                (git_dir / "refs").mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                target = git_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside, target_is_directory=True)
+                self.assertFalse(check(checkout, owner_uid=os.getuid()))
+
+    def test_candidate_git_metadata_is_rejected_before_git_identity_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git/info").mkdir(parents=True)
+            (checkout / ".git/info/grafts").write_text("graft\n")
+            checker = production_preflight.Preflight(checkout, EXPECTED_SHA)
+            with (
+                patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_git") as git,
+            ):
+                checker.candidate_git()
+            self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+            git.assert_not_called()
+
+    def test_candidate_git_metadata_is_rejected_before_git_identity_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / ".git/info").mkdir(parents=True)
+            (checkout / ".git/info/grafts").write_text("graft\n")
+            checker = production_preflight.Preflight(checkout, EXPECTED_SHA)
+            with (
+                patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_git") as git,
+            ):
+                checker.candidate_git()
+            self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+            git.assert_not_called()
+
+    def test_candidate_git_filter_configuration_is_rejected(self) -> None:
+        checker = production_preflight.Preflight(
+            Path("/trusted/candidate"), EXPECTED_SHA
+        )
+
+        def fake_git(_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if args and args[0] == "branch":
+                output = production_preflight.BRANCH
+            elif args[:2] == ("rev-parse", "HEAD"):
+                output = EXPECTED_SHA
+            elif args[:2] == ("rev-parse", f"refs/heads/{production_preflight.BRANCH}"):
+                output = EXPECTED_SHA
+            elif args[:2] == ("config", "--local"):
+                output = "filter.untrusted.clean"
+            else:
+                output = ""
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        with (
+            patch.object(checker, "_trusted_checkout_tree", return_value=True),
+                patch.object(checker, "_validate_git_metadata", return_value=True),
+            patch.object(checker, "_git", side_effect=fake_git),
+        ):
+            checker.candidate_git()
+        self.assertEqual(checker.checks["candidate_git"].status, "FAIL")
+        self.assertIn("filter", checker.checks["candidate_git"].detail)
+
+    def test_root_source_gate_rejects_developer_owned_script_path(self) -> None:
+        with patch.object(os, "geteuid", return_value=0):
+            self.assertFalse(production_preflight.Preflight._trusted_execution_source())
+
+    def test_run_orchestrates_all_checks_and_separates_result_groups(self) -> None:
+        from contextlib import ExitStack
+
+        checker = production_preflight.Preflight(
+            Path("/trusted/candidate"), EXPECTED_SHA
+        )
+
+        def add(name: str, status: str) -> None:
+            checker.add(name, status, "test result")
+
+        def runtime() -> None:
+            add("python_and_architecture", "PASS")
+            add("service_account_and_group", "PASS")
+
+        def checkout(_path: Path, *, candidate: bool = False) -> tuple[str, bool]:
+            name = "candidate_checkout" if candidate else "production_checkout"
+            add(name, "PASS" if candidate else "UNKNOWN")
+            return EXPECTED_SHA, candidate
+
+        def release_pointer() -> None:
+            add("current_release", "PASS")
+            add("installed_release_permissions", "PASS")
+
+        def files_and_hashes() -> None:
+            add("protected_files", "PASS")
+            add("installed_helper_hashes", "UNKNOWN")
+
+        def database_checks() -> None:
+            add("production_database", "UNKNOWN")
+            add("latest_backup", "PASS")
+
+        def incident_journal() -> None:
+            add("deployment_recovery_ack", "PASS")
+            add("failed_v1_1_4_manifest", "UNKNOWN")
+
+        stages = {
+            "candidate_git": lambda: add("candidate_git", "PASS"),
+            "runtime": runtime,
+            "deployment_pin": lambda: add("deployment_pin", "UNKNOWN"),
+            "checkout": checkout,
+            "systemd": lambda: add("systemd_states", "PASS"),
+            "release_pointer": release_pointer,
+            "files_and_hashes": files_and_hashes,
+            "installed_artifacts": lambda: add("v2_target_release", "UNKNOWN"),
+            "database_checks": database_checks,
+            "incident_journal": incident_journal,
+        }
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(checker, "_trusted_execution_source", return_value=True)
+            )
+            for name, callback in stages.items():
+                stack.enter_context(patch.object(checker, name, side_effect=callback))
+            result = checker.run()
+
+        self.assertEqual(len(result), 17)
+        self.assertEqual(
+            result["deployment_pin"].group,
+            "v2.0.0 deployment prerequisites",
+        )
+        self.assertEqual(
+            result["systemd_states"].group,
+            "Current production health",
+        )
+        self.assertEqual(result["preflight_execution_source"].status, "PASS")
+
+    def test_untrusted_run_returns_unknown_without_launching_subprocesses(self) -> None:
+        checker = production_preflight.Preflight(
+            Path("/developer/checkout"), EXPECTED_SHA
+        )
+        with (
+            patch.object(checker, "_trusted_execution_source", return_value=False),
+            patch.object(checker, "_run") as run,
+        ):
+            result = checker.run()
+        run.assert_not_called()
+        self.assertEqual(result["preflight_execution_source"].status, "UNKNOWN")
+        self.assertEqual(result["deployment_pin"].status, "UNKNOWN")
+        self.assertEqual(result["systemd_states"].status, "UNKNOWN")
+
+    def test_database_calls_supply_both_path_and_check_identifier(self) -> None:
+        tree = ast.parse(
+            Path(production_preflight.__file__).read_text(encoding="utf-8")
+        )
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "database"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ]
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(all(len(call.args) == 2 for call in calls))
+
+    def test_existing_target_release_is_reported_without_modification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "opt/wow-forever-armory-bot"
+            target_sha = "a" * 40
+            target = base / "releases" / target_sha
+            target.mkdir(parents=True)
+            target_file = target / "existing-data"
+            target_file.write_text("preserve", encoding="ascii")
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            checker.pin = {
+                "release_sha": target_sha,
+                "previous_sha": "b" * 40,
+                "installer_sha256": "c" * 64,
+            }
+            before = target_file.read_bytes()
+            with patch.object(production_preflight, "BASE", base):
+                checker.installed_artifacts()
+            self.assertEqual(checker.checks["v2_target_release"].status, "FAIL")
+            self.assertEqual(target_file.read_bytes(), before)
+            self.assertFalse((target / ".installation-complete").exists())
+
+    def test_manual_recovery_journal_is_reported_as_pending_without_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            journal = audit / "deployment-state.json"
+            journal.write_text("preserved evidence", encoding="ascii")
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            with (
+                patch.object(production_preflight, "AUDIT", audit),
+                patch.object(production_preflight.Preflight, "_metadata"),
+                patch.object(
+                    production_preflight.Preflight,
+                    "_secure_json",
+                    return_value={"phase": "manual_recovery_required"},
+                ),
+            ):
+                checker.incident_journal()
+            self.assertEqual(checker.checks["deployment_recovery_ack"].status, "FAIL")
+            self.assertEqual(journal.read_text(encoding="ascii"), "preserved evidence")
+
+    def test_missing_audit_directory_is_not_treated_as_resolved_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "missing-audit"
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            with patch.object(production_preflight, "AUDIT", audit):
+                checker.incident_journal()
+            self.assertEqual(checker.checks["deployment_recovery_ack"].status, "FAIL")
+
+    def test_empty_audit_directory_is_allowed_for_initial_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            checker = production_preflight.Preflight(Path(temporary), EXPECTED_SHA)
+            with patch.object(production_preflight, "REPO", Path(__file__).parents[1]):
+                self.assertEqual(
+                    checker._verify_archived_deployments(audit, owner=os.getuid()),
+                    0,
+                )
+
+    def test_archived_audit_uses_validator_from_protected_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            (checkout / "deploy").mkdir(parents=True)
+            source = Path(__file__).parents[1] / "deploy/recovery_audit.py"
+            validator = checkout / "deploy/recovery_audit.py"
+            validator.write_bytes(source.read_bytes())
+            validator.chmod(0o444)
+            audit = root / "audit"
+            audit.mkdir(mode=0o700)
+            with patch.object(production_preflight, "REPO", checkout):
+                self.assertEqual(
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    ),
+                    0,
+                )
+
+    def test_preflight_rejects_manifest_without_prior_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            orphan = audit / f"deployment-{'a' * 40}.json"
+            orphan.write_text("{}\n", encoding="ascii")
+            orphan.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+
+    def test_preflight_requires_archive_manifest_and_admin_ack_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, manifest, ack = self._recovery_fixture(audit)
+            with patch.object(production_preflight, "REPO", Path(__file__).parents[1]):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+                ack.unlink()
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                self._recovery_fixture(
+                    audit, ack_changes={"manifest_sha256": "0" * 64}
+                )
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                manifest.write_text("{}\n", encoding="ascii")
+                manifest.chmod(0o600)
+                with self.assertRaises(ValueError):
+                    production_preflight.Preflight._verify_archived_deployments(
+                        audit, owner=os.getuid()
+                    )
+                self.assertTrue(archive.exists())
+
+    def test_preflight_rejects_unverified_fail_closed_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            self._recovery_fixture(audit, fail_closed=False)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+
+    def test_preflight_rejects_changed_archived_journal_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary)
+            archive, _, _ = self._recovery_fixture(audit)
+            archive.write_text("tampered\n", encoding="ascii")
+            archive.chmod(0o600)
+            with self.assertRaises(ValueError):
+                production_preflight.Preflight._verify_archived_deployments(
+                    audit, owner=os.getuid()
+                )
+
+    def test_systemd_check_only_uses_observation_commands(self) -> None:
+        checker = production_preflight.Preflight(Path("/unused"), EXPECTED_SHA)
+        seen: list[tuple[str, ...]] = []
+
+        def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            seen.append(tuple(argv))
+            state = "active" if argv[1] == "is-active" else "enabled"
+            if argv[2] == production_preflight.BACKUP_SERVICE:
+                state = "inactive" if argv[1] == "is-active" else "static"
+            return subprocess.CompletedProcess(argv, 0, state, "")
+
+        with patch.object(checker, "_run", side_effect=fake_run):
+            checker.systemd()
+        self.assertEqual(checker.checks["systemd_states"].status, "PASS")
+        self.assertTrue(seen)
+        self.assertTrue(all(argv[1] in {"is-active", "is-enabled"} for argv in seen))
+
+    def test_source_contains_no_file_or_service_mutation_calls(self) -> None:
+        source = Path(production_preflight.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        forbidden = {
+            "chmod",
+            "chown",
+            "mkdir",
+            "makedirs",
+            "replace",
+            "rename",
+            "unlink",
+            "remove",
+            "write_text",
+            "write_bytes",
+            "system",
+            "Popen",
+        }
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertFalse(forbidden & calls, sorted(forbidden & calls))
+        self.assertIn("query_only=ON", source)
+        self.assertIn("immutable=1", source)
+        self.assertNotIn("os.environ", source)
+        self.assertNotIn("os.environb", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -42,6 +42,8 @@ from .parser import ArmoryParseError
 _LOGGER = logging.getLogger("wow_forever_armory.discord_bot")
 _LOCK_STRIPES = 32
 _MAX_TOKEN_FILE_BYTES = 4096
+_ARMORY_REFRESH_INTERVAL = 5 * 60
+_ARMORY_REFRESH_PACING = 0.2
 
 
 class BotIdentityUnavailable(RuntimeError):
@@ -184,7 +186,6 @@ class ArmoryBot(commands.Bot):
         self,
         armory_client: ArmoryClient,
         store: GuildArmoryStore,
-        test_guild_id: int | None = None,
     ) -> None:
         super().__init__(
             command_prefix=commands.when_mentioned,
@@ -192,7 +193,6 @@ class ArmoryBot(commands.Bot):
         )
         self.armory_client = armory_client
         self.store = store
-        self.test_guild_id = test_guild_id
         self.armory_semaphore = asyncio.Semaphore(3)
         self.graphic_semaphore = asyncio.Semaphore(2)
         self._member_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
@@ -200,6 +200,8 @@ class ArmoryBot(commands.Bot):
         self._activation_locks = tuple(asyncio.Lock() for _ in range(_LOCK_STRIPES))
         self._recovered = False
         self._recovery_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_pending_rows: set[tuple[int, int]] = set()
 
     @staticmethod
     def _intents() -> discord.Intents:
@@ -215,27 +217,6 @@ class ArmoryBot(commands.Bot):
             configs = await self.store.guilds()
             for config in configs:
                 self.add_view(GuildPanelView(self, config.guild_id))
-            if self.test_guild_id is not None:
-                test_guild = discord.Object(id=self.test_guild_id)
-                self.tree.copy_global_to(guild=test_guild)
-                synced = await self.tree.sync(guild=test_guild)
-                _LOGGER.info(
-                    "slash_commands_synced_to_test_guild",
-                    extra={
-                        "guild_count": 1,
-                        "persistent_views_registered": len(configs),
-                        "slash_commands_synced": len(synced),
-                    },
-                )
-            else:
-                synced = await self.tree.sync()
-                _LOGGER.info(
-                    "global_slash_commands_synced",
-                    extra={
-                        "persistent_views_registered": len(configs),
-                        "slash_commands_synced": len(synced),
-                    },
-                )
         except Exception as exc:
             _log_recovery_exception(
                 "discord_bot_setup_failed", exc, reason="setup_hook"
@@ -378,9 +359,7 @@ class ArmoryBot(commands.Bot):
             path = validate_armory_url(value, self.armory_client)
             verified = await self._verify_member(guild_id, interaction.user.id)
             if verified is None:
-                result = (
-                    "You must be a member of this server to edit its Armory."
-                )
+                result = "You must be a member of this server to edit its Armory."
             else:
                 guild, member = verified
                 config = await self.store.get_guild(guild_id)
@@ -506,9 +485,7 @@ class ArmoryBot(commands.Bot):
         except CharacterNotFound:
             result = "The character to replace is no longer in your list."
         except ValueError:
-            result = (
-                "Enter a full character URL from the official WoW Armory."
-            )
+            result = "Enter a full character URL from the official WoW Armory."
         except ArmoryHTTPError as exc:
             _LOGGER.warning(
                 "Armory profile request failed", extra={"status": exc.status}
@@ -527,8 +504,7 @@ class ArmoryBot(commands.Bot):
             result = "Could not reach the WoW Armory. Please try again later."
         except discord.DiscordException, OSError, TimeoutError:
             result = (
-                "Guild Armory could not be updated right now. "
-                "Please try again later."
+                "Guild Armory could not be updated right now. Please try again later."
             )
             _LOGGER.warning("Guild Armory registration encountered a service failure")
         except Exception:
@@ -661,11 +637,7 @@ class ArmoryBot(commands.Bot):
                 )
         await self.store.set_row_message(state.guild_id, state.user_id, message.id)
         _LOGGER.info("member_image_updated")
-        return (
-            MemberRowSyncOutcome.CREATED
-            if created
-            else MemberRowSyncOutcome.UPDATED
-        )
+        return MemberRowSyncOutcome.CREATED if created else MemberRowSyncOutcome.UPDATED
 
     def _is_bot_attachment(self, message: discord.Message, filename: str) -> bool:
         return bool(
@@ -818,6 +790,7 @@ class ArmoryBot(commands.Bot):
                     "guild_armory_recovery_skipped",
                     extra={"outcome": "already_recovered"},
                 )
+                self._ensure_refresh_worker()
                 return
             _LOGGER.info("guild_armory_recovery_started")
             try:
@@ -832,6 +805,7 @@ class ArmoryBot(commands.Bot):
                     "guild_armory_recovery_completed",
                     extra={"outcome": "failed", "reason": "state_load"},
                 )
+                self._ensure_refresh_worker()
                 return
             all_recovered = True
             recovered_guilds = 0
@@ -900,6 +874,159 @@ class ArmoryBot(commands.Bot):
                     "outcome": "success" if all_recovered else "incomplete",
                 },
             )
+            self._ensure_refresh_worker()
+
+    def _ensure_refresh_worker(self) -> None:
+        task = self._refresh_task
+        if task is None or task.done():
+            self._refresh_task = asyncio.create_task(
+                self._refresh_worker(), name="armory-character-refresh"
+            )
+            _LOGGER.info("armory_refresh_worker_started")
+
+    async def _refresh_worker(self) -> None:
+        try:
+            while True:
+                await self.refresh_registered_characters()
+                await asyncio.sleep(_ARMORY_REFRESH_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log_recovery_exception(
+                "armory_refresh_worker_failed", exc, reason="worker_cycle"
+            )
+            # Keep the worker alive after an unexpected cycle-level failure.
+            await asyncio.sleep(_ARMORY_REFRESH_INTERVAL)
+            if not self.is_closed():
+                self._refresh_task = asyncio.create_task(
+                    self._refresh_worker(), name="armory-character-refresh"
+                )
+
+    async def refresh_registered_characters(self) -> None:
+        """Refresh registered snapshots; isolate failures to each character."""
+        _LOGGER.info("armory_refresh_cycle_started")
+        checked = changed = unchanged = failed = 0
+        try:
+            configs = await self.store.guilds()
+            for config in configs:
+                try:
+                    members = await self.store.members(config.guild_id)
+                except Exception as exc:
+                    failed += 1
+                    _log_recovery_exception(
+                        "armory_refresh_member_load_failed",
+                        exc,
+                        reason="member_state_load",
+                        level=logging.WARNING,
+                    )
+                    continue
+                for state in members:
+                    for registered in state.characters:
+                        try:
+                            outcome = await self._refresh_character(
+                                state, registered.path
+                            )
+                        except Exception as exc:
+                            outcome = "failed"
+                            _log_recovery_exception(
+                                "armory_refresh_character_failed",
+                                exc,
+                                reason="character_refresh",
+                                level=logging.WARNING,
+                            )
+                        checked += 1
+                        if outcome == "changed":
+                            changed += 1
+                        elif outcome == "unchanged":
+                            unchanged += 1
+                        else:
+                            failed += 1
+        except Exception as exc:
+            _log_recovery_exception(
+                "armory_refresh_cycle_failed",
+                exc,
+                reason="cycle_state_load",
+                level=logging.WARNING,
+            )
+            failed += 1
+        finally:
+            _LOGGER.info(
+                "armory_refresh_cycle_completed",
+                extra={
+                    "checked": checked,
+                    "changed": changed,
+                    "unchanged": unchanged,
+                    "failed": failed,
+                },
+            )
+
+    async def _refresh_character(self, state: MemberState, path: str) -> str:
+        async with self.armory_semaphore:
+            await asyncio.sleep(_ARMORY_REFRESH_PACING)
+            try:
+                fresh = await self.armory_client.fetch_character(path)
+            except Exception as exc:
+                _log_recovery_exception(
+                    "armory_refresh_character_failed",
+                    exc,
+                    reason="armory_fetch",
+                    level=logging.WARNING,
+                )
+                return "failed"
+        if not fresh.name or fresh.level is None:
+            _LOGGER.warning(
+                "armory_refresh_character_failed",
+                extra={"reason": "incomplete_profile"},
+            )
+            return "failed"
+        persisted = False
+        try:
+            async with self.member_lock(state.guild_id, state.user_id):
+                latest = await self.store.member(state.guild_id, state.user_id)
+                if latest is None:
+                    return "unchanged"
+                registered = next(
+                    (item for item in latest.characters if item.path == path), None
+                )
+                if registered is None:
+                    return "unchanged"
+                if fresh == registered.character:
+                    row_key = (state.guild_id, state.user_id)
+                    if row_key in self._refresh_pending_rows:
+                        await self.sync_member_row(latest)
+                        self._refresh_pending_rows.discard(row_key)
+                    return "unchanged"
+                changed = await self.store.update_character(
+                    state.guild_id, state.user_id, path, fresh
+                )
+                if not changed:
+                    return "unchanged"
+                persisted = True
+                latest = await self.store.member(state.guild_id, state.user_id)
+                if latest is not None:
+                    await self.sync_member_row(latest, fresh_paths=frozenset({path}))
+                    self._refresh_pending_rows.discard((state.guild_id, state.user_id))
+            return "changed"
+        except Exception as exc:
+            if persisted:
+                self._refresh_pending_rows.add((state.guild_id, state.user_id))
+            _log_recovery_exception(
+                "armory_refresh_character_failed",
+                exc,
+                reason="persist_or_discord_update",
+                level=logging.WARNING,
+            )
+            # Data may already be saved; the next cycle will retry Discord rendering.
+            return "failed"
+
+    async def close(self) -> None:
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            _LOGGER.info("armory_refresh_worker_stopped")
+        await super().close()
 
     async def on_disconnect(self) -> None:
         async with self._recovery_lock:
@@ -1121,29 +1248,9 @@ class ArmoryBot(commands.Bot):
 
 def create_bot() -> ArmoryBot:
     """Build an offline bot instance from public configuration and env secrets."""
-    runtime_environment = os.getenv("ARMORY_ENVIRONMENT", "production").lower()
-    if runtime_environment not in {"production", "development"}:
-        raise RuntimeError("ARMORY_ENVIRONMENT must be production or development")
-    raw_test_guild_id = (
-        os.getenv("DISCORD_TEST_GUILD_ID")
-        if runtime_environment == "development"
-        else None
-    )
-    test_guild_id: int | None = None
-    if raw_test_guild_id:
-        try:
-            test_guild_id = int(raw_test_guild_id)
-        except ValueError as exc:
-            raise RuntimeError(
-                "DISCORD_TEST_GUILD_ID must be a positive integer when set"
-            ) from exc
-        if test_guild_id <= 0:
-            raise RuntimeError("DISCORD_TEST_GUILD_ID must be a positive integer")
     timeout = float(os.getenv("ARMORY_TIMEOUT", "10"))
     database_path = Path(os.getenv("ARMORY_DATABASE_PATH", "data/guild-armory.sqlite3"))
-    return ArmoryBot(
-        ArmoryClient(timeout=timeout), GuildArmoryStore(database_path), test_guild_id
-    )
+    return ArmoryBot(ArmoryClient(timeout=timeout), GuildArmoryStore(database_path))
 
 
 def _read_credential_file(path: Path) -> str:

@@ -1,7 +1,7 @@
 # Character Overview Graphic Renderer
 
 The member image workflow uses `graphic_renderer.py` to render one, two, or
-three characters into fixed landscape PNGs (800×900, 1200×900, or 1800×900).
+three characters into fixed landscape PNGs (800×380, 1200×380, or 1800×380).
 The Discord layer selects the already-authorized member state, uses the current
 guild display name when it is cached, and offloads Pillow rendering from the
 event loop. A small semaphore bounds concurrent renders. The existing per-guild

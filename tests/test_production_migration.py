@@ -227,7 +227,13 @@ class ProductionMigrationTests(unittest.TestCase):
         self.assertTrue(restore_marker_path(self.target).exists())
         self.assertFalse(self.target.exists())
         guard = _load_preflight()
-        self.assertFalse(guard.database_is_ready(self.target))
+        self.assertFalse(
+            guard.database_metadata_is_safe(
+                self.target,
+                expected_owner=os.getuid(),
+                expected_group=os.getgid(),
+            )
+        )
         self.assertTrue(self.source.exists())
         self.assertEqual(
             hashlib.sha256(self.source.read_bytes()).hexdigest(), original_hash

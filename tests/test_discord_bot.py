@@ -1,7 +1,6 @@
 """Guild Armory command and event tests with no Discord gateway access."""
 
 import asyncio
-import os
 import tempfile
 import traceback
 import unittest
@@ -43,7 +42,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         await self.store.initialize()
         await self.store.activate_guild(111, 222, 333)
         self.core = ArmoryClient(max_retries=0)
-        self.bot = ArmoryBot(self.core, self.store, 999)
+        self.bot = ArmoryBot(self.core, self.store)
         self.render_runner = AsyncMock(side_effect=_inline_thread_call)
         self._render_runner_patch = patch(
             "wow_forever_armory.discord_bot.to_thread", new=self.render_runner
@@ -221,6 +220,70 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(intents.message_content)
         self.assertFalse(intents.members)
 
+    async def test_refresh_updates_changed_character_and_member_image(self) -> None:
+        path = f"{PREFIX}/refresh-hero"
+        old = Character(name="Hero", surname="Woodsong", level=60)
+        await self.store.finish_flow(111, 456, "Hero", path, old)
+        self.bot.armory_client.fetch_character = AsyncMock(
+            return_value=Character(name="Hero", surname="Woodsong", level=70)
+        )
+        self.bot.sync_member_row = AsyncMock()
+
+        await self.bot.refresh_registered_characters()
+
+        state = await self.store.member(111, 456)
+        self.assertEqual(state.characters[0].character.level, 70)
+        self.bot.sync_member_row.assert_awaited_once_with(
+            state, fresh_paths=frozenset({path})
+        )
+
+    async def test_refresh_fetch_failure_preserves_snapshot_and_continues(self) -> None:
+        first_path = f"{PREFIX}/failed-hero"
+        second_path = f"{PREFIX}/changed-hero"
+        await self.store.finish_flow(
+            111, 456, "Hero", first_path, Character(name="Hero", level=60)
+        )
+        await self.store.finish_flow(
+            111, 457, "Other", second_path, Character(name="Other", level=60)
+        )
+        refresh_tasks = []
+
+        async def fetch(path: str) -> Character:
+            refresh_tasks.append(asyncio.current_task())
+            if path == first_path:
+                raise RuntimeError("offline")
+            return Character(name="Other", level=70)
+
+        self.bot.armory_client.fetch_character = AsyncMock(side_effect=fetch)
+        self.bot.sync_member_row = AsyncMock()
+
+        with patch("wow_forever_armory.discord_bot._ARMORY_REFRESH_PACING", 0):
+            await self.bot.refresh_registered_characters()
+
+        first = await self.store.member(111, 456)
+        second = await self.store.member(111, 457)
+        self.assertEqual(first.characters[0].character.level, 60)
+        self.assertEqual(second.characters[0].character.level, 70)
+        self.assertEqual(self.bot.armory_client.fetch_character.await_count, 2)
+        self.assertEqual(len(set(refresh_tasks)), 1)
+        self.bot.sync_member_row.assert_awaited_once()
+
+    async def test_refresh_worker_is_not_duplicated_after_reconnect_ready(self) -> None:
+        entered = asyncio.Event()
+
+        async def worker() -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(self.bot, "_refresh_worker", worker):
+            self.bot._ensure_refresh_worker()
+            first_task = self.bot._refresh_task
+            await entered.wait()
+            self.bot._ensure_refresh_worker()
+            self.assertIs(self.bot._refresh_task, first_task)
+            await self.bot.close()
+            self.assertTrue(first_task.cancelled())
+
     async def test_discord_event_dispatch_runs_connect_then_ready_callbacks(
         self,
     ) -> None:
@@ -245,17 +308,17 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
         on_ready.assert_awaited_once_with()
         self.assertEqual(events, ["connect", "ready"])
 
-    async def test_setup_syncs_commands_only_to_test_guild(self) -> None:
+    async def test_setup_registers_commands_without_any_sync(self) -> None:
         self.bot.add_cog = AsyncMock()
-        self.bot.tree.copy_global_to = MagicMock()
+        self.bot.tree.copy_global_to = MagicMock(
+            side_effect=AssertionError("must not copy")
+        )
         self.bot.tree.sync = AsyncMock()
         with self.assertLogs("wow_forever_armory.discord_bot", level="INFO") as logs:
             await self.bot.setup_hook()
-        guild = self.bot.tree.copy_global_to.call_args.kwargs["guild"]
-        self.assertEqual(guild.id, 999)
-        self.bot.tree.sync.assert_awaited_once_with(guild=guild)
+        self.bot.tree.copy_global_to.assert_not_called()
+        self.bot.tree.sync.assert_not_awaited()
         self.assertIn("discord_bot_setup_started", "\n".join(logs.output))
-        self.assertIn("slash_commands_synced_to_test_guild", "\n".join(logs.output))
         self.assertIn("discord_bot_setup_completed", "\n".join(logs.output))
 
     async def test_setup_hook_failure_is_logged_and_propagated(self) -> None:
@@ -275,98 +338,11 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             sensitive, "".join(traceback.format_exception(captured.exception))
         )
 
-    async def test_global_command_sync_failure_never_logs_setup_or_ready_success(
-        self,
-    ) -> None:
-        self.bot.test_guild_id = None
+    async def test_setup_does_not_sync_even_if_sync_would_fail(self) -> None:
         self.bot.add_cog = AsyncMock()
-        self.bot.tree.sync = AsyncMock(
-            side_effect=RuntimeError(
-                "token=synthetic private URL?token=secret discord_id=123456789012345678"
-            )
-        )
-        with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
-            with self.assertRaisesRegex(RuntimeError, "Discord bot setup failed"):
-                await self.bot.setup_hook()
-        self.assertEqual(logger.log.call_args.args[1], "discord_bot_setup_failed")
-        self.assertEqual(
-            logger.log.call_args.kwargs["extra"],
-            {"exception_type": "RuntimeError", "reason": "setup_hook"},
-        )
-        events = [call.args[0] for call in logger.info.call_args_list]
-        self.assertIn("discord_bot_setup_started", events)
-        self.assertNotIn("global_slash_commands_synced", events)
-        self.assertNotIn("discord_bot_setup_completed", events)
-        self.assertNotIn("discord_ready_event_received", events)
-        self.assertNotIn("guild_armory_recovery_started", events)
-
-    async def test_setup_globally_syncs_when_no_development_guild_is_configured(
-        self,
-    ) -> None:
-        self.bot.test_guild_id = None
-        self.bot.add_cog = AsyncMock()
-        self.bot.tree.copy_global_to = MagicMock()
-        self.bot.tree.sync = AsyncMock(return_value=[object(), object()])
+        self.bot.tree.sync = AsyncMock(side_effect=AssertionError("sync forbidden"))
         await self.bot.setup_hook()
-        self.bot.tree.copy_global_to.assert_not_called()
-        self.bot.tree.sync.assert_awaited_once_with()
-
-    async def test_create_bot_does_not_require_test_guild_configuration(self) -> None:
-        from wow_forever_armory.discord_bot import create_bot
-
-        with patch.dict(os.environ, {}, clear=True):
-            bot = create_bot()
-        try:
-            self.assertIsNone(bot.test_guild_id)
-        finally:
-            await bot.close()
-
-    async def test_create_bot_rejects_invalid_optional_test_guild(self) -> None:
-        from wow_forever_armory.discord_bot import create_bot
-
-        with patch.dict(
-            os.environ,
-            {
-                "ARMORY_ENVIRONMENT": "development",
-                "DISCORD_TEST_GUILD_ID": "not-a-guild",
-            },
-        ):
-            with self.assertRaisesRegex(RuntimeError, "positive integer"):
-                create_bot()
-
-    async def test_development_mode_honors_test_guild_override(self) -> None:
-        from wow_forever_armory.discord_bot import create_bot
-
-        with patch.dict(
-            os.environ,
-            {
-                "ARMORY_ENVIRONMENT": "development",
-                "DISCORD_TEST_GUILD_ID": "123456789012345678",
-            },
-        ):
-            bot = create_bot()
-        try:
-            self.assertEqual(bot.test_guild_id, 123456789012345678)
-        finally:
-            await bot.close()
-
-    async def test_production_ignores_legacy_test_guild_environment_variable(
-        self,
-    ) -> None:
-        from wow_forever_armory.discord_bot import create_bot
-
-        with patch.dict(
-            os.environ,
-            {
-                "ARMORY_ENVIRONMENT": "production",
-                "DISCORD_TEST_GUILD_ID": "123456789012345678",
-            },
-        ):
-            bot = create_bot()
-        try:
-            self.assertIsNone(bot.test_guild_id)
-        finally:
-            await bot.close()
+        self.bot.tree.sync.assert_not_awaited()
 
     async def test_same_member_has_independent_access_in_two_guilds(self) -> None:
         await self.store.activate_guild(222, 223, 224)
@@ -737,9 +713,7 @@ class GuildArmoryBotTests(unittest.IsolatedAsyncioTestCase):
             return {222: first_channel, 223: second_channel}[channel_id]
 
         self.bot.get_armory_channel = AsyncMock(side_effect=channel_for)
-        self.bot.sync_member_row = AsyncMock(
-            return_value=MemberRowSyncOutcome.UPDATED
-        )
+        self.bot.sync_member_row = AsyncMock(return_value=MemberRowSyncOutcome.UPDATED)
         with patch("wow_forever_armory.discord_bot._LOGGER") as logger:
             await self.bot.on_ready()
 

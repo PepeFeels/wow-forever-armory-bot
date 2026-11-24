@@ -57,7 +57,7 @@ Grant the bot these channel permissions:
 3. Add a character using its full WoW Forever Armory profile URL.
 4. Use the character controls to add another character, replace one, or remove one.
 
-Each member can have up to three characters per Discord server. Character registrations are managed through private interactions; the resulting overview is displayed in the shared panel channel.
+Each member can have up to three characters per Discord server. Character registrations are managed through private interactions; the resulting overview is displayed in the shared panel channel. Registered characters are checked against the Armory about every five minutes; the member image is refreshed only when normalized character data changes, without pinging the member again. The Armory's own last-updated timestamp can lag behind a check, so a successful check does not guarantee newer profile data.
 
 ## Privacy and data
 
@@ -75,6 +75,7 @@ If you need a guild's stored data deleted, contact the bot operator and follow t
 The bot is built in Python and uses a local SQLite database for persistent Guild Armory state. Its Armory Core validates supported profile URLs, fetches public profile pages over HTTPS, and parses character data. The Discord layer handles commands, persistent controls, panel messages, and recovery.
 
 - [Operations guide](OPERATIONS.md)
+- [Administrator handover guide](ADMIN-HANDOVER.md)
 - [Troubleshooting](TROUBLESHOOTING.md)
 - [Character graphic renderer](GRAPHIC_RENDERER.md)
 - [Changelog](CHANGELOG.md)
@@ -86,7 +87,7 @@ Use Python 3.14 or newer:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
 
@@ -96,9 +97,6 @@ Example development configuration:
 
 ```dotenv
 DISCORD_BOT_TOKEN=your-private-test-token
-ARMORY_ENVIRONMENT=development
-# Optional: use a test guild for faster command propagation during development.
-DISCORD_TEST_GUILD_ID=123456789012345678
 ARMORY_TIMEOUT=10
 ARMORY_DATABASE_PATH=data/guild-armory.sqlite3
 ```
@@ -108,6 +106,11 @@ Run the bot only when you intend to connect to Discord:
 ```bash
 .venv/bin/python -m wow_forever_armory.discord_bot
 ```
+
+Bot startup registers commands locally but never creates or changes global
+Discord commands. Use the separate administrative workflow in `OPERATIONS.md`
+to review a command diff and obtain approval before an apply run. Deletions
+require a distinct approval.
 
 ### Tests
 

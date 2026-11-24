@@ -180,9 +180,10 @@ def render_member_row(
             width=2,
         )
         character = entry.character
-        character_name = " ".join(
-            filter(None, (character.name, character.surname))
-        ) or "Unknown Character"
+        character_name = (
+            " ".join(filter(None, (character.name, character.surname)))
+            or "Unknown Character"
+        )
         name = _fit(draw, character_name, _font(28, True), card_width - 44)
         draw.text((left + 22, top + 20), name, font=_font(28, True), fill=_GOLD)
         details = (

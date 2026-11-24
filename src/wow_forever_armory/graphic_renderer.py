@@ -23,7 +23,7 @@ from .models import Character, Profession
 _ASSET_DIR: Final = Path(__file__).with_name("assets")
 _CLASS_ICON_DIR: Final = _ASSET_DIR / "class_icons"
 _FONT_DIR: Final = _ASSET_DIR / "fonts"
-_OUTPUT_SIZES: Final = {1: (800, 520), 2: (1200, 520), 3: (1800, 520)}
+_OUTPUT_SIZES: Final = {1: (800, 380), 2: (1200, 380), 3: (1800, 380)}
 _STALE_AFTER: Final = timedelta(days=30)
 _MAX_LOGO_BYTES: Final = 8 * 1024 * 1024
 _MAX_PORTRAIT_BYTES: Final = 2 * 1024 * 1024
@@ -203,7 +203,7 @@ def output_size(character_count: int) -> tuple[int, int]:
 def _panel_section_layout(has_stats: bool = False) -> tuple[int, int, int, int]:
     """Return compact divider, profession heading/row positions, and spacing."""
     del has_stats
-    return 158, 174, 207, 48
+    return 130, 144, 168, 29
 
 
 def _clean_text(value: object, *, limit: int = 512) -> str:
@@ -751,10 +751,10 @@ def _draw_identity(
     left, top, right, _ = box
     draw = ImageDraw.Draw(canvas)
     panel_width = right - left
-    portrait_size = min(132, max(104, panel_width // 5))
+    portrait_size = min(104, max(88, panel_width // 5))
     portrait_box = (
         left + 18,
-        top + 16,
+        top + 12,
         left + 18 + portrait_size,
         top + 16 + portrait_size,
     )
@@ -768,7 +768,7 @@ def _draw_identity(
         info_width,
         base_size=26 if panel_width < 650 else 31,
     )
-    draw.text((info_x, top + 20), title, font=title_font, fill=_GOLD_LIGHT)
+    draw.text((info_x, top + 15), title, font=title_font, fill=_GOLD_LIGHT)
 
     level = _valid_number(character.level)
     level_text = f"Level {_grouped_number(level)}" if level is not None else "Level —"
@@ -777,7 +777,7 @@ def _draw_identity(
     identity = f"{level_text} · {race} {character_class}"
     identity_font = _font(16 if panel_width < 650 else 18, serif=True)
     identity_text = _fit_text(draw, identity, identity_font, info_width, limit=180)
-    draw.text((info_x, top + 66), identity_text, font=identity_font, fill=_PAPER)
+    draw.text((info_x, top + 52), identity_text, font=identity_font, fill=_PAPER)
 
     spec = (
         _clean_text(character.specialization, limit=80) or "No Specialization Available"
@@ -790,7 +790,7 @@ def _draw_identity(
     )
     spec_font = _font(16 if panel_width < 650 else 18, serif=True)
     spec_text = _fit_text(draw, f"{spec}{talent}", spec_font, info_width, limit=160)
-    draw.text((info_x, top + 94), spec_text, font=spec_font, fill=_MUTED)
+    draw.text((info_x, top + 76), spec_text, font=spec_font, fill=_MUTED)
 
 
 def _draw_professions(
@@ -935,9 +935,9 @@ def _draw_footer(
     updated_x = inner_left + column_width + gap
     heading_size = 19 if count == 3 else 21
     body_size = 15 if count == 3 else 17
-    _section_heading(draw, "PVP", pvp_x, top + 400, column_width, size=heading_size)
+    _section_heading(draw, "PVP", pvp_x, top + 272, column_width, size=heading_size)
     _section_heading(
-        draw, "LAST UPDATED", updated_x, top + 400, column_width, size=heading_size
+        draw, "LAST UPDATED", updated_x, top + 272, column_width, size=heading_size
     )
     body_font = _font(body_size)
 
@@ -946,16 +946,16 @@ def _draw_footer(
     for index, line in enumerate(pvp_lines[:2]):
         fitted = _fit_text(draw, line, body_font, column_width, limit=90)
         draw.text(
-            (pvp_x, top + 435 + index * 22), fitted, font=body_font, fill=pvp_color
+            (pvp_x, top + 300 + index * 19), fitted, font=body_font, fill=pvp_color
         )
 
     updated = _timestamp_label(character.last_updated)
     updated_text = _fit_text(draw, updated, body_font, column_width, limit=64)
-    draw.text((updated_x, top + 435), updated_text, font=body_font, fill=_PAPER)
+    draw.text((updated_x, top + 296), updated_text, font=body_font, fill=_PAPER)
     freshness = _freshness_label(character)
     if freshness:
         freshness_font = _font(11, bold=True)
-        draw.text((updated_x, top + 450), freshness, font=freshness_font, fill=_MUTED)
+        draw.text((updated_x, top + 314), freshness, font=freshness_font, fill=_MUTED)
 
 
 def _freshness_label(character: GraphicCharacter) -> str:
@@ -995,7 +995,7 @@ def _draw_panel(
         _panel_section_layout()
     )
     middle_divider = top + middle_offset
-    for y in (middle_divider, top + 390):
+    for y in (middle_divider, top + 262):
         draw.line((inner_left, y, inner_right, y), fill=(157, 110, 48), width=2)
         draw.line(
             (inner_left + 3, y + 3, inner_right - 3, y + 3), fill=(58, 51, 43), width=1
