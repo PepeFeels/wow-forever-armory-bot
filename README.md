@@ -75,6 +75,7 @@ If you need a guild's stored data deleted, contact the bot operator and follow t
 The bot is built in Python and uses a local SQLite database for persistent Guild Armory state. Its Armory Core validates supported profile URLs, fetches public profile pages over HTTPS, and parses character data. The Discord layer handles commands, persistent controls, panel messages, and recovery.
 
 - [Operations guide](OPERATIONS.md)
+- [Administrator handover guide](ADMIN-HANDOVER.md)
 - [Troubleshooting](TROUBLESHOOTING.md)
 - [Character graphic renderer](GRAPHIC_RENDERER.md)
 - [Changelog](CHANGELOG.md)
